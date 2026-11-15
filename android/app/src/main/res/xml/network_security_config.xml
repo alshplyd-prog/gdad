@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Deny all cleartext HTTP traffic and trust ONLY system CAs (rejects user-installed MITM proxy certs like Charles/Burp) -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Strict SSL/TLS SPKI Pinning for Google Cloud Run (*.run.app) backend -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">run.app</domain>
+        <pin-set expiration="2028-01-01">
+            <!-- Leaf (*.a.run.app) SPKI SHA-256 -->
+            <pin digest="SHA-256">yc3A0YzRhVFKbhCZ+o+ahNI5btqixasPMGqosUzbueE=</pin>
+            <!-- Intermediate (Google Trust Services WR2) SPKI SHA-256 -->
+            <pin digest="SHA-256">YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=</pin>
+            <!-- Root (GTS Root R1) SPKI SHA-256 -->
+            <pin digest="SHA-256">hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=</pin>
+            <!-- Backup Root (GTS Root R2) SPKI SHA-256 -->
+            <pin digest="SHA-256">iie1VXtL7HzAMF+/PVPR9xzT80kQxdZeJ+zduCB3uj0=</pin>
+        </pin-set>
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

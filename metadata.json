@@ -1,0 +1,10 @@
+{
+  "name": "نظام الكرار للمبيعات والأقساط",
+  "description": "نظام متكامل لإدارة المبيعات المباشرة وبالتقسيط، متابعة الزبائن، تحصيل الأقساط، وإدارة المخزن والمناديب.",
+  "requestFramePermissions": [
+    "bluetooth"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
