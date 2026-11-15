@@ -15,21 +15,46 @@
     public static int w(...);
 }
 
+# Preserve app AndroidManifest components & native security helpers
+-keep class com.alkarrar.mobile.MainActivity { *; }
+-keep class com.alkarrar.mobile.ForegroundSyncService { *; }
+-keep class com.alkarrar.mobile.BootReceiver { *; }
+-keep class com.alkarrar.mobile.SyncWorker { *; }
+-keep class com.alkarrar.mobile.EncryptedOfflineDbHelper { *; }
+-keep class com.alkarrar.mobile.SecureKeyStoreHelper { *; }
+-keep class com.alkarrar.mobile.SecurityGuard { *; }
+-keep class com.alkarrar.mobile.MainActivity$PrinterJavascriptInterface {
+    public *;
+}
+
 # Preserve WebView JavascriptInterface bridge methods
 -keepclassmembers class * {
     @android.webkit.JavascriptInterface <methods>;
 }
--keepclassmembers class com.alkarrar.mobile.MainActivity$PrinterJavascriptInterface {
-    public *;
-}
 
-# Preserve Capacitor Bridge & Plugins
+# Preserve Capacitor Bridge, Plugins, and AndroidX FileProvider
 -keep class com.getcapacitor.** { *; }
 -keep @com.getcapacitor.annotation.CapacitorPlugin class * { *; }
+-keep class androidx.core.content.FileProvider { *; }
 
-# Preserve SQLCipher native bindings & AndroidX Security Crypto
+# Preserve AndroidX WorkManager workers instantiated via reflection
+-keep class androidx.work.** { *; }
+-keep class * extends androidx.work.Worker { *; }
+-keep class * extends androidx.work.ListenableWorker { *; }
+
+# Preserve SQLCipher native bindings, AndroidX Security Crypto, and Google Tink (required by EncryptedSharedPreferences)
 -keep class net.sqlcipher.** { *; }
 -keep class net.sqlcipher.database.** { *; }
+-keep class net.zetetic.** { *; }
 -keep class androidx.security.crypto.** { *; }
+-keep class com.google.crypto.tink.** { *; }
+-keepclassmembers class com.google.crypto.tink.shaded.protobuf.** { *; }
+
 -dontwarn net.sqlcipher.**
+-dontwarn net.zetetic.**
+-dontwarn com.google.crypto.tink.**
 -dontwarn com.google.errorprone.annotations.**
+-dontwarn javax.annotation.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**

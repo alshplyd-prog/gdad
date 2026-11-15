@@ -63,7 +63,6 @@ public final class SecurityGuard {
             }
 
             if (Build.TAGS != null && Build.TAGS.contains("test-keys")) {
-                rooted = true;
                 reasons.put("build_test_keys");
             }
 

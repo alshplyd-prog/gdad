@@ -3,7 +3,7 @@ import { UserCheck, Shield, KeyRound, ArrowRight, UserPlus, Sparkles, Building2,
 import { SalesRepresentative, Language } from '../types';
 import { DEFAULT_REPS } from '../data/initialContracts';
 import { normalizePin } from '../lib/pinUtils';
-import { fetchWithFallback, getCustomServerUrl, setCustomServerUrl, checkServerHealth } from '../lib/apiConfig';
+import { fetchWithFallback, getCustomServerUrl, setCustomServerUrl, checkServerHealth, isNativeOrApkEnvironment } from '../lib/apiConfig';
 import { getLocalCache, reconcileAllLocalWithDatabase } from '../lib/postgresClient';
 import { setAuthSession, verifyOfflinePinHash, sanitizeRepForStorage } from '../lib/securityClient';
 
@@ -45,7 +45,45 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
     setError('');
   };
 
-  // Submit PIN for Modal (Server-Verified HS256 JWT + Offline SHA-256 Fallback only when network unreachable)
+  const verifyLocalPinAcrossSources = async (
+    rep: SalesRepresentative,
+    normalizedEnteredPin: string
+  ): Promise<{ matched: boolean; resolvedRep: SalesRepresentative }> => {
+    if (rep.code && normalizePin(rep.code) === normalizedEnteredPin) {
+      return { matched: true, resolvedRep: rep };
+    }
+    if (await verifyOfflinePinHash(rep.id, normalizedEnteredPin, rep.offlineVerifier)) {
+      return { matched: true, resolvedRep: rep };
+    }
+    try {
+      const cachedReps = getLocalCache<SalesRepresentative>('reps');
+      const cachedMatch = cachedReps.find(
+        (r) => r.id === rep.id || (r.name && rep.name && r.name.toLowerCase() === rep.name.toLowerCase())
+      );
+      if (cachedMatch) {
+        if (cachedMatch.code && normalizePin(cachedMatch.code) === normalizedEnteredPin) {
+          return { matched: true, resolvedRep: cachedMatch };
+        }
+        if (await verifyOfflinePinHash(cachedMatch.id, normalizedEnteredPin, cachedMatch.offlineVerifier)) {
+          return { matched: true, resolvedRep: cachedMatch };
+        }
+      }
+    } catch (cacheErr) {}
+    const defaultMatch = DEFAULT_REPS.find(
+      (r) => r.id === rep.id || (r.name && rep.name && r.name.toLowerCase() === rep.name.toLowerCase())
+    );
+    if (defaultMatch) {
+      if (defaultMatch.code && normalizePin(defaultMatch.code) === normalizedEnteredPin) {
+        return { matched: true, resolvedRep: { ...defaultMatch, ...rep, offlineVerifier: defaultMatch.offlineVerifier } };
+      }
+      if (await verifyOfflinePinHash(defaultMatch.id, normalizedEnteredPin, defaultMatch.offlineVerifier)) {
+        return { matched: true, resolvedRep: { ...defaultMatch, ...rep, offlineVerifier: defaultMatch.offlineVerifier } };
+      }
+    }
+    return { matched: false, resolvedRep: rep };
+  };
+
+  // Submit PIN for Modal (Local App PIN + Server JWT Exchange)
   const handlePinSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (isSubmitting) return;
@@ -64,8 +102,56 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
     );
     const targetRep = currentFromProps || pinModalRep;
 
+    const exchangeServerJwtInBackground = (repObj: SalesRepresentative, pinStr: string) => {
+      fetchWithFallback(
+        '/api/auth/login',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repId: repObj.id,
+            repName: repObj.name,
+            pin: pinStr,
+          }),
+        },
+        3500
+      )
+        .then(async (res) => {
+          const data = await res.json().catch(() => null);
+          if (res.ok && data?.success && data?.token && data?.rep) {
+            const cleanRep = sanitizeRepForStorage(data.rep);
+            setAuthSession({
+              token: data.token,
+              hmacKey: data.hmacKey || '',
+              rep: cleanRep,
+              issuedAt: Date.now(),
+              offlinePendingExchange: false,
+            });
+          }
+        })
+        .catch(() => {});
+    };
+
     setIsSubmitting(true);
     try {
+      // Check local app PIN immediately so APK login stays instant when offline or preview URLs require auth
+      const localCheck = await verifyLocalPinAcrossSources(targetRep, normalizedEnteredPin);
+
+      // Inside exported APK, honor in-app PIN immediately with zero network stall and exchange JWT silently in background
+      if (localCheck.matched && isNativeOrApkEnvironment()) {
+        const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
+        setAuthSession({
+          token: 'offline_pending',
+          hmacKey: '',
+          rep: cleanRep,
+          issuedAt: Date.now(),
+          offlinePendingExchange: true,
+        });
+        onLogin(cleanRep);
+        exchangeServerJwtInBackground(targetRep, normalizedEnteredPin);
+        return;
+      }
+
       // 1. Primary: Server-side PIN verification & HS256 JWT + Per-Session HMAC Key issuance
       try {
         const res = await fetchWithFallback(
@@ -79,7 +165,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
               pin: normalizedEnteredPin,
             }),
           },
-          5500
+          localCheck.matched ? 2200 : 4000
         );
 
         const data = await res.json().catch(() => null);
@@ -96,37 +182,30 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
           return;
         }
 
-        // Server explicitly rejected credentials (401/403) -> never fall back to local cache
+        // Server explicitly rejected credentials (401/403)
         if (res.status === 401 || res.status === 403) {
+          if (localCheck.matched && isNativeOrApkEnvironment()) {
+            const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
+            setAuthSession({
+              token: 'offline_pending',
+              hmacKey: '',
+              rep: cleanRep,
+              issuedAt: Date.now(),
+              offlinePendingExchange: true,
+            });
+            onLogin(cleanRep);
+            return;
+          }
           setError(data?.error || (isAr ? `رمز الأمان غير صحيح لحساب (${pinModalRep.name})!` : 'Incorrect PIN code!'));
           return;
         }
       } catch (networkErr) {
-        // Server unreachable -> fall through to SHA-256 offline verifier ONLY in true offline condition
+        // Server unreachable -> fall through to in-app PIN verification
       }
 
-      // 2. Offline Fallback: Verify SHA-256 cryptographic verifier (zero plaintext PINs stored)
-      let offlineOk = await verifyOfflinePinHash(targetRep.id, normalizedEnteredPin, targetRep.offlineVerifier);
-      let matchedRep: SalesRepresentative = targetRep;
-
-      if (!offlineOk) {
-        try {
-          const cachedReps = getLocalCache<SalesRepresentative>('reps');
-          const cachedMatch = cachedReps.find(
-            (r) => r.id === targetRep.id || (r.name && r.name.toLowerCase() === targetRep.name.toLowerCase())
-          );
-          if (cachedMatch) {
-            const matchOk = await verifyOfflinePinHash(cachedMatch.id, normalizedEnteredPin, cachedMatch.offlineVerifier);
-            if (matchOk) {
-              offlineOk = true;
-              matchedRep = cachedMatch;
-            }
-          }
-        } catch (cacheErr) {}
-      }
-
-      if (offlineOk) {
-        const cleanRep = sanitizeRepForStorage(matchedRep);
+      // 2. Local in-app PIN verification fallback (keeps APK functional offline / pre-server link)
+      if (localCheck.matched) {
+        const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
         setAuthSession({
           token: 'offline_pending',
           hmacKey: '',
@@ -222,6 +301,43 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
       );
 
     if (matched) {
+      const localCheck = await verifyLocalPinAcrossSources(matched, normalizedEnteredPin);
+
+      if (localCheck.matched && isNativeOrApkEnvironment()) {
+        const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
+        setAuthSession({
+          token: 'offline_pending',
+          hmacKey: '',
+          rep: cleanRep,
+          issuedAt: Date.now(),
+          offlinePendingExchange: true,
+        });
+        onLogin(cleanRep);
+        fetchWithFallback(
+          '/api/auth/login',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ repId: matched.id, repName: matched.name, pin: normalizedEnteredPin }),
+          },
+          3500
+        )
+          .then(async (res) => {
+            const data = await res.json().catch(() => null);
+            if (res.ok && data?.success && data?.token && data?.rep) {
+              setAuthSession({
+                token: data.token,
+                hmacKey: data.hmacKey || '',
+                rep: sanitizeRepForStorage(data.rep),
+                issuedAt: Date.now(),
+                offlinePendingExchange: false,
+              });
+            }
+          })
+          .catch(() => {});
+        return;
+      }
+
       try {
         const res = await fetchWithFallback(
           '/api/auth/login',
@@ -230,7 +346,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ repId: matched.id, repName: matched.name, pin: normalizedEnteredPin }),
           },
-          5500
+          localCheck.matched ? 2200 : 4000
         );
         const data = await res.json().catch(() => null);
         if (res.ok && data?.success && data?.token && data?.rep) {
@@ -251,23 +367,8 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
         }
       } catch (e) {}
 
-      let offlineOk = await verifyOfflinePinHash(matched.id, normalizedEnteredPin, matched.offlineVerifier);
-      let finalRep = matched;
-      if (!offlineOk) {
-        try {
-          const cachedReps = getLocalCache<SalesRepresentative>('reps');
-          const cachedMatch = cachedReps.find(
-            (r) => r.id === matched.id || r.name.toLowerCase() === trimmedName.toLowerCase()
-          );
-          if (cachedMatch && (await verifyOfflinePinHash(cachedMatch.id, normalizedEnteredPin, cachedMatch.offlineVerifier))) {
-            offlineOk = true;
-            finalRep = cachedMatch;
-          }
-        } catch (e) {}
-      }
-
-      if (offlineOk) {
-        const cleanRep = sanitizeRepForStorage(finalRep);
+      if (localCheck.matched) {
+        const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
         setAuthSession({
           token: 'offline_pending',
           hmacKey: '',

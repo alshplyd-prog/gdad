@@ -124,7 +124,6 @@ public class ForegroundSyncService extends Service {
 
         createNotificationChannel();
         startInForeground("يراقب الاتصال للمزامنة الفورية عند توفر الإنترنت");
-        initBackgroundWebView();
         registerNetworkListener();
         acquirePartialWakeLock();
         acquireWifiLock();
@@ -149,7 +148,13 @@ public class ForegroundSyncService extends Service {
             );
 
             long triggerAt = SystemClock.elapsedRealtime() + delayMs;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (alarmManager.canScheduleExactAlarms()) {
+                    alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent);
+                } else {
+                    alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent);
+                }
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent);
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 alarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent);

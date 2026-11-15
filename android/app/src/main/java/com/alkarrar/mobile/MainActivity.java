@@ -46,6 +46,8 @@ public class MainActivity extends BridgeActivity {
 
     private BluetoothAdapter bluetoothAdapter;
     private BroadcastReceiver syncReceiver;
+    private boolean permissionsRequestedInSession = false;
+    private boolean webViewInterfaceAttached = false;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -105,8 +107,8 @@ public class MainActivity extends BridgeActivity {
             Log.w(TAG, "SyncWorker init error: " + e.getMessage());
         }
 
-        // Request all necessary permissions (Bluetooth, Location, Notifications) on startup
-        checkAndRequestPermissions();
+        // Request runtime permissions once on startup (never force-launch Settings dialogs automatically)
+        checkAndRequestPermissions(false);
     }
 
     @Override
@@ -114,7 +116,6 @@ public class MainActivity extends BridgeActivity {
         super.onResume();
         setupWebViewInterface();
         triggerWebSync();
-        checkAndRequestPermissions();
         try {
             ForegroundSyncService.startSyncService(this);
         } catch (Throwable ignored) {}
@@ -195,9 +196,12 @@ public class MainActivity extends BridgeActivity {
                 settings.setAllowUniversalAccessFromFileURLs(false);
                 settings.setMediaPlaybackRequiresUserGesture(false);
 
-                PrinterJavascriptInterface nativeInterface = new PrinterJavascriptInterface();
-                webView.addJavascriptInterface(nativeInterface, "AndroidPrinter");
-                webView.addJavascriptInterface(nativeInterface, "AndroidInterface");
+                if (!webViewInterfaceAttached) {
+                    PrinterJavascriptInterface nativeInterface = new PrinterJavascriptInterface();
+                    webView.addJavascriptInterface(nativeInterface, "AndroidPrinter");
+                    webView.addJavascriptInterface(nativeInterface, "AndroidInterface");
+                    webViewInterfaceAttached = true;
+                }
             }
         } catch (Throwable e) {
             Log.w(TAG, "Failed to attach AndroidPrinter JavascriptInterface: " + e.getMessage());
@@ -210,9 +214,18 @@ public class MainActivity extends BridgeActivity {
     }
 
     private void checkAndRequestPermissions() {
+        checkAndRequestPermissions(false);
+    }
+
+    private void checkAndRequestPermissions(final boolean promptSettingsDialogs) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                if (permissionsRequestedInSession && !promptSettingsDialogs) {
+                    return;
+                }
+                permissionsRequestedInSession = true;
+
                 List<String> permissions = new ArrayList<>();
 
                 // 1. Notification Permission (Android 13+ / API 33+)
@@ -261,11 +274,17 @@ public class MainActivity extends BridgeActivity {
                 }
 
                 if (!permissions.isEmpty()) {
-                    ActivityCompat.requestPermissions(MainActivity.this, permissions.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+                    try {
+                        ActivityCompat.requestPermissions(MainActivity.this, permissions.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+                    } catch (Throwable e) {
+                        Log.w(TAG, "requestPermissions note: " + e.getMessage());
+                    }
                 }
 
-                // 5. Check and prompt to ignore battery optimizations for persistent background sync
-                checkAndPromptBatteryOptimization();
+                // 5. Only prompt Battery/Alarm settings when explicitly requested by user action
+                if (promptSettingsDialogs) {
+                    checkAndPromptBatteryOptimization();
+                }
             }
         });
     }

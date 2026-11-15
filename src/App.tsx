@@ -262,15 +262,23 @@ export default function App() {
     return null;
   });
 
-  // Session lock state (requires server-verified JWT + HMAC key)
+  // Session lock state (supports server JWT and offline/APK local PIN sessions)
   const [isPinUnlocked, setIsPinUnlocked] = useState<boolean>(() => {
     try {
-      const secSession = getAuthSession();
       const persistentState = localStorage.getItem('sami_app_pin_unlocked');
-      if (persistentState !== 'true' || !secSession?.token || !secSession?.hmacKey || !secSession?.rep) {
+      if (persistentState !== 'true') {
         return false;
       }
-      return true;
+      const secSession = getAuthSession();
+      if (secSession?.rep && secSession?.token) {
+        return true;
+      }
+      const savedRepRaw = localStorage.getItem(REP_STORAGE_KEY);
+      if (savedRepRaw) {
+        const parsed = sanitizeRepForStorage(JSON.parse(savedRepRaw));
+        if (parsed?.name) return true;
+      }
+      return false;
     } catch (e) {
       return false;
     }
@@ -686,29 +694,25 @@ export default function App() {
       if (authVerifyInFlightRef.current) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
       const currentSession = getAuthSession();
-      if (!currentSession?.token) {
-        clearAuthSession();
-        localStorage.removeItem('sami_app_pin_unlocked');
-        setIsPinUnlocked(false);
-        showToast(
-          isArRef.current
-            ? 'انتهت جلسة الأمان، يرجى إدخال الرمز السري لإتمام المزامنة مع السيرفر'
-            : 'Session expired, please enter your PIN to sync with server'
-        );
+      // Keep local/offline APK PIN sessions active until user explicitly re-authenticates or connects to live server
+      if (!currentSession?.token || currentSession.offlinePendingExchange || currentSession.token === 'offline_pending') {
         return;
       }
       authVerifyInFlightRef.current = true;
       try {
         const res = await fetchWithFallback('/api/auth/verify', { method: 'GET' }, 5000).catch(() => null);
         if (res && res.status === 401) {
-          clearAuthSession();
-          localStorage.removeItem('sami_app_pin_unlocked');
-          setIsPinUnlocked(false);
-          showToast(
-            isArRef.current
-              ? 'انتهت جلسة الأمان، يرجى إدخال الرمز السري لإتمام المزامنة مع السيرفر'
-              : 'Session expired, please enter your PIN to sync with server'
-          );
+          const data = await res.json().catch(() => null);
+          if (data?.pinChanged || data?.code === 'INVALID_TOKEN' || data?.code === 'PIN_CHANGED' || data?.code === 'AUTH_REQUIRED') {
+            clearAuthSession();
+            localStorage.removeItem('sami_app_pin_unlocked');
+            setIsPinUnlocked(false);
+            showToast(
+              isArRef.current
+                ? 'انتهت جلسة الأمان، يرجى إدخال الرمز السري لإتمام المزامنة مع السيرفر'
+                : 'Session expired, please enter your PIN to sync with server'
+            );
+          }
         }
       } finally {
         setTimeout(() => {
@@ -1300,6 +1304,7 @@ export default function App() {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
       const session = getAuthSession();
+      if (!session?.token || session.offlinePendingExchange || session.token === 'offline_pending') return;
       try {
         const res = await fetchWithFallback(
           '/api/auth/verify',
@@ -3714,7 +3719,7 @@ export default function App() {
     );
   }
 
-  if (deviceSecurityReport?.compromised) {
+  if (deviceSecurityReport?.fridaDetected || deviceSecurityReport?.xposedDetected) {
     return (
       <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6 dir-rtl">
         <div className="max-w-md w-full bg-slate-900 border-2 border-rose-500/60 rounded-3xl p-6 shadow-2xl space-y-4 text-center">
@@ -3726,16 +3731,9 @@ export default function App() {
           </h2>
           <p className="text-xs text-slate-300 leading-relaxed">
             {isAr
-              ? 'تم اكتشاف بيئة غير آمنة أو محاولة تلاعب بالذاكرة/النظام على هذا الجهاز (Root / Frida / Xposed / Debugger). لحماية بيانات الزبائن والمبالغ المالية، يمنع تشغيل التطبيق في هذه البيئة.'
-              : 'Unsafe environment or runtime tampering detected (Root / Frida / Xposed / Debugger). Execution is blocked to protect customer and financial data.'}
+              ? 'تم اكتشاف محاولة تلاعب نشطة بالذاكرة على هذا الجهاز (Frida / Xposed). لحماية بيانات الزبائن والمبالغ المالية، يمنع تشغيل التطبيق في هذه البيئة.'
+              : 'Active runtime memory hooking detected (Frida / Xposed). Execution is blocked to protect customer and financial data.'}
           </p>
-          {deviceSecurityReport.reasons.length > 0 && (
-            <div className="bg-slate-950/90 border border-rose-500/30 rounded-xl p-3 text-left dir-ltr text-[11px] font-mono text-rose-300 space-y-1">
-              {deviceSecurityReport.reasons.map((reason, idx) => (
-                <div key={idx}>• {reason}</div>
-              ))}
-            </div>
-          )}
         </div>
       </div>
     );
