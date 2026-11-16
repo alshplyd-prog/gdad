@@ -7,6 +7,7 @@ export const DEFAULT_REPS: SalesRepresentative[] = [
     "phone": "07801112233",
     "code": "",
     "pinSet": true,
+    "pinVersion": "79b39f07b809319e",
     "offlineVerifier": "bd4dac1261d6f195231e5d59c014f07afd033da40131c54bd10c6ed9dba92556",
     "role": "admin",
     "canEdit": true,
@@ -23,9 +24,10 @@ export const DEFAULT_REPS: SalesRepresentative[] = [
     "phone": "",
     "code": "",
     "pinSet": true,
-    "offlineVerifier": "9dd00d9c08a684e04f0f264c3f1cb9ca2dc4b3d9ff84fd1a56b45eeb6c145fe9",
+    "pinVersion": "6e3503eb1f6c443d",
+    "offlineVerifier": "29a69451e35f01560e3a91023776ec40207ba9b154195e993363beabaf6f392d",
     "role": "supervisor",
-    "canEdit": true,
+    "canEdit": false,
     "canDelete": false,
     "canMoveCustomer": true,
     "canSell": true,
@@ -38,31 +40,39 @@ export const DEFAULT_REPS: SalesRepresentative[] = [
   {
     "id": "rep_1792578863867_soh3s",
     "name": "سيد نزار",
-    "phone": "",
+    "phone": "0780",
     "code": "",
     "pinSet": true,
+    "pinVersion": "157eee8c29f1cc0a",
     "offlineVerifier": "0b8c7abfe49a7a971b88c4327cfdb9af12c1cf9537b32df28c94e78d16f527bd",
-    "role": "rep",
+    "role": "supervisor",
     "canEdit": false,
     "canDelete": false,
-    "canMoveCustomer": false,
+    "canMoveCustomer": true,
     "canSell": true,
     "allowedListIds": [
-      "all"
+      "list_1787350121291_e186z",
+      "list-1",
+      "list_1787412721284_d7tle"
     ]
   },
   {
     "id": "rep_1790325874814_0njii",
     "name": "زيد",
-    "phone": "07704445566",
+    "phone": "0780",
     "code": "",
     "pinSet": true,
+    "pinVersion": "be5c3bf3bf599a11",
     "offlineVerifier": "60b4b0d9d0f35e13b49ad21bdd595bd1b19db96b876467bc673b36eb1c8a8684",
     "role": "rep",
     "canEdit": true,
-    "canDelete": true,
+    "canDelete": false,
     "canMoveCustomer": true,
-    "canSell": true
+    "canSell": true,
+    "allowedListIds": [
+      "list-4",
+      "list_1787350092691_n2xzi"
+    ]
   },
   {
     "id": "rep_1791619141491_eurdj",
@@ -70,7 +80,8 @@ export const DEFAULT_REPS: SalesRepresentative[] = [
     "phone": "",
     "code": "",
     "pinSet": true,
-    "offlineVerifier": "f4226ffcdac916ffb43f12e4b93ed0d31ed8a6e7c514dc2b3cc5d418cf949deb",
+    "pinVersion": "f803fa314e1db24f",
+    "offlineVerifier": "8c8829a8dd4f67c696853f4a5ef607bb2373ecd216080a8aa634a40d9d6f2d02",
     "role": "rep",
     "canEdit": false,
     "canDelete": false,

@@ -20,6 +20,7 @@ export interface InstallmentContract {
   longitude?: number;
   locationAddress?: string;
   locationUpdatedAt?: string;
+  locationClearedAt?: string | null;
   itemId?: string;
   itemName: string;
   itemQuantity?: number;
@@ -74,6 +75,11 @@ export interface Customer {
   name: string;
   phone: string;
   address?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  locationAddress?: string | null;
+  locationUpdatedAt?: string | null;
+  locationClearedAt?: string | null;
   listId?: string;
   listName?: string;
   totalPaid: number;

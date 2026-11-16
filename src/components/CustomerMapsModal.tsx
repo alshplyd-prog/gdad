@@ -25,7 +25,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { InstallmentContract, CustomerList, SalesRepresentative, Language } from '../types';
-import { updateCustomerLocation, getLocalCache, reconcileAllLocalWithDatabase } from '../lib/postgresClient';
+import { updateCustomerLocation, getLocalCache, reconcileAllLocalWithDatabase, getDeletedRecordIds } from '../lib/postgresClient';
 import { captureDeviceLocation } from '../lib/geolocationHelper';
 import { OfflineTileLayer, precacheMapTilesForLocations } from '../lib/offlineTileLayer';
 import { fetchStreetDrivingRoute } from '../lib/routingHelper';
@@ -228,6 +228,13 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
 
   // Helper to extract valid coords from a contract (supports latitude/longitude or lat/lng or customers lookup)
   const getCustomerCoords = useCallback((c: InstallmentContract): { lat: number; lng: number } | null => {
+    const deletedSet = getDeletedRecordIds();
+    const cClearedAt = c.locationClearedAt ?? (c as any).location_cleared_at ?? null;
+    const cUpdatedAt = c.locationUpdatedAt ?? (c as any).location_updated_at ?? null;
+    if ((c.id && deletedSet.has(`loc_clear_${c.id}`)) || (cClearedAt && (!cUpdatedAt || String(cClearedAt) >= String(cUpdatedAt)))) {
+      return null;
+    }
+
     const lat = Number(c.latitude ?? (c as any).lat);
     const lng = Number(c.longitude ?? (c as any).lng);
     if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) return { lat, lng };
@@ -239,6 +246,13 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       (cu.name && c.customerName && cu.name.trim().toLowerCase() === c.customerName.trim().toLowerCase())
     );
     if (matched) {
+      const custClearedAt = matched.locationClearedAt ?? matched.location_cleared_at ?? null;
+      const custUpdatedAt = matched.locationUpdatedAt ?? matched.location_updated_at ?? null;
+      const isCustCleared =
+        (matched.id && deletedSet.has(`loc_clear_${matched.id}`)) ||
+        Boolean(custClearedAt && (!custUpdatedAt || String(custClearedAt) >= String(custUpdatedAt)));
+      if (isCustCleared) return null;
+
       const cLat = Number(matched.latitude ?? matched.lat);
       const cLng = Number(matched.longitude ?? matched.lng);
       if (!isNaN(cLat) && !isNaN(cLng) && cLat !== 0 && cLng !== 0) {

@@ -93,6 +93,7 @@ function mapContractRow(r: any) {
     longitude: r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : undefined),
     locationAddress: r.location_address ?? r.locationAddress ?? '',
     locationUpdatedAt: r.location_updated_at ?? r.locationUpdatedAt ?? undefined,
+    locationClearedAt: r.location_cleared_at ?? r.locationClearedAt ?? null,
     createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
     completedAt: r.completed_at ?? r.completedAt ?? null,
     updatedAt: r.updated_at ?? r.updatedAt ?? null,
@@ -214,8 +215,186 @@ function mapCustomerRow(r: any) {
     longitude: r.longitude != null ? Number(r.longitude) : undefined,
     locationAddress: r.location_address ?? r.locationAddress ?? '',
     locationUpdatedAt: r.location_updated_at ?? r.locationUpdatedAt ?? undefined,
+    locationClearedAt: r.location_cleared_at ?? r.locationClearedAt ?? null,
     createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
   };
+}
+
+async function clearContractAndCustomerLocations(contractId: string, clearIso?: string, customerNameHint?: string) {
+  const iso = clearIso || new Date().toISOString();
+  try {
+    let customerId = '';
+    let customerName = (customerNameHint || '').trim();
+    const relatedIds = new Set<string>([contractId]);
+
+    if (isPgConfigured()) {
+      const saleRows = await executePg(
+        `SELECT id, customer_id, customer_name FROM sales WHERE id = $1 LIMIT 1`,
+        [contractId]
+      ).catch(() => []);
+      if (saleRows && saleRows[0]) {
+        customerId = String(saleRows[0].customer_id || '').trim();
+        if (!customerName && saleRows[0].customer_name) {
+          customerName = String(saleRows[0].customer_name).trim();
+        }
+      }
+      if (!customerName && contractId.startsWith('cust-')) {
+        const custRows = await executePg(`SELECT id, name FROM customers WHERE id = $1 LIMIT 1`, [contractId]).catch(() => []);
+        if (custRows && custRows[0]?.name) customerName = String(custRows[0].name).trim();
+      }
+      if (customerId || customerName) {
+        const siblingRows = await executePg(
+          `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2)))`,
+          [customerId, customerName]
+        ).catch(() => []);
+        for (const sr of siblingRows || []) {
+          if (sr?.id) relatedIds.add(String(sr.id));
+        }
+      }
+
+      const tombstoneIds = Array.from(relatedIds).map((rid) => `loc_clear_${rid}`);
+      if (tombstoneIds.length > 0) {
+        await executePg(
+          `INSERT INTO deleted_records (record_id, table_name)
+           SELECT unnest($1::text[]), 'contract_locations'
+           ON CONFLICT (record_id) DO UPDATE SET deleted_at = CURRENT_TIMESTAMP`,
+          [tombstoneIds]
+        ).catch(() => {});
+      }
+
+      await executePg(
+        `UPDATE sales
+         SET latitude = NULL, longitude = NULL, location_address = NULL, location_updated_at = NULL, location_cleared_at = $1
+         WHERE id = ANY($2)`,
+        [iso, Array.from(relatedIds)]
+      ).catch(() => {});
+
+      await executePg(
+        `UPDATE customers
+         SET latitude = NULL, longitude = NULL, location_address = NULL, location_updated_at = NULL, location_cleared_at = $1
+         WHERE id = $2
+            OR ($3 != '' AND id = $3)
+            OR ($4 != '' AND TRIM(LOWER(name)) = TRIM(LOWER($4)))`,
+        [iso, contractId, customerId, customerName]
+      ).catch(() => {});
+
+      await executePg(
+        `UPDATE payments
+         SET latitude = NULL, longitude = NULL
+         WHERE (contract_id = ANY($1) OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2))))
+           AND COALESCE(created_at, payment_date, '') <= $3`,
+        [Array.from(relatedIds), customerName, iso]
+      ).catch(() => {});
+    }
+
+    const normTarget = customerName ? customerName.toLowerCase().replace(/\s+/g, ' ') : '';
+    const allContracts = fileDb.get<any>("contracts") || [];
+    let cChanged = false;
+    const nextContracts = allContracts.map((c: any) => {
+      const matchId = relatedIds.has(String(c.id));
+      const matchName = normTarget && c.customerName && String(c.customerName).trim().toLowerCase().replace(/\s+/g, ' ') === normTarget;
+      if (matchId || matchName) {
+        if (c.id) relatedIds.add(String(c.id));
+        cChanged = true;
+        return {
+          ...c,
+          latitude: null,
+          longitude: null,
+          locationAddress: null,
+          locationUpdatedAt: null,
+          locationClearedAt: iso,
+        };
+      }
+      return c;
+    });
+    if (cChanged) fileDb.setAll("contracts", nextContracts);
+
+    const allCusts = fileDb.get<any>("customers") || [];
+    let cuChanged = false;
+    const nextCusts = allCusts.map((cu: any) => {
+      const matchId = relatedIds.has(String(cu.id)) || (customerId && cu.id === customerId);
+      const matchName = normTarget && cu.name && String(cu.name).trim().toLowerCase().replace(/\s+/g, ' ') === normTarget;
+      if (matchId || matchName) {
+        cuChanged = true;
+        return {
+          ...cu,
+          latitude: null,
+          longitude: null,
+          location_address: null,
+          locationAddress: null,
+          location_updated_at: null,
+          locationUpdatedAt: null,
+          location_cleared_at: iso,
+          locationClearedAt: iso,
+        };
+      }
+      return cu;
+    });
+    if (cuChanged) fileDb.setAll("customers", nextCusts);
+
+    const allPays = fileDb.get<any>("payments") || [];
+    let pChanged = false;
+    const nextPays = allPays.map((p: any) => {
+      const matchId = p.contractId && relatedIds.has(String(p.contractId));
+      const matchName = normTarget && p.customerName && String(p.customerName).trim().toLowerCase().replace(/\s+/g, ' ') === normTarget;
+      if (matchId || matchName) {
+        if (p.latitude != null || p.longitude != null) {
+          pChanged = true;
+          return { ...p, latitude: null, longitude: null };
+        }
+      }
+      return p;
+    });
+    if (pChanged) fileDb.setAll("payments", nextPays);
+  } catch (err) {
+    console.warn("clearContractAndCustomerLocations error:", err);
+  }
+}
+
+async function unclearContractLocation(contractId: string, customerNameHint?: string) {
+  try {
+    let customerId = '';
+    let customerName = (customerNameHint || '').trim();
+    const relatedIds = new Set<string>([contractId]);
+
+    if (isPgConfigured()) {
+      const saleRows = await executePg(
+        `SELECT id, customer_id, customer_name FROM sales WHERE id = $1 LIMIT 1`,
+        [contractId]
+      ).catch(() => []);
+      if (saleRows && saleRows[0]) {
+        customerId = String(saleRows[0].customer_id || '').trim();
+        if (!customerName && saleRows[0].customer_name) {
+          customerName = String(saleRows[0].customer_name).trim();
+        }
+      }
+      if (customerId || customerName) {
+        const siblingRows = await executePg(
+          `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2)))`,
+          [customerId, customerName]
+        ).catch(() => []);
+        for (const sr of siblingRows || []) {
+          if (sr?.id) relatedIds.add(String(sr.id));
+        }
+      }
+
+      const tombstoneIds = Array.from(relatedIds).map((rid) => `loc_clear_${rid}`);
+      if (tombstoneIds.length > 0) {
+        await executePg(`DELETE FROM deleted_records WHERE record_id = ANY($1)`, [tombstoneIds]).catch(() => {});
+      }
+      await executePg(
+        `UPDATE sales SET location_cleared_at = NULL WHERE id = ANY($1)`,
+        [Array.from(relatedIds)]
+      ).catch(() => {});
+      await executePg(
+        `UPDATE customers SET location_cleared_at = NULL
+         WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND TRIM(LOWER(name)) = TRIM(LOWER($3)))`,
+        [contractId, customerId, customerName]
+      ).catch(() => {});
+    }
+  } catch (err) {
+    console.warn("unclearContractLocation error:", err);
+  }
 }
 
 // Helper to adjust cash fund balance safely in both fileDb and PostgreSQL
@@ -1164,19 +1343,36 @@ async function startServer() {
       let pinValid = verifyPinHash(normPin, storedSecret);
       // Support fallback default only if rep record has zero PIN configured
       if (!pinValid && !storedSecret) {
-        pinValid = normPin === '1234' || normPin === '0000' || (targetRow.id === 'rep-1' && normPin === '4444');
+        pinValid = normPin === '1234' || normPin === '0000' || (targetRow.id === 'rep-1' && (normPin === '7351' || normPin === '4444'));
+      }
+      // Also allow offlineVerifier match when row lacks pin_hash or has an out-of-sync pin_version
+      const storedOfflineVerifier = targetRow.offline_verifier || targetRow.offlineVerifier || '';
+      if (!pinValid && storedOfflineVerifier) {
+        const expectedPv = storedSecret ? computePinVersion(targetRow.id, storedSecret) : '';
+        const needsRepair = !targetRow.pin_hash || !targetRow.pin_version || (expectedPv && targetRow.pin_version !== expectedPv);
+        if (needsRepair && storedOfflineVerifier === computeOfflinePinVerifier(targetRow.id, normPin)) {
+          pinValid = true;
+        }
       }
 
       if (!pinValid) {
         return res.status(401).json({ error: "رمز الأمان غير صحيح!" });
       }
 
-      // Seamlessly upgrade legacy plaintext PINs in DB to salted scrypt hashes + version
-      const newPinHash = String(storedSecret).startsWith('scrypt_v1:') ? String(storedSecret) : hashPin(normPin);
+      // Seamlessly upgrade legacy plaintext PINs or repaired hashes in DB to salted scrypt hashes + version
+      const pinHashValidMatchesPin = storedSecret && verifyPinHash(normPin, storedSecret);
+      const newPinHash = (String(storedSecret).startsWith('scrypt_v1:') && pinHashValidMatchesPin)
+        ? String(storedSecret)
+        : hashPin(normPin);
       const newPinVersion = computePinVersion(targetRow.id, newPinHash);
       const newOfflineVerifier = computeOfflinePinVerifier(targetRow.id, normPin);
 
-      if (isPgConfigured() && (!targetRow.pin_hash || !targetRow.pin_version || !targetRow.offline_verifier)) {
+      if (
+        isPgConfigured() &&
+        (!targetRow.pin_hash ||
+          targetRow.pin_version !== newPinVersion ||
+          targetRow.offline_verifier !== newOfflineVerifier)
+      ) {
         await executePg(
           `UPDATE reps SET pin_hash = $1, pin_version = $2, offline_verifier = $3, code = '' WHERE id = $4`,
           [newPinHash, newPinVersion, newOfflineVerifier, targetRow.id]
@@ -1214,7 +1410,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/auth/verify", async (req, res) => {
+  app.all("/api/auth/verify", async (req, res) => {
     try {
       if (!req.authUser) {
         return res.status(401).json({ valid: false, error: "جلسة غير صالحة أو منتهية" });
@@ -1605,19 +1801,27 @@ async function startServer() {
         WHERE (list_id IS NULL OR list_id = '' OR list_id = 'unknown')
           AND EXISTS (SELECT 1 FROM customer_lists);
 
-        -- Synchronize GPS locations between sales and customers if missing on one side
+        -- Synchronize GPS locations between sales and customers ONLY when neither side has cleared location
         UPDATE customers c
-        SET latitude = s.latitude, longitude = s.longitude, location_address = COALESCE(c.location_address, s.location_address)
+        SET latitude = s.latitude, longitude = s.longitude, location_address = COALESCE(c.location_address, s.location_address), location_updated_at = COALESCE(c.location_updated_at, s.location_updated_at)
         FROM sales s
-        WHERE (c.id = s.customer_id OR c.name = s.customer_name)
+        WHERE (c.id = s.customer_id OR TRIM(LOWER(c.name)) = TRIM(LOWER(s.customer_name)))
           AND (c.latitude IS NULL OR c.latitude = 0)
+          AND c.location_cleared_at IS NULL
+          AND s.location_cleared_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = 'loc_clear_' || s.id)
+          AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = 'loc_clear_' || c.id)
           AND s.latitude IS NOT NULL AND s.latitude != 0;
 
         UPDATE sales s
-        SET latitude = c.latitude, longitude = c.longitude, location_address = COALESCE(s.location_address, c.location_address)
+        SET latitude = c.latitude, longitude = c.longitude, location_address = COALESCE(s.location_address, c.location_address), location_updated_at = COALESCE(s.location_updated_at, c.location_updated_at)
         FROM customers c
-        WHERE (c.id = s.customer_id OR c.name = s.customer_name)
+        WHERE (c.id = s.customer_id OR TRIM(LOWER(c.name)) = TRIM(LOWER(s.customer_name)))
           AND (s.latitude IS NULL OR s.latitude = 0)
+          AND s.location_cleared_at IS NULL
+          AND c.location_cleared_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = 'loc_clear_' || s.id)
+          AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = 'loc_clear_' || c.id)
           AND c.latitude IS NOT NULL AND c.latitude != 0;
       `).catch(() => {});
     } catch (e) {
@@ -1881,10 +2085,11 @@ async function startServer() {
           last_payment_date = EXCLUDED.last_payment_date,
           updated_at = EXCLUDED.updated_at,
           is_edited = EXCLUDED.is_edited,
-          latitude = COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude),
-          longitude = COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude),
-          location_address = COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address),
-          location_updated_at = COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at)`;
+          latitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude) END,
+          longitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
+          location_address = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
+          location_updated_at = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END,
+          location_cleared_at = CASE WHEN EXCLUDED.location_updated_at IS NOT NULL AND sales.location_cleared_at IS NOT NULL AND EXCLUDED.location_updated_at > sales.location_cleared_at THEN NULL ELSE sales.location_cleared_at END`;
       const vals = [
         id, saved.customerName, saved.customerPhone, saved.customerAddress, saved.itemId, saved.itemName,
         saved.itemQuantity, saved.purchasePrice, saved.listId, saved.listName,
@@ -1898,13 +2103,14 @@ async function startServer() {
       await executePg(sql1, vals);
       await executePg("DELETE FROM deleted_records WHERE record_id = $1", [id]).catch(() => {});
       if (saved.latitude != null && saved.longitude != null && !isNaN(Number(saved.latitude)) && !isNaN(Number(saved.longitude)) && Number(saved.latitude) !== 0 && Number(saved.longitude) !== 0) {
+        await unclearContractLocation(id, saved.customerName);
         await executePg(`
           UPDATE customers
-          SET latitude = COALESCE(NULLIF(latitude, 0), $1),
-              longitude = COALESCE(NULLIF(longitude, 0), $2),
-              location_address = COALESCE(NULLIF(location_address, ''), $3),
-              location_updated_at = COALESCE(location_updated_at, $4)
-          WHERE id = $5 OR name = $6
+          SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
+              longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
+              location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
+              location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
+          WHERE id = $5 OR TRIM(LOWER(name)) = TRIM(LOWER($6))
         `, [saved.latitude, saved.longitude, saved.locationAddress || '', saved.locationUpdatedAt || new Date().toISOString(), id, saved.customerName]).catch(() => {});
       }
       console.log(`[POST /api/contracts] Inserted ${id} into PostgreSQL successfully.`);
@@ -2017,10 +2223,10 @@ async function startServer() {
                 rep_name = EXCLUDED.rep_name,
                 updated_at = EXCLUDED.updated_at,
                 is_edited = EXCLUDED.is_edited,
-                latitude = COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude),
-                longitude = COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude),
-                location_address = COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address),
-                location_updated_at = COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at)`;
+                latitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude) END,
+                longitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
+                location_address = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
+                location_updated_at = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END`;
             const vals = [
               saved.id, saved.customerName, saved.customerPhone, saved.customerAddress, saved.itemId, saved.itemName,
               saved.itemQuantity, saved.purchasePrice, saved.listId, saved.listName,
@@ -2104,8 +2310,15 @@ async function startServer() {
         locationAddress: 'location_address',
         location_address: 'location_address',
         locationUpdatedAt: 'location_updated_at',
-        location_updated_at: 'location_updated_at'
+        location_updated_at: 'location_updated_at',
+        locationClearedAt: 'location_cleared_at',
+        location_cleared_at: 'location_cleared_at'
       };
+
+      const isClearingLoc =
+        updates.locationCleared === true ||
+        ((updates.latitude !== undefined || updates.longitude !== undefined) &&
+          (updates.latitude == null || updates.longitude == null || Number(updates.latitude) === 0 || Number(updates.longitude) === 0));
 
       const setClauses: string[] = [];
       const values: any[] = [];
@@ -2113,7 +2326,7 @@ async function startServer() {
       const addedCols = new Set<string>();
 
       for (const [k, v] of Object.entries(updates)) {
-        if (k === 'id') continue;
+        if (k === 'id' || k === 'locationCleared') continue;
         const col = fieldMap[k];
         if (col && !addedCols.has(col)) {
           addedCols.add(col);
@@ -2122,66 +2335,56 @@ async function startServer() {
         }
       }
 
-      if (setClauses.length > 0) {
-        values.push(id);
-        await executePg(`UPDATE sales SET ${setClauses.join(', ')} WHERE id = $${idx}`, values);
+      if (setClauses.length > 0 || isClearingLoc) {
+        if (setClauses.length > 0) {
+          values.push(id);
+          await executePg(`UPDATE sales SET ${setClauses.join(', ')} WHERE id = $${idx}`, values);
+        }
         await executePg("DELETE FROM deleted_records WHERE record_id = $1", [id]).catch(() => {});
 
-        if (updates.latitude !== undefined || updates.longitude !== undefined) {
+        if (isClearingLoc) {
+          const clearIso = updates.locationClearedAt || updates.location_cleared_at || new Date().toISOString();
+          await clearContractAndCustomerLocations(id, clearIso, updates.customerName || updates.customer_name);
+        } else if (updates.latitude !== undefined || updates.longitude !== undefined) {
           const newLat = (updates.latitude != null && updates.latitude !== 0 && !isNaN(Number(updates.latitude))) ? Number(updates.latitude) : null;
           const newLng = (updates.longitude != null && updates.longitude !== 0 && !isNaN(Number(updates.longitude))) ? Number(updates.longitude) : null;
           const newLocAddress = updates.locationAddress ?? updates.location_address ?? null;
-          const newLocUpdated = updates.locationUpdatedAt ?? updates.location_updated_at ?? null;
+          const newLocUpdated = updates.locationUpdatedAt ?? updates.location_updated_at ?? new Date().toISOString();
 
-          await executePg(`
-            UPDATE customers
-            SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4
-            WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
-               OR name IN (SELECT customer_name FROM sales WHERE id = $5)
-          `, [newLat, newLng, newLocAddress, newLocUpdated, id]).catch(() => {});
+          if (newLat != null && newLng != null) {
+            await unclearContractLocation(id, updates.customerName || updates.customer_name);
+            await executePg(
+              `UPDATE sales SET location_cleared_at = NULL WHERE id = $1`,
+              [id]
+            ).catch(() => {});
 
-          // Also update in fileDb customers
-          const allCusts = fileDb.get<any>("customers") || [];
-          const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === id);
-          let custChanged = false;
-          for (let i = 0; i < allCusts.length; i++) {
-            if (
-              (matchedSale?.customerId && allCusts[i].id === matchedSale.customerId) ||
-              (matchedSale?.customerName && allCusts[i].name && allCusts[i].name.trim().toLowerCase() === matchedSale.customerName.trim().toLowerCase()) ||
-              allCusts[i].id === id
-            ) {
-              allCusts[i].latitude = newLat;
-              allCusts[i].longitude = newLng;
-              allCusts[i].location_address = newLocAddress;
-              allCusts[i].location_updated_at = newLocUpdated;
-              custChanged = true;
-            }
-          }
-          if (custChanged) {
-            fileDb.setAll("customers", allCusts);
-          }
-
-          if (newLat == null || newLng == null) {
             await executePg(`
-              UPDATE payments
-              SET latitude = NULL, longitude = NULL
-              WHERE contract_id = $1 OR customer_name IN (SELECT customer_name FROM sales WHERE id = $1)
-            `, [id]).catch(() => {});
+              UPDATE customers
+              SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
+              WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
+                 OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $5)
+            `, [newLat, newLng, newLocAddress, newLocUpdated, id]).catch(() => {});
 
-            // Also clear in fileDb payments
-            const allP = fileDb.get<any>("payments") || [];
-            let pChanged = false;
-            for (let i = 0; i < allP.length; i++) {
-              if (allP[i].contractId === id) {
-                if (allP[i].latitude != null || allP[i].longitude != null) {
-                  allP[i].latitude = null;
-                  allP[i].longitude = null;
-                  pChanged = true;
-                }
+            const allCusts = fileDb.get<any>("customers") || [];
+            const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === id);
+            let custChanged = false;
+            for (let i = 0; i < allCusts.length; i++) {
+              if (
+                (matchedSale?.customerId && allCusts[i].id === matchedSale.customerId) ||
+                (matchedSale?.customerName && allCusts[i].name && allCusts[i].name.trim().toLowerCase() === matchedSale.customerName.trim().toLowerCase()) ||
+                allCusts[i].id === id
+              ) {
+                allCusts[i].latitude = newLat;
+                allCusts[i].longitude = newLng;
+                allCusts[i].location_address = newLocAddress;
+                allCusts[i].location_updated_at = newLocUpdated;
+                allCusts[i].location_cleared_at = null;
+                allCusts[i].locationClearedAt = null;
+                custChanged = true;
               }
             }
-            if (pChanged) {
-              fileDb.setAll("payments", allP);
+            if (custChanged) {
+              fileDb.setAll("customers", allCusts);
             }
           }
         }
@@ -2596,27 +2799,38 @@ async function startServer() {
       await executePgWithContext(sql1, vals, ctx);
       await executePg("DELETE FROM deleted_records WHERE record_id = $1", [id]).catch(() => {});
 
-      // If payment has GPS location, immediately reflect it as the customer's location on the map
-      if (contractId && latitude != null && longitude != null && !isNaN(latitude) && !isNaN(longitude)) {
+      // If payment has GPS location and was captured AFTER any prior location clear, reflect it on the map
+      if (contractId && latitude != null && longitude != null && !isNaN(latitude) && !isNaN(longitude) && latitude !== 0 && longitude !== 0) {
         const nowIso = new Date().toISOString();
-        await executePg(`
-          UPDATE sales 
-          SET latitude = $1, longitude = $2, location_updated_at = $3
-          WHERE id = $4
-        `, [latitude, longitude, nowIso, contractId]).catch(() => {});
+        const paymentTs = String(createdAt || nowIso);
+        const existingSaleRows = await executePg(
+          `SELECT customer_name, location_cleared_at FROM sales WHERE id = $1 LIMIT 1`,
+          [contractId]
+        ).catch(() => []);
+        const clearedAt = existingSaleRows?.[0]?.location_cleared_at || '';
+        const shouldApplyPaymentGps = !clearedAt || paymentTs > clearedAt;
 
-        await executePg(`
-          UPDATE customers 
-          SET latitude = $1, longitude = $2
-          WHERE id IN (SELECT customer_id FROM sales WHERE id = $3)
-             OR name IN (SELECT customer_name FROM sales WHERE id = $3)
-        `, [latitude, longitude, contractId]).catch(() => {});
+        if (shouldApplyPaymentGps) {
+          await unclearContractLocation(contractId, customerName || existingSaleRows?.[0]?.customer_name);
+          await executePg(`
+            UPDATE sales 
+            SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+            WHERE id = $4
+          `, [latitude, longitude, nowIso, contractId]).catch(() => {});
 
-        const allC = fileDb.get<any>("contracts") || [];
-        const cIdx = allC.findIndex((x: any) => x.id === contractId);
-        if (cIdx !== -1) {
-          allC[cIdx] = { ...allC[cIdx], latitude, longitude, locationUpdatedAt: nowIso };
-          fileDb.setAll("contracts", allC);
+          await executePg(`
+            UPDATE customers 
+            SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+            WHERE id IN (SELECT customer_id FROM sales WHERE id = $4)
+               OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $4)
+          `, [latitude, longitude, nowIso, contractId]).catch(() => {});
+
+          const allC = fileDb.get<any>("contracts") || [];
+          const cIdx = allC.findIndex((x: any) => x.id === contractId);
+          if (cIdx !== -1) {
+            allC[cIdx] = { ...allC[cIdx], latitude, longitude, locationUpdatedAt: nowIso, locationClearedAt: null };
+            fileDb.setAll("contracts", allC);
+          }
         }
       }
 
@@ -3402,10 +3616,15 @@ async function startServer() {
     try {
       const { id } = req.params;
       const b = req.body;
-      const latVal = b.latitude !== undefined ? (b.latitude != null && b.latitude !== 0 && !isNaN(Number(b.latitude)) ? Number(b.latitude) : null) : undefined;
-      const lngVal = b.longitude !== undefined ? (b.longitude != null && b.longitude !== 0 && !isNaN(Number(b.longitude)) ? Number(b.longitude) : null) : undefined;
-      const locAddrVal = b.locationAddress ?? b.location_address;
-      const locUpdVal = b.locationUpdatedAt ?? b.location_updated_at;
+      const isClearingLoc =
+        b.locationCleared === true ||
+        ((b.latitude !== undefined || b.longitude !== undefined) &&
+          (b.latitude == null || b.longitude == null || Number(b.latitude) === 0 || Number(b.longitude) === 0));
+      const latVal = isClearingLoc ? null : (b.latitude !== undefined && b.latitude != null && b.latitude !== 0 && !isNaN(Number(b.latitude)) ? Number(b.latitude) : undefined);
+      const lngVal = isClearingLoc ? null : (b.longitude !== undefined && b.longitude != null && b.longitude !== 0 && !isNaN(Number(b.longitude)) ? Number(b.longitude) : undefined);
+      const locAddrVal = isClearingLoc ? null : (b.locationAddress ?? b.location_address);
+      const locUpdVal = isClearingLoc ? null : (b.locationUpdatedAt ?? b.location_updated_at ?? (latVal != null ? new Date().toISOString() : undefined));
+      const clearIso = isClearingLoc ? (b.locationClearedAt || b.location_cleared_at || new Date().toISOString()) : null;
 
       if (isPgConfigured()) {
         await executePg(`
@@ -3419,9 +3638,10 @@ async function startServer() {
             status = COALESCE($7, status),
             latitude = CASE WHEN $8::boolean THEN $9::double precision ELSE latitude END,
             longitude = CASE WHEN $10::boolean THEN $11::double precision ELSE longitude END,
-            location_address = COALESCE($12, location_address),
-            location_updated_at = COALESCE($13, location_updated_at)
-          WHERE id = $14
+            location_address = CASE WHEN $12::boolean THEN $13::text ELSE COALESCE($13, location_address) END,
+            location_updated_at = CASE WHEN $12::boolean THEN $14::text ELSE COALESCE($14, location_updated_at) END,
+            location_cleared_at = CASE WHEN $12::boolean THEN $15::text ELSE CASE WHEN $9::double precision IS NOT NULL THEN NULL ELSE location_cleared_at END END
+          WHERE id = $16
         `, [
           b.name,
           b.phone,
@@ -3430,30 +3650,47 @@ async function startServer() {
           b.listName ?? b.list_name,
           b.notes,
           b.status,
-          b.latitude !== undefined,
+          isClearingLoc || b.latitude !== undefined,
           latVal ?? null,
-          b.longitude !== undefined,
+          isClearingLoc || b.longitude !== undefined,
           lngVal ?? null,
-          locAddrVal,
-          locUpdVal,
+          isClearingLoc,
+          locAddrVal ?? null,
+          locUpdVal ?? null,
+          clearIso,
           id
         ]).catch(() => {});
 
-        if (b.latitude !== undefined || b.longitude !== undefined) {
+        if (isClearingLoc) {
+          const custRows = await executePg(`SELECT name FROM customers WHERE id = $1 LIMIT 1`, [id]).catch(() => []);
+          const custName = b.name || custRows?.[0]?.name || '';
+          const relSales = await executePg(
+            `SELECT id FROM sales WHERE customer_id = $1 OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2))) OR id = $1`,
+            [id, custName]
+          ).catch(() => []);
+          await clearContractAndCustomerLocations(id, clearIso!, custName);
+          for (const sr of relSales || []) {
+            if (sr?.id) await clearContractAndCustomerLocations(String(sr.id), clearIso!, custName);
+          }
+        } else if (latVal != null && lngVal != null) {
+          const custRows = await executePg(`SELECT name FROM customers WHERE id = $1 LIMIT 1`, [id]).catch(() => []);
+          const custName = b.name || custRows?.[0]?.name || '';
+          await unclearContractLocation(id, custName);
           await executePg(`
             UPDATE sales
-            SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4
-            WHERE customer_id = $5 OR customer_name IN (SELECT name FROM customers WHERE id = $5)
-          `, [latVal ?? null, lngVal ?? null, locAddrVal ?? null, locUpdVal ?? null, id]).catch(() => {});
+            SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
+            WHERE customer_id = $5 OR ($6 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($6)))
+          `, [latVal, lngVal, locAddrVal ?? null, locUpdVal ?? new Date().toISOString(), id, custName]).catch(() => {});
         }
       }
 
       fileDb.update("customers", id, {
         ...b,
-        ...(latVal !== undefined ? { latitude: latVal } : {}),
-        ...(lngVal !== undefined ? { longitude: lngVal } : {}),
-        ...(locAddrVal !== undefined ? { locationAddress: locAddrVal, location_address: locAddrVal } : {}),
-        ...(locUpdVal !== undefined ? { locationUpdatedAt: locUpdVal, location_updated_at: locUpdVal } : {})
+        ...(isClearingLoc ? { latitude: null, longitude: null, locationAddress: null, location_address: null, locationUpdatedAt: null, location_updated_at: null, locationClearedAt: clearIso, location_cleared_at: clearIso } : {}),
+        ...(!isClearingLoc && latVal !== undefined ? { latitude: latVal, locationClearedAt: null, location_cleared_at: null } : {}),
+        ...(!isClearingLoc && lngVal !== undefined ? { longitude: lngVal } : {}),
+        ...(!isClearingLoc && locAddrVal !== undefined ? { locationAddress: locAddrVal, location_address: locAddrVal } : {}),
+        ...(!isClearingLoc && locUpdVal !== undefined ? { locationUpdatedAt: locUpdVal, location_updated_at: locUpdVal } : {})
       });
       bumpSyncVersion();
       res.json({ success: true });
@@ -3530,9 +3767,9 @@ async function startServer() {
             VALUES ('rep-1', 'ضياء المحاسب', '07801112233', '', $1, $2, $3, 'admin', true, true, true, true, '["all"]')
             ON CONFLICT (id) DO UPDATE SET name = 'ضياء المحاسب', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
           `, [
-            hashPin('4444'),
-            computePinVersion('rep-1', '4444'),
-            computeOfflinePinVerifier('rep-1', '4444'),
+            hashPin('7351'),
+            computePinVersion('rep-1', '7351'),
+            computeOfflinePinVerifier('rep-1', '7351'),
           ]).catch(() => {});
 
           const rows = await executePg("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
@@ -3545,8 +3782,8 @@ async function startServer() {
                 phone: '07801112233',
                 code: '',
                 pinSet: true,
-                pinVersion: computePinVersion('rep-1', '4444'),
-                offlineVerifier: computeOfflinePinVerifier('rep-1', '4444'),
+                pinVersion: computePinVersion('rep-1', '7351'),
+                offlineVerifier: computeOfflinePinVerifier('rep-1', '7351'),
                 role: 'admin',
                 canEdit: true,
                 canDelete: true,
@@ -3571,8 +3808,8 @@ async function startServer() {
           phone: '07801112233',
           code: '',
           pinSet: true,
-          pinVersion: computePinVersion('rep-1', '4444'),
-          offlineVerifier: computeOfflinePinVerifier('rep-1', '4444'),
+          pinVersion: computePinVersion('rep-1', '7351'),
+          offlineVerifier: computeOfflinePinVerifier('rep-1', '7351'),
           role: 'admin',
           canEdit: true,
           canDelete: true,
@@ -5366,10 +5603,41 @@ async function startServer() {
           const upAt = payload.updatedAt ?? payload.updated_at ?? new Date().toISOString();
           const isEd = Boolean(payload.isEdited ?? payload.is_edited);
 
-          const lat = payload.latitude != null ? Number(payload.latitude) : (payload.lat != null ? Number(payload.lat) : null);
-          const lng = payload.longitude != null ? Number(payload.longitude) : (payload.lng != null ? Number(payload.lng) : null);
-          const locAddr = payload.locationAddress ?? payload.location_address ?? null;
-          const locUpAt = payload.locationUpdatedAt ?? payload.location_updated_at ?? null;
+          let lat = payload.latitude != null && !isNaN(Number(payload.latitude)) && Number(payload.latitude) !== 0 ? Number(payload.latitude) : (payload.lat != null && !isNaN(Number(payload.lat)) && Number(payload.lat) !== 0 ? Number(payload.lat) : null);
+          let lng = payload.longitude != null && !isNaN(Number(payload.longitude)) && Number(payload.longitude) !== 0 ? Number(payload.longitude) : (payload.lng != null && !isNaN(Number(payload.lng)) && Number(payload.lng) !== 0 ? Number(payload.lng) : null);
+          let locAddr = payload.locationAddress ?? payload.location_address ?? null;
+          let locUpAt = payload.locationUpdatedAt ?? payload.location_updated_at ?? null;
+          let locClearedAt = payload.locationClearedAt ?? payload.location_cleared_at ?? null;
+
+          if (isPgConfigured()) {
+            const [saleStateRows, clearRows] = await Promise.all([
+              executePg(`SELECT location_cleared_at FROM sales WHERE id = $1 LIMIT 1`, [payload.id]).catch(() => []),
+              executePg(`SELECT 1 FROM deleted_records WHERE record_id = $1 LIMIT 1`, [`loc_clear_${payload.id}`]).catch(() => []),
+            ]);
+            const serverClearedAt = saleStateRows?.[0]?.location_cleared_at || '';
+            const hasTombstone = Boolean(clearRows && clearRows.length > 0);
+            const payloadExplicitlyCleared = payload.locationCleared === true || Boolean(locClearedAt && (!locUpAt || locClearedAt >= locUpAt));
+
+            if (payloadExplicitlyCleared) {
+              lat = null;
+              lng = null;
+              locAddr = null;
+              locUpAt = null;
+              locClearedAt = locClearedAt || new Date().toISOString();
+            } else if (serverClearedAt || hasTombstone) {
+              const incomingIsStrictlyNewer = Boolean(locUpAt && serverClearedAt && String(locUpAt) > String(serverClearedAt));
+              if (!incomingIsStrictlyNewer) {
+                lat = null;
+                lng = null;
+                locAddr = null;
+                locUpAt = null;
+                locClearedAt = serverClearedAt || locClearedAt || new Date().toISOString();
+              } else {
+                await unclearContractLocation(payload.id, cName);
+                locClearedAt = null;
+              }
+            }
+          }
 
           const contractObj = {
             ...payload,
@@ -5381,6 +5649,7 @@ async function startServer() {
             longitude: lng,
             locationAddress: locAddr,
             locationUpdatedAt: locUpAt,
+            locationClearedAt: locClearedAt,
             itemId: iId,
             itemName: iName,
             itemQuantity: iQty,
@@ -5412,11 +5681,11 @@ async function startServer() {
             remBal, dInst, sDate, notes,
             status, lastPayDate, tPaid, rName,
             cAt, compAt, upAt, isEd,
-            lat, lng, locAddr, locUpAt
+            lat, lng, locAddr, locUpAt, locClearedAt
           ];
           await executePg(
-            `INSERT INTO sales (id, customer_name, customer_phone, customer_address, item_id, item_name, item_quantity, purchase_price, list_id, list_name, total_price, advance_payment, remaining_balance, daily_installment, start_date, notes, status, last_payment_date, total_paid, rep_name, created_at, completed_at, updated_at, is_edited, latitude, longitude, location_address, location_updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+            `INSERT INTO sales (id, customer_name, customer_phone, customer_address, item_id, item_name, item_quantity, purchase_price, list_id, list_name, total_price, advance_payment, remaining_balance, daily_installment, start_date, notes, status, last_payment_date, total_paid, rep_name, created_at, completed_at, updated_at, is_edited, latitude, longitude, location_address, location_updated_at, location_cleared_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
              ON CONFLICT (id) DO UPDATE SET
                customer_name=EXCLUDED.customer_name, customer_phone=EXCLUDED.customer_phone, customer_address=EXCLUDED.customer_address,
                item_id=EXCLUDED.item_id, item_name=EXCLUDED.item_name, item_quantity=EXCLUDED.item_quantity, purchase_price=EXCLUDED.purchase_price,
@@ -5425,20 +5694,23 @@ async function startServer() {
                start_date=EXCLUDED.start_date, notes=EXCLUDED.notes, status=EXCLUDED.status, last_payment_date=EXCLUDED.last_payment_date,
                total_paid=EXCLUDED.total_paid, rep_name=EXCLUDED.rep_name, completed_at=EXCLUDED.completed_at,
                updated_at=EXCLUDED.updated_at, is_edited=EXCLUDED.is_edited,
-               latitude=COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude),
-               longitude=COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude),
-               location_address=COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address),
-               location_updated_at=COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at)`,
+               latitude=CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude) END,
+               longitude=CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
+               location_address=CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
+               location_updated_at=CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END,
+               location_cleared_at=COALESCE(EXCLUDED.location_cleared_at, sales.location_cleared_at)`,
             vals
           );
-          if (lat != null && lng != null && !isNaN(Number(lat)) && !isNaN(Number(lng)) && Number(lat) !== 0 && Number(lng) !== 0) {
+          if (locClearedAt && (lat == null || lng == null)) {
+            await clearContractAndCustomerLocations(payload.id, locClearedAt, cName);
+          } else if (lat != null && lng != null && !isNaN(Number(lat)) && !isNaN(Number(lng)) && Number(lat) !== 0 && Number(lng) !== 0) {
             await executePg(`
               UPDATE customers
-              SET latitude = COALESCE(NULLIF(latitude, 0), $1),
-                  longitude = COALESCE(NULLIF(longitude, 0), $2),
-                  location_address = COALESCE(NULLIF(location_address, ''), $3),
-                  location_updated_at = COALESCE(location_updated_at, $4)
-              WHERE id = $5 OR name = $6
+              SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
+                  longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
+                  location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
+                  location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
+              WHERE id = $5 OR TRIM(LOWER(name)) = TRIM(LOWER($6))
             `, [lat, lng, locAddr || '', locUpAt || new Date().toISOString(), payload.id, cName]).catch(() => {});
           }
           return true;
@@ -5452,6 +5724,11 @@ async function startServer() {
             return true;
           }
           fileDb.update("contracts", payload.id, payload);
+          const isClearingLoc =
+            payload.locationCleared === true ||
+            ((payload.latitude !== undefined || payload.longitude !== undefined) &&
+              (payload.latitude == null || payload.longitude == null || Number(payload.latitude) === 0 || Number(payload.longitude) === 0));
+
           const fields: string[] = [];
           const vals: any[] = [];
           let idx = 1;
@@ -5503,11 +5780,13 @@ async function startServer() {
             locationAddress: "location_address",
             location_address: "location_address",
             locationUpdatedAt: "location_updated_at",
-            location_updated_at: "location_updated_at"
+            location_updated_at: "location_updated_at",
+            locationClearedAt: "location_cleared_at",
+            location_cleared_at: "location_cleared_at"
           };
           const addedCols = new Set<string>();
           for (const [k, v] of Object.entries(payload)) {
-            if (k === "id") continue;
+            if (k === "id" || k === "locationCleared") continue;
             const mappedCol = colMap[k];
             if (mappedCol && !addedCols.has(mappedCol)) {
               addedCols.add(mappedCol);
@@ -5515,62 +5794,50 @@ async function startServer() {
               vals.push(v);
             }
           }
-          if (fields.length > 0) {
-            vals.push(payload.id);
-            await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx}`, vals).catch(() => {});
-            if (payload.latitude !== undefined || payload.longitude !== undefined) {
+          if (fields.length > 0 || isClearingLoc) {
+            if (fields.length > 0) {
+              vals.push(payload.id);
+              await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx}`, vals).catch(() => {});
+            }
+            if (isClearingLoc) {
+              const clearIso = payload.locationClearedAt || payload.location_cleared_at || new Date().toISOString();
+              await clearContractAndCustomerLocations(payload.id, clearIso, payload.customerName || payload.customer_name);
+            } else if (payload.latitude !== undefined || payload.longitude !== undefined) {
               const newLat = (payload.latitude != null && payload.latitude !== 0 && !isNaN(Number(payload.latitude))) ? Number(payload.latitude) : null;
               const newLng = (payload.longitude != null && payload.longitude !== 0 && !isNaN(Number(payload.longitude))) ? Number(payload.longitude) : null;
               const newLocAddress = payload.locationAddress ?? payload.location_address ?? null;
-              const newLocUpdated = payload.locationUpdatedAt ?? payload.location_updated_at ?? null;
-              await executePg(`
-                UPDATE customers
-                SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4
-                WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
-                   OR name IN (SELECT customer_name FROM sales WHERE id = $5)
-                   OR id = $5
-              `, [newLat, newLng, newLocAddress, newLocUpdated, payload.id]).catch(() => {});
-
-              const allCusts = fileDb.get<any>("customers") || [];
-              const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === payload.id);
-              let custChanged = false;
-              for (let i = 0; i < allCusts.length; i++) {
-                if (
-                  (matchedSale?.customerId && allCusts[i].id === matchedSale.customerId) ||
-                  (matchedSale?.customerName && allCusts[i].name && allCusts[i].name.trim().toLowerCase() === matchedSale.customerName.trim().toLowerCase()) ||
-                  allCusts[i].id === payload.id
-                ) {
-                  allCusts[i].latitude = newLat;
-                  allCusts[i].longitude = newLng;
-                  allCusts[i].location_address = newLocAddress;
-                  allCusts[i].location_updated_at = newLocUpdated;
-                  custChanged = true;
-                }
-              }
-              if (custChanged) {
-                fileDb.setAll("customers", allCusts);
-              }
-
-              if (newLat == null || newLng == null) {
+              const newLocUpdated = payload.locationUpdatedAt ?? payload.location_updated_at ?? new Date().toISOString();
+              if (newLat != null && newLng != null) {
+                await unclearContractLocation(payload.id, payload.customerName || payload.customer_name);
+                await executePg(`UPDATE sales SET location_cleared_at = NULL WHERE id = $1`, [payload.id]).catch(() => {});
                 await executePg(`
-                  UPDATE payments
-                  SET latitude = NULL, longitude = NULL
-                  WHERE contract_id = $1 OR customer_name IN (SELECT customer_name FROM sales WHERE id = $1)
-                `, [payload.id]).catch(() => {});
+                  UPDATE customers
+                  SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
+                  WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
+                     OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $5)
+                     OR id = $5
+                `, [newLat, newLng, newLocAddress, newLocUpdated, payload.id]).catch(() => {});
 
-                const allP = fileDb.get<any>("payments") || [];
-                let pChanged = false;
-                for (let i = 0; i < allP.length; i++) {
-                  if (allP[i].contractId === payload.id || (matchedSale?.customerName && allP[i].customerName === matchedSale.customerName)) {
-                    if (allP[i].latitude != null || allP[i].longitude != null) {
-                      allP[i].latitude = null;
-                      allP[i].longitude = null;
-                      pChanged = true;
-                    }
+                const allCusts = fileDb.get<any>("customers") || [];
+                const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === payload.id);
+                let custChanged = false;
+                for (let i = 0; i < allCusts.length; i++) {
+                  if (
+                    (matchedSale?.customerId && allCusts[i].id === matchedSale.customerId) ||
+                    (matchedSale?.customerName && allCusts[i].name && allCusts[i].name.trim().toLowerCase() === matchedSale.customerName.trim().toLowerCase()) ||
+                    allCusts[i].id === payload.id
+                  ) {
+                    allCusts[i].latitude = newLat;
+                    allCusts[i].longitude = newLng;
+                    allCusts[i].location_address = newLocAddress;
+                    allCusts[i].location_updated_at = newLocUpdated;
+                    allCusts[i].location_cleared_at = null;
+                    allCusts[i].locationClearedAt = null;
+                    custChanged = true;
                   }
                 }
-                if (pChanged) {
-                  fileDb.setAll("payments", allP);
+                if (custChanged) {
+                  fileDb.setAll("customers", allCusts);
                 }
               }
             }
@@ -5743,30 +6010,38 @@ async function startServer() {
 
           if (cId && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng) && pLat !== 0 && pLng !== 0) {
             const nowIso = new Date().toISOString();
+            const paymentTs = String(cAt || nowIso);
             const shouldForceUpdate = Boolean(payload.updateCustomerLocation || payload.shouldUpdateCustomerLocation);
+            const saleCheckRows = await executePg(
+              `SELECT location_cleared_at FROM sales WHERE id = $1 LIMIT 1`,
+              [cId]
+            ).catch(() => []);
+            const clearedAt = saleCheckRows?.[0]?.location_cleared_at || '';
 
-            // Only update sales & customers if customer has NO location yet (first payment / deleted location) OR explicitly forced:
-            await executePg(`
-              UPDATE sales 
-              SET latitude = $1, longitude = $2, location_updated_at = $3
-              WHERE id = $4 AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
-            `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
+            if (!clearedAt || paymentTs > clearedAt || shouldForceUpdate) {
+              await unclearContractLocation(cId, cName);
+              await executePg(`
+                UPDATE sales 
+                SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                WHERE id = $4 AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
+              `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
 
-            await executePg(`
-              UPDATE customers 
-              SET latitude = $1, longitude = $2
-              WHERE (id IN (SELECT customer_id FROM sales WHERE id = $3) OR name IN (SELECT customer_name FROM sales WHERE id = $3))
-                AND ($4::boolean = true OR latitude IS NULL OR latitude = 0)
-            `, [pLat, pLng, cId, shouldForceUpdate]).catch(() => {});
+              await executePg(`
+                UPDATE customers 
+                SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $4))
+                  AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
+              `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
 
-            const allC = fileDb.get<any>("contracts") || [];
-            const cIdx = allC.findIndex((x: any) => x.id === cId);
-            if (cIdx !== -1) {
-              const existingC = allC[cIdx];
-              const hasOldLoc = existingC.latitude != null && Number(existingC.latitude) !== 0;
-              if (shouldForceUpdate || !hasOldLoc) {
-                allC[cIdx] = { ...existingC, latitude: pLat, longitude: pLng, locationUpdatedAt: nowIso };
-                fileDb.setAll("contracts", allC);
+              const allC = fileDb.get<any>("contracts") || [];
+              const cIdx = allC.findIndex((x: any) => x.id === cId);
+              if (cIdx !== -1) {
+                const existingC = allC[cIdx];
+                const hasOldLoc = existingC.latitude != null && Number(existingC.latitude) !== 0;
+                if (shouldForceUpdate || !hasOldLoc) {
+                  allC[cIdx] = { ...existingC, latitude: pLat, longitude: pLng, locationUpdatedAt: nowIso, locationClearedAt: null };
+                  fileDb.setAll("contracts", allC);
+                }
               }
             }
           }
@@ -6619,9 +6894,9 @@ async function startServer() {
           VALUES ('rep-1', 'ضياء المحاسب', '07801112233', '', $1, $2, $3, 'admin', true, true, true, true, '["all"]')
           ON CONFLICT (id) DO UPDATE SET name = 'ضياء المحاسب', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
         `, [
-          hashPin('4444'),
-          computePinVersion('rep-1', '4444'),
-          computeOfflinePinVerifier('rep-1', '4444'),
+          hashPin('7351'),
+          computePinVersion('rep-1', '7351'),
+          computeOfflinePinVerifier('rep-1', '7351'),
         ]).catch(() => {});
 
         const [
@@ -6732,6 +7007,7 @@ async function startServer() {
           longitude: c.longitude != null ? Number(c.longitude) : null,
           locationAddress: c.location_address || c.locationAddress || '',
           locationUpdatedAt: c.location_updated_at || c.locationUpdatedAt || null,
+          locationClearedAt: c.location_cleared_at || c.locationClearedAt || null,
         }));
         const payments = (paymentsRows || []).map(mapPaymentRow);
         const inventory = (inventoryRows || []).map(mapInventoryRow);
@@ -6744,8 +7020,8 @@ async function startServer() {
             phone: '07801112233',
             code: '',
             pinSet: true,
-            pinVersion: computePinVersion('rep-1', '4444'),
-            offlineVerifier: computeOfflinePinVerifier('rep-1', '4444'),
+            pinVersion: computePinVersion('rep-1', '7351'),
+            offlineVerifier: computeOfflinePinVerifier('rep-1', '7351'),
             role: 'admin',
             canEdit: true,
             canDelete: true,
@@ -6830,6 +7106,19 @@ async function startServer() {
             !activeEmpIds.has(String(id))
           );
 
+        const clearedLocationSet = new Set<string>();
+        for (const r of deletedRows || []) {
+          const rid = String(r?.record_id || '');
+          if (rid.startsWith('loc_clear_')) {
+            clearedLocationSet.add(rid.replace(/^loc_clear_/, ''));
+          }
+        }
+        for (const c of contracts) {
+          if (c?.id && c.locationClearedAt && (!c.locationUpdatedAt || String(c.locationClearedAt) >= String(c.locationUpdatedAt))) {
+            clearedLocationSet.add(String(c.id));
+          }
+        }
+
         return res.json({
           success: true,
           serverTimestamp: new Date().toISOString(),
@@ -6846,6 +7135,7 @@ async function startServer() {
           paymentConflicts,
           appointments,
           deletedRecordIds,
+          clearedLocationContractIds: Array.from(clearedLocationSet),
         });
       }
 
@@ -7083,17 +7373,23 @@ async function startServer() {
               }
               if (row.contract_id && row.latitude != null && row.longitude != null && row.latitude !== 0 && row.longitude !== 0) {
                 const nowIso = new Date().toISOString();
-                await executePg(`
-                  UPDATE sales
-                  SET latitude = $1, longitude = $2, location_updated_at = $3
-                  WHERE id = $4 AND (latitude IS NULL OR latitude = 0)
-                `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
-                await executePg(`
-                  UPDATE customers
-                  SET latitude = $1, longitude = $2, location_updated_at = $3
-                  WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR name IN (SELECT customer_name FROM sales WHERE id = $4))
-                    AND (latitude IS NULL OR latitude = 0)
-                `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
+                const paymentTs = String(row.created_at || nowIso);
+                const saleState = await executePg(`SELECT location_cleared_at FROM sales WHERE id = $1 LIMIT 1`, [row.contract_id]).catch(() => []);
+                const clearedAt = saleState?.[0]?.location_cleared_at || '';
+                if (!clearedAt || paymentTs > clearedAt) {
+                  await unclearContractLocation(row.contract_id, row.customer_name);
+                  await executePg(`
+                    UPDATE sales
+                    SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                    WHERE id = $4 AND (latitude IS NULL OR latitude = 0)
+                  `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
+                  await executePg(`
+                    UPDATE customers
+                    SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                    WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $4))
+                      AND (latitude IS NULL OR latitude = 0)
+                  `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
+                }
               }
             }
 
@@ -7114,6 +7410,22 @@ async function startServer() {
 
       // 3. High-Performance Bulk Upsert for Contracts (jsonb_to_recordset in 1 single SQL statement)
       if (contractActions.length > 0) {
+        const candIds = contractActions.map((a) => String(a?.payload?.id || '')).filter(Boolean);
+        const clearedLookup = new Map<string, string>();
+        if (candIds.length > 0 && isPgConfigured()) {
+          const [saleClearRows, tombClearRows] = await Promise.all([
+            executePg(`SELECT id, location_cleared_at FROM sales WHERE id = ANY($1) AND location_cleared_at IS NOT NULL`, [candIds]).catch(() => []),
+            executePg(`SELECT record_id FROM deleted_records WHERE record_id = ANY($1)`, [candIds.map((id) => `loc_clear_${id}`)]).catch(() => []),
+          ]);
+          for (const sr of saleClearRows || []) {
+            if (sr?.id && sr?.location_cleared_at) clearedLookup.set(String(sr.id), String(sr.location_cleared_at));
+          }
+          for (const tr of tombClearRows || []) {
+            const rawId = String(tr?.record_id || '').replace(/^loc_clear_/, '');
+            if (rawId && !clearedLookup.has(rawId)) clearedLookup.set(rawId, '1970-01-01T00:00:00.000Z');
+          }
+        }
+
         const contractRows = contractActions.map((act) => {
           const c = act.payload || {};
           if (c.id && (String(c.id).startsWith('pay_') || String(c.id).startsWith('ft_') || String(c.id).startsWith('emptx_') || String(c.id).startsWith('conflict_'))) {
@@ -7126,10 +7438,23 @@ async function startServer() {
           const daily = Number(c.dailyInstallment ?? c.daily_installment) || 0;
           const stat = rem <= 0 ? 'completed' : (c.status || 'active');
 
-          const latVal = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : (c.lat != null && !isNaN(Number(c.lat)) && Number(c.lat) !== 0 ? Number(c.lat) : null);
-          const lngVal = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : (c.lng != null && !isNaN(Number(c.lng)) && Number(c.lng) !== 0 ? Number(c.lng) : null);
-          const locAddr = c.locationAddress ?? c.location_address ?? null;
-          const locUpAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
+          let latVal = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : (c.lat != null && !isNaN(Number(c.lat)) && Number(c.lat) !== 0 ? Number(c.lat) : null);
+          let lngVal = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : (c.lng != null && !isNaN(Number(c.lng)) && Number(c.lng) !== 0 ? Number(c.lng) : null);
+          let locAddr = c.locationAddress ?? c.location_address ?? null;
+          let locUpAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
+          let locClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? null;
+
+          const serverClearedAt = clearedLookup.get(String(c.id));
+          if (serverClearedAt) {
+            const incomingNewer = Boolean(locUpAt && String(locUpAt) > String(serverClearedAt));
+            if (!incomingNewer) {
+              latVal = null;
+              lngVal = null;
+              locAddr = null;
+              locUpAt = null;
+              locClearedAt = serverClearedAt;
+            }
+          }
 
           if (c.id) affectedContractIds.add(c.id);
 
@@ -7142,7 +7467,7 @@ async function startServer() {
               remainingBalance: rem,
               dailyInstallment: daily,
               status: stat,
-              ...(latVal != null ? { latitude: latVal, longitude: lngVal, locationAddress: locAddr || '', locationUpdatedAt: locUpAt } : {}),
+              ...(latVal != null ? { latitude: latVal, longitude: lngVal, locationAddress: locAddr || '', locationUpdatedAt: locUpAt } : { latitude: null, longitude: null, locationClearedAt: locClearedAt }),
             });
           } catch (e) {}
 
@@ -7171,6 +7496,7 @@ async function startServer() {
             longitude: lngVal,
             location_address: locAddr,
             location_updated_at: locUpAt,
+            location_cleared_at: locClearedAt,
             created_at: String(c.createdAt ?? c.created_at ?? new Date().toISOString()),
             completed_at: c.completedAt ?? c.completed_at ?? null,
             updated_at: c.updatedAt ?? c.updated_at ?? new Date().toISOString(),
@@ -7195,7 +7521,7 @@ async function startServer() {
                 list_id, list_name, total_price, advance_payment,
                 remaining_balance, daily_installment, start_date, notes,
                 status, last_payment_date, total_paid, rep_name,
-                latitude, longitude, location_address, location_updated_at,
+                latitude, longitude, location_address, location_updated_at, location_cleared_at,
                 created_at, completed_at, updated_at, is_edited
               )
               SELECT
@@ -7204,7 +7530,7 @@ async function startServer() {
                 x.list_id, x.list_name, COALESCE(x.total_price, 0), COALESCE(x.advance_payment, 0),
                 COALESCE(x.remaining_balance, 0), COALESCE(x.daily_installment, 0), COALESCE(x.start_date, NOW()::date::text), x.notes,
                 COALESCE(x.status, 'active'), x.last_payment_date, COALESCE(x.total_paid, 0), x.rep_name,
-                x.latitude, x.longitude, x.location_address, x.location_updated_at,
+                x.latitude, x.longitude, x.location_address, x.location_updated_at, x.location_cleared_at,
                 COALESCE(x.created_at, NOW()::text), x.completed_at, x.updated_at, COALESCE(x.is_edited, false)
               FROM jsonb_to_recordset($1::jsonb) AS x(
                 id text, customer_name text, customer_phone text, customer_address text,
@@ -7212,7 +7538,7 @@ async function startServer() {
                 list_id text, list_name text, total_price double precision, advance_payment double precision,
                 remaining_balance double precision, daily_installment double precision, start_date text, notes text,
                 status text, last_payment_date text, total_paid double precision, rep_name text,
-                latitude double precision, longitude double precision, location_address text, location_updated_at text,
+                latitude double precision, longitude double precision, location_address text, location_updated_at text, location_cleared_at text,
                 created_at text, completed_at text, updated_at text, is_edited boolean
               )
               ON CONFLICT (id) DO UPDATE SET
@@ -7235,10 +7561,11 @@ async function startServer() {
                 last_payment_date = COALESCE(EXCLUDED.last_payment_date, sales.last_payment_date),
                 total_paid = EXCLUDED.total_paid,
                 rep_name = COALESCE(NULLIF(EXCLUDED.rep_name, ''), sales.rep_name),
-                latitude = COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude),
-                longitude = COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude),
-                location_address = COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address),
-                location_updated_at = COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at),
+                latitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude) END,
+                longitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
+                location_address = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
+                location_updated_at = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END,
+                location_cleared_at = COALESCE(sales.location_cleared_at, EXCLUDED.location_cleared_at),
                 completed_at = COALESCE(EXCLUDED.completed_at, sales.completed_at),
                 updated_at = EXCLUDED.updated_at,
                 is_edited = EXCLUDED.is_edited
@@ -7248,11 +7575,11 @@ async function startServer() {
               if (row.latitude != null && row.longitude != null && row.latitude !== 0 && row.longitude !== 0) {
                 await executePg(`
                   UPDATE customers
-                  SET latitude = COALESCE(NULLIF(latitude, 0), $1),
-                      longitude = COALESCE(NULLIF(longitude, 0), $2),
-                      location_address = COALESCE(NULLIF(location_address, ''), $3),
-                      location_updated_at = COALESCE(location_updated_at, $4)
-                  WHERE id = $5 OR name = $6
+                  SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
+                      longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
+                      location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
+                      location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
+                  WHERE id = $5 OR TRIM(LOWER(name)) = TRIM(LOWER($6))
                 `, [row.latitude, row.longitude, row.location_address || '', row.location_updated_at || new Date().toISOString(), row.id, row.customer_name]).catch(() => {});
               }
             }
@@ -7364,6 +7691,16 @@ async function startServer() {
             const fundDelIds = delIds.filter((id: string) => String(id).startsWith('fund_'));
             const listDelIds = delIds.filter((id: string) => String(id).startsWith('list_'));
             const empDelIds = delIds.filter((id: string) => String(id).startsWith('emp_') && !protectedEmpIds.has(String(id)));
+            const locClearDelIds = delIds.filter((id: string) => String(id).startsWith('loc_clear_'));
+
+            if (locClearDelIds.length > 0) {
+              for (const lc of locClearDelIds) {
+                const targetContractId = String(lc).replace(/^loc_clear_/, '');
+                if (targetContractId) {
+                  await clearContractAndCustomerLocations(targetContractId).catch(() => {});
+                }
+              }
+            }
 
             if (contractDelIds.length > 0) {
               await executePg(`INSERT INTO deleted_records (record_id, table_name) SELECT unnest($1::text[]), 'sales' ON CONFLICT (record_id) DO NOTHING`, [contractDelIds]).catch(() => {});
@@ -7544,6 +7881,19 @@ async function startServer() {
       ]);
 
       const deletedSet = new Set((deletedRecordsRows || []).map((r: any) => String(r.record_id)));
+      const clearedLocationSet = new Set<string>();
+      for (const id of deletedSet) {
+        if (id.startsWith('loc_clear_')) clearedLocationSet.add(id.replace(/^loc_clear_/, ''));
+      }
+      if (clientLocatedContractIds.length > 0 && isPgConfigured()) {
+        const clearedSalesRows = await executePg(
+          `SELECT id FROM sales WHERE id = ANY($1) AND location_cleared_at IS NOT NULL AND (latitude IS NULL OR location_cleared_at >= COALESCE(location_updated_at, ''))`,
+          [clientLocatedContractIds]
+        ).catch(() => []);
+        for (const r of clearedSalesRows || []) {
+          if (r?.id) clearedLocationSet.add(String(r.id));
+        }
+      }
 
       const foundContractSet = new Set((existingContracts || []).map((r: any) => String(r.id)));
       const foundPaymentSet = new Set((existingPayments || []).map((r: any) => String(r.id)));
@@ -7606,7 +7956,7 @@ async function startServer() {
         }
       }
 
-      // Filter out deleted records so they don't count as missing
+      // Filter out deleted records (and cleared-location contracts) so they don't count as missing or resurrect
       const missingContractIds = clientContractIds.filter((id) => !foundContractSet.has(id) && !deletedSet.has(id));
       const missingPaymentIds = clientPaymentIds.filter((id) => !foundPaymentSet.has(id) && !deletedSet.has(id));
       const missingInventoryIds = clientInventoryIds.filter((id) => !foundInventorySet.has(id) && !deletedSet.has(id));
@@ -7615,7 +7965,9 @@ async function startServer() {
       const missingCustomerListIds = clientCustomerListIds.filter((id) => !foundCustomerListSet.has(id) && !deletedSet.has(id));
       const missingEmployeeIds = clientEmployeeIds.filter((id) => !foundEmployeeSet.has(id) && !deletedSet.has(id));
       const missingAppointmentIds = clientAppointmentIds.filter((id) => !foundAppointmentSet.has(id) && !deletedSet.has(id));
-      const missingLocationContractIds = clientLocatedContractIds.filter((id) => !foundLocatedContractSet.has(id) && !deletedSet.has(id));
+      const missingLocationContractIds = clientLocatedContractIds.filter(
+        (id) => !foundLocatedContractSet.has(id) && !deletedSet.has(id) && !deletedSet.has(`loc_clear_${id}`) && !clearedLocationSet.has(id)
+      );
 
       const totalMissing =
         missingContractIds.length +
@@ -7657,6 +8009,7 @@ async function startServer() {
         missingEmployeeIds,
         missingAppointmentIds,
         missingLocationContractIds,
+        clearedLocationContractIds: Array.from(clearedLocationSet),
         confirmedContractCount: foundContractSet.size,
         confirmedPaymentCount: foundPaymentSet.size,
         serverContractCount,

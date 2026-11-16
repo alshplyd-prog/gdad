@@ -158,6 +158,7 @@ import {
   subscribeToAppointments,
   getLocalCache,
   updateLocalCacheItem,
+  getDeletedRecordIds,
   run5DayPruneAndPollingInspection
 } from './lib/postgresClient';
 
@@ -700,7 +701,7 @@ export default function App() {
       }
       authVerifyInFlightRef.current = true;
       try {
-        const res = await fetchWithFallback('/api/auth/verify', { method: 'GET' }, 5000).catch(() => null);
+        const res = await fetchWithFallback('/api/auth/verify', { method: 'POST' }, 5000).catch(() => null);
         if (res && res.status === 401) {
           const data = await res.json().catch(() => null);
           if (data?.pinChanged || data?.code === 'INVALID_TOKEN' || data?.code === 'PIN_CHANGED' || data?.code === 'AUTH_REQUIRED') {
@@ -1473,6 +1474,7 @@ export default function App() {
 
   // Dynamically reconcile contracts with live payments so deletion/update always instantly updates totalPaid, remainingBalance, and status
   const contractsWithLiveBalances = useMemo(() => {
+    const deletedIdsSet = getDeletedRecordIds();
     return contracts.map((c) => {
       const cNameNorm = normalizeEntityName(c.customerName);
       const cPayments = payments.filter((p) => {
@@ -1494,25 +1496,46 @@ export default function App() {
       }
       const status: 'active' | 'completed' = (remainingBalance === 0 && paymentsSum > 0 && net > 0) ? 'completed' : 'active';
 
-      // Fallback coordinate resolution from customers state or payments
-      let lat = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : undefined;
-      let lng = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : undefined;
-      let locationAddress = c.locationAddress || '';
-      let locationUpdatedAt = c.locationUpdatedAt;
+      // Respect explicit location deletion tombstones & locationClearedAt before falling back to customers
+      const contractClearedAt = c.locationClearedAt ?? (c as any).location_cleared_at ?? null;
+      const contractUpdatedAt = c.locationUpdatedAt ?? (c as any).location_updated_at ?? null;
+      const isContractLocCleared = Boolean(
+        (c.id && deletedIdsSet.has(`loc_clear_${c.id}`)) ||
+        (contractClearedAt && (!contractUpdatedAt || String(contractClearedAt) >= String(contractUpdatedAt)))
+      );
 
-      if (lat == null) {
-        const matchedCust = customers.find((cu) =>
-          (cu.id && (cu.id === c.id || cu.id === (c as any).customerId)) ||
-          (cu.name && cNameNorm && normalizeEntityName(cu.name) === cNameNorm)
-        );
-        if (matchedCust) {
-          const cLat = Number(matchedCust.latitude ?? matchedCust.lat);
-          const cLng = Number(matchedCust.longitude ?? matchedCust.lng);
-          if (!isNaN(cLat) && !isNaN(cLng) && cLat !== 0 && cLng !== 0) {
-            lat = cLat;
-            lng = cLng;
-            locationAddress = locationAddress || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
-            locationUpdatedAt = locationUpdatedAt || matchedCust.location_updated_at || matchedCust.locationUpdatedAt;
+      let lat: number | undefined;
+      let lng: number | undefined;
+      let locationAddress = '';
+      let locationUpdatedAt = contractUpdatedAt || undefined;
+
+      if (!isContractLocCleared) {
+        lat = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : undefined;
+        lng = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : undefined;
+        locationAddress = c.locationAddress || '';
+
+        if (lat == null) {
+          const matchedCust = customers.find((cu) =>
+            (cu.id && (cu.id === c.id || cu.id === (c as any).customerId)) ||
+            (cu.name && cNameNorm && normalizeEntityName(cu.name) === cNameNorm)
+          );
+          if (matchedCust) {
+            const custClearedAt = matchedCust.locationClearedAt ?? matchedCust.location_cleared_at ?? null;
+            const custUpdatedAt = matchedCust.locationUpdatedAt ?? matchedCust.location_updated_at ?? null;
+            const isCustLocCleared = Boolean(
+              (matchedCust.id && deletedIdsSet.has(`loc_clear_${matchedCust.id}`)) ||
+              (custClearedAt && (!custUpdatedAt || String(custClearedAt) >= String(custUpdatedAt)))
+            );
+            if (!isCustLocCleared) {
+              const cLat = Number(matchedCust.latitude ?? matchedCust.lat);
+              const cLng = Number(matchedCust.longitude ?? matchedCust.lng);
+              if (!isNaN(cLat) && !isNaN(cLng) && cLat !== 0 && cLng !== 0) {
+                lat = cLat;
+                lng = cLng;
+                locationAddress = locationAddress || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
+                locationUpdatedAt = locationUpdatedAt || custUpdatedAt || undefined;
+              }
+            }
           }
         }
       }
@@ -1523,6 +1546,7 @@ export default function App() {
         longitude: lng,
         locationAddress,
         locationUpdatedAt,
+        locationClearedAt: isContractLocCleared ? (contractClearedAt || new Date().toISOString()) : null,
         totalPaid,
         excessAmount,
         rawTotalPaid: paymentsSum,

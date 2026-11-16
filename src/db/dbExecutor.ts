@@ -80,22 +80,24 @@ export async function executePg(sql: string, params: any[] = []): Promise<any[]>
               const resRetry = await currentPool.query(sql, params);
               return resRetry.rows || [];
             }
-            if (e.message.includes('latitude') || e.message.includes('longitude') || e.message.includes('location_address') || e.message.includes('location_updated_at')) {
+            if (e.message.includes('latitude') || e.message.includes('longitude') || e.message.includes('location_address') || e.message.includes('location_updated_at') || e.message.includes('location_cleared_at')) {
               const currentPool = createPool();
               await currentPool.query(`
                 ALTER TABLE sales ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
                 ALTER TABLE sales ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
                 ALTER TABLE sales ADD COLUMN IF NOT EXISTS location_address TEXT;
                 ALTER TABLE sales ADD COLUMN IF NOT EXISTS location_updated_at TEXT;
+                ALTER TABLE sales ADD COLUMN IF NOT EXISTS location_cleared_at TEXT;
                 ALTER TABLE customers ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
                 ALTER TABLE customers ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
                 ALTER TABLE customers ADD COLUMN IF NOT EXISTS location_address TEXT;
                 ALTER TABLE customers ADD COLUMN IF NOT EXISTS location_updated_at TEXT;
+                ALTER TABLE customers ADD COLUMN IF NOT EXISTS location_cleared_at TEXT;
                 DROP VIEW IF EXISTS contracts CASCADE;
                 CREATE VIEW contracts AS 
                 SELECT 
                   id, customer_id, customer_name, customer_phone, customer_address,
-                  latitude, longitude, location_address, location_updated_at,
+                  latitude, longitude, location_address, location_updated_at, location_cleared_at,
                   item_id, item_name, item_quantity, purchase_price,
                   list_id, list_name, total_price, advance_payment,
                   remaining_balance, daily_installment, start_date, notes,

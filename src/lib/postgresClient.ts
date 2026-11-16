@@ -284,23 +284,32 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
         if (item && item.id) {
           // If the record exists on PostgreSQL server, it is authoritative unless marked deleted locally
           if (item.id === 'rep-1' || (!pendingDeleteIds.has(item.id) && !deletedSet.has(item.id))) {
-            let mergedItem = item;
-            if (tableName === 'contracts' && Array.isArray(existingLocal)) {
-              const localMatch: any = existingLocal.find((e: any) => e && e.id === item.id);
-              const itemAny: any = item;
-              if (localMatch) {
-                const localLat = localMatch.latitude ?? localMatch.lat;
-                const localLng = localMatch.longitude ?? localMatch.lng;
-                const serverLat = itemAny.latitude ?? itemAny.lat;
-                if (localLat != null && !isNaN(Number(localLat)) && Number(localLat) !== 0 && (serverLat == null || isNaN(Number(serverLat)) || Number(serverLat) === 0)) {
-                  mergedItem = {
-                    ...item,
-                    latitude: Number(localLat),
-                    longitude: Number(localLng),
-                    locationAddress: itemAny.locationAddress || localMatch.locationAddress || localMatch.location_address || '',
-                    locationUpdatedAt: itemAny.locationUpdatedAt || localMatch.locationUpdatedAt || localMatch.location_updated_at,
-                  };
-                }
+            let mergedItem: any = item;
+            if (tableName === 'contracts' || tableName === 'customers') {
+              const itemClearedAt = mergedItem.locationClearedAt ?? mergedItem.location_cleared_at ?? null;
+              const itemUpdatedAt = mergedItem.locationUpdatedAt ?? mergedItem.location_updated_at ?? null;
+              const isServerCleared = Boolean(
+                deletedSet.has(`loc_clear_${item.id}`) ||
+                (itemClearedAt && (!itemUpdatedAt || String(itemClearedAt) >= String(itemUpdatedAt)))
+              );
+              if (isServerCleared) {
+                mergedItem = {
+                  ...mergedItem,
+                  latitude: undefined,
+                  longitude: undefined,
+                  locationAddress: '',
+                  locationUpdatedAt: undefined,
+                  locationClearedAt: itemClearedAt || new Date().toISOString(),
+                };
+              }
+            } else if (tableName === 'reps') {
+              const defRep = DEFAULT_REPS.find((dr) => dr.id === item.id);
+              if (defRep && !mergedItem.offlineVerifier) {
+                mergedItem = {
+                  ...mergedItem,
+                  offlineVerifier: defRep.offlineVerifier,
+                  pinVersion: mergedItem.pinVersion || defRep.pinVersion,
+                };
               }
             }
             map.set(item.id, mergedItem);
@@ -378,9 +387,34 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
       if (tableName === 'contracts' && (type === 'CREATE_CONTRACT' || type === 'UPDATE_CONTRACT')) {
         const cName = (payload.customerName || payload.customer_name || '').trim();
         const pId = String(payload.id || '');
-        if (pId && cName && !pId.startsWith('pay_') && !pId.startsWith('fund_') && !pId.startsWith('emp_') && !pId.startsWith('item_') && !pId.startsWith('ft_') && !pId.startsWith('emptx_') && !pId.startsWith('conflict_')) {
+        const isLocationUpdate =
+          type === 'UPDATE_CONTRACT' &&
+          (payload.locationCleared === true || payload.latitude !== undefined || payload.longitude !== undefined || payload.locationClearedAt !== undefined);
+        if (
+          pId &&
+          (cName || isLocationUpdate) &&
+          !pId.startsWith('pay_') &&
+          !pId.startsWith('fund_') &&
+          !pId.startsWith('emp_') &&
+          !pId.startsWith('item_') &&
+          !pId.startsWith('ft_') &&
+          !pId.startsWith('emptx_') &&
+          !pId.startsWith('conflict_')
+        ) {
           const existing = map.get(payload.id) || {};
-          map.set(payload.id, { ...existing, ...payload });
+          if (payload.locationCleared === true || (payload.latitude === null && payload.longitude === null)) {
+            map.set(payload.id, {
+              ...existing,
+              ...payload,
+              latitude: undefined,
+              longitude: undefined,
+              locationAddress: '',
+              locationUpdatedAt: undefined,
+              locationClearedAt: payload.locationClearedAt || payload.location_cleared_at || new Date().toISOString(),
+            });
+          } else {
+            map.set(payload.id, { ...existing, ...payload });
+          }
         }
       } else if (tableName === 'payments' && (type === 'CREATE_PAYMENT' || type === 'UPDATE_PAYMENT')) {
         const pId = String(payload.id || '');
@@ -757,33 +791,61 @@ export function recalculateLocalFundBalances(persistToCache = true): any[] {
 export function enrichContractsWithCustomerLocations(contractsList: any[], customersList?: any[]): any[] {
   if (!Array.isArray(contractsList) || contractsList.length === 0) return contractsList || [];
   const custs = (customersList && customersList.length > 0) ? customersList : getLocalCache<any>('customers');
-  if (!custs || custs.length === 0) return contractsList;
+  const deletedSet = getDeletedRecordIds();
 
   const custMap = new Map<string, any>();
-  for (const cu of custs) {
-    if (cu.id) custMap.set(String(cu.id).trim(), cu);
-    if (cu.name) custMap.set(String(cu.name).trim().toLowerCase(), cu);
-    if (cu.customerName) custMap.set(String(cu.customerName).trim().toLowerCase(), cu);
+  if (Array.isArray(custs)) {
+    for (const cu of custs) {
+      if (cu.id) custMap.set(String(cu.id).trim(), cu);
+      if (cu.name) custMap.set(String(cu.name).trim().toLowerCase(), cu);
+      if (cu.customerName) custMap.set(String(cu.customerName).trim().toLowerCase(), cu);
+    }
   }
 
   return contractsList.map((c) => {
+    const cClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? null;
+    const cUpdatedAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
+    const isContractCleared = Boolean(
+      (c.id && deletedSet.has(`loc_clear_${c.id}`)) ||
+      (cClearedAt && (!cUpdatedAt || String(cClearedAt) >= String(cUpdatedAt)))
+    );
+
+    if (isContractCleared) {
+      return {
+        ...c,
+        latitude: undefined,
+        longitude: undefined,
+        locationAddress: '',
+        locationUpdatedAt: undefined,
+        locationClearedAt: cClearedAt || new Date().toISOString(),
+      };
+    }
+
     let lat = c.latitude ?? c.lat;
     let lng = c.longitude ?? c.lng;
     let locAddr = c.locationAddress ?? c.location_address;
-    let locUpdated = c.locationUpdatedAt ?? c.location_updated_at;
+    let locUpdated = cUpdatedAt;
 
     if (lat == null || isNaN(Number(lat)) || Number(lat) === 0) {
       const matchedCust = (c.customerId && custMap.get(String(c.customerId).trim())) ||
                           (c.customerName && custMap.get(String(c.customerName).trim().toLowerCase())) ||
                           (c.id && custMap.get(String(c.id).trim()));
       if (matchedCust) {
-        const cLat = matchedCust.latitude ?? matchedCust.lat;
-        const cLng = matchedCust.longitude ?? matchedCust.lng;
-        if (cLat != null && !isNaN(Number(cLat)) && Number(cLat) !== 0) {
-          lat = Number(cLat);
-          lng = Number(cLng);
-          locAddr = locAddr || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
-          locUpdated = locUpdated || matchedCust.location_updated_at || matchedCust.locationUpdatedAt || matchedCust.updated_at;
+        const custClearedAt = matchedCust.locationClearedAt ?? matchedCust.location_cleared_at ?? null;
+        const custUpdatedAt = matchedCust.locationUpdatedAt ?? matchedCust.location_updated_at ?? null;
+        const isCustCleared = Boolean(
+          (matchedCust.id && deletedSet.has(`loc_clear_${matchedCust.id}`)) ||
+          (custClearedAt && (!custUpdatedAt || String(custClearedAt) >= String(custUpdatedAt)))
+        );
+        if (!isCustCleared) {
+          const cLat = matchedCust.latitude ?? matchedCust.lat;
+          const cLng = matchedCust.longitude ?? matchedCust.lng;
+          if (cLat != null && !isNaN(Number(cLat)) && Number(cLat) !== 0) {
+            lat = Number(cLat);
+            lng = Number(cLng);
+            locAddr = locAddr || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
+            locUpdated = locUpdated || custUpdatedAt || matchedCust.updated_at;
+          }
         }
       }
     }
@@ -810,6 +872,51 @@ export function getLocalCache<T>(tableName: string): T[] {
       if (Array.isArray(parsed)) {
         if (tableName === 'appointments') {
           return parsed.filter((a: any) => a && a.id && !String(a.id).startsWith('appt_init_')) as T[];
+        }
+        if (tableName === 'reps') {
+          try {
+            const REPS_MIGRATION_KEY = 'alkarrar_reps_synced_v2';
+            if (typeof window !== 'undefined' && localStorage && localStorage.getItem(REPS_MIGRATION_KEY) !== 'true') {
+              let migrated = false;
+              const defaultById = new Map(DEFAULT_REPS.map((dr) => [dr.id, dr]));
+              const updatedReps = parsed.map((r: any) => {
+                const def = r?.id ? defaultById.get(String(r.id)) : undefined;
+                if (!def) return r;
+                if (
+                  r.pinVersion !== def.pinVersion ||
+                  r.offlineVerifier !== def.offlineVerifier ||
+                  r.role !== def.role
+                ) {
+                  migrated = true;
+                  return {
+                    ...def,
+                    ...r,
+                    pinVersion: def.pinVersion,
+                    offlineVerifier: def.offlineVerifier,
+                    role: def.role,
+                    canEdit: def.canEdit,
+                    canDelete: def.canDelete,
+                    canMoveCustomer: def.canMoveCustomer,
+                    canSell: def.canSell,
+                    allowedListIds: def.allowedListIds,
+                    avatarUrl: r.avatarUrl || '',
+                  };
+                }
+                return r;
+              });
+              for (const def of DEFAULT_REPS) {
+                if (!updatedReps.some((r: any) => r?.id === def.id)) {
+                  updatedReps.push(def);
+                  migrated = true;
+                }
+              }
+              if (migrated) {
+                secureStorageSetSync('sami_cache_reps', JSON.stringify(updatedReps));
+              }
+              localStorage.setItem(REPS_MIGRATION_KEY, 'true');
+              return updatedReps as T[];
+            }
+          } catch (migErr) {}
         }
         return parsed;
       }
@@ -1190,6 +1297,12 @@ function mapRow(tableName: string, r: any): any {
     const status = (remainingBalance === 0 && (netFinanced === 0 || rawTotalPaid > 0)) ? 'completed' : 'active';
     const lastPaymentDate = r.actual_last_payment_date !== undefined ? r.actual_last_payment_date : (r.last_payment_date ?? r.lastPaymentDate ?? null);
 
+    const locClearedAt = r.location_cleared_at ?? r.locationClearedAt ?? null;
+    const locUpdatedAt = r.location_updated_at ?? r.locationUpdatedAt ?? undefined;
+    const isLocCleared =
+      getDeletedRecordIds().has(`loc_clear_${r.id}`) ||
+      Boolean(locClearedAt && (!locUpdatedAt || String(locClearedAt) >= String(locUpdatedAt)));
+
     return {
       id: r.id,
       customerName: r.customer_name ?? r.customerName ?? '',
@@ -1213,14 +1326,34 @@ function mapRow(tableName: string, r: any): any {
       excessAmount,
       rawTotalPaid,
       repName: r.rep_name ?? r.repName ?? '',
-      latitude: r.latitude != null ? Number(r.latitude) : (r.lat != null ? Number(r.lat) : undefined),
-      longitude: r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : undefined),
-      locationAddress: r.location_address ?? r.locationAddress ?? '',
-      locationUpdatedAt: r.location_updated_at ?? r.locationUpdatedAt ?? undefined,
+      latitude: isLocCleared ? undefined : (r.latitude != null ? Number(r.latitude) : (r.lat != null ? Number(r.lat) : undefined)),
+      longitude: isLocCleared ? undefined : (r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : undefined)),
+      locationAddress: isLocCleared ? '' : (r.location_address ?? r.locationAddress ?? ''),
+      locationUpdatedAt: isLocCleared ? undefined : locUpdatedAt,
+      locationClearedAt: isLocCleared ? (locClearedAt || null) : null,
       createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
       completedAt: r.completed_at ?? r.completedAt ?? null,
       updatedAt: r.updated_at ?? r.updatedAt ?? null,
       isEdited: Boolean(r.is_edited ?? r.isEdited)
+    };
+  }
+
+  if (tableName === 'customers') {
+    const locClearedAt = r.location_cleared_at ?? r.locationClearedAt ?? null;
+    const locUpdatedAt = r.location_updated_at ?? r.locationUpdatedAt ?? undefined;
+    const isLocCleared =
+      getDeletedRecordIds().has(`loc_clear_${r.id}`) ||
+      Boolean(locClearedAt && (!locUpdatedAt || String(locClearedAt) >= String(locUpdatedAt)));
+    return {
+      ...r,
+      latitude: isLocCleared ? null : (r.latitude != null ? Number(r.latitude) : (r.lat != null ? Number(r.lat) : null)),
+      longitude: isLocCleared ? null : (r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : null)),
+      locationAddress: isLocCleared ? '' : (r.location_address ?? r.locationAddress ?? ''),
+      location_address: isLocCleared ? '' : (r.location_address ?? r.locationAddress ?? ''),
+      locationUpdatedAt: isLocCleared ? null : (locUpdatedAt || null),
+      location_updated_at: isLocCleared ? null : (locUpdatedAt || null),
+      locationClearedAt: isLocCleared ? (locClearedAt || null) : null,
+      location_cleared_at: isLocCleared ? (locClearedAt || null) : null,
     };
   }
 
@@ -1677,6 +1810,113 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
 // Module-level cached server sync version to avoid redundant heavy downloads
 let cachedServerSyncVersion: number | string | null = null;
 
+function applyServerClearedLocations(clearedIdsInput?: string[], deletedIdsInput?: string[]) {
+  try {
+    const idSet = new Set<string>();
+    if (Array.isArray(clearedIdsInput)) {
+      for (const id of clearedIdsInput) {
+        if (id && typeof id === 'string') idSet.add(id.replace(/^loc_clear_/, ''));
+      }
+    }
+    if (Array.isArray(deletedIdsInput)) {
+      for (const raw of deletedIdsInput) {
+        if (typeof raw === 'string' && raw.startsWith('loc_clear_')) {
+          idSet.add(raw.replace(/^loc_clear_/, ''));
+        }
+      }
+    }
+    if (idSet.size === 0) return;
+
+    // Respect pending unsynced positive GPS updates queued locally on this device
+    const pendingPositiveGpsIds = new Set<string>();
+    try {
+      const pendingActions = getPendingQueueSync().filter((a) => a.status !== 'synced');
+      for (const act of pendingActions) {
+        if ((act.type === 'UPDATE_CONTRACT' || act.type === 'CREATE_PAYMENT') && act.payload) {
+          const pId = String(act.payload.contractId || act.payload.id || '');
+          const pLat = Number(act.payload.latitude ?? act.payload.lat);
+          if (pId && act.payload.locationCleared !== true && !isNaN(pLat) && pLat !== 0) {
+            pendingPositiveGpsIds.add(pId);
+          }
+        }
+      }
+    } catch (e) {}
+
+    const effectiveClearedIds = Array.from(idSet).filter((id) => !pendingPositiveGpsIds.has(id));
+    if (effectiveClearedIds.length === 0) return;
+
+    const effectiveSet = new Set(effectiveClearedIds);
+    markRecordAsDeleted(effectiveClearedIds.map((id) => `loc_clear_${id}`));
+
+    const nowIso = new Date().toISOString();
+    const clearedCustomerNames = new Set<string>();
+
+    const localContracts = getLocalCache<any>('contracts');
+    let contractsChanged = false;
+    const nextContracts = localContracts.map((c: any) => {
+      if (!c) return c;
+      if (effectiveSet.has(String(c.id))) {
+        if (c.customerName) clearedCustomerNames.add(normName(c.customerName));
+        if (c.latitude != null || c.longitude != null || c.locationAddress || !c.locationClearedAt) {
+          contractsChanged = true;
+          return {
+            ...c,
+            latitude: undefined,
+            longitude: undefined,
+            locationAddress: '',
+            locationUpdatedAt: undefined,
+            locationClearedAt: c.locationClearedAt || nowIso,
+          };
+        }
+      }
+      return c;
+    });
+    if (contractsChanged) setLocalCache('contracts', nextContracts);
+
+    const localCustomers = getLocalCache<any>('customers');
+    let customersChanged = false;
+    const nextCustomers = localCustomers.map((cu: any) => {
+      if (!cu) return cu;
+      const matchedById = effectiveSet.has(String(cu.id));
+      const matchedByName = cu.name && clearedCustomerNames.has(normName(cu.name));
+      if (matchedById || matchedByName) {
+        if (cu.latitude != null || cu.longitude != null || cu.location_address || cu.locationAddress || !cu.locationClearedAt) {
+          customersChanged = true;
+          return {
+            ...cu,
+            latitude: null,
+            longitude: null,
+            location_address: null,
+            locationAddress: '',
+            location_updated_at: null,
+            locationUpdatedAt: null,
+            location_cleared_at: cu.location_cleared_at || cu.locationClearedAt || nowIso,
+            locationClearedAt: cu.locationClearedAt || cu.location_cleared_at || nowIso,
+          };
+        }
+      }
+      return cu;
+    });
+    if (customersChanged) setLocalCache('customers', nextCustomers);
+
+    const localPayments = getLocalCache<any>('payments');
+    let paymentsChanged = false;
+    const nextPayments = localPayments.map((p: any) => {
+      if (!p) return p;
+      const matchedByContract = p.contractId && effectiveSet.has(String(p.contractId));
+      const matchedByName = p.customerName && clearedCustomerNames.has(normName(p.customerName));
+      if ((matchedByContract || matchedByName) && (p.latitude != null || p.longitude != null)) {
+        paymentsChanged = true;
+        return { ...p, latitude: null, longitude: null };
+      }
+      return p;
+    });
+    if (paymentsChanged) setLocalCache('payments', nextPayments);
+  } catch (e) {
+    console.warn('[applyServerClearedLocations] error:', e);
+  }
+}
+
 export function resetServerSyncVersionCache() {
   cachedServerSyncVersion = null;
 }
@@ -1772,10 +2012,11 @@ export async function reconcileAllLocalWithDatabase(options?: {
     if (res && res.ok) {
       const data = await res.json().catch(() => null);
       if (data && data.success) {
-        // Sync deleted IDs
+        // Sync deleted IDs & cleared GPS locations first
         if (Array.isArray(data.deletedRecordIds)) {
           markRecordAsDeleted(data.deletedRecordIds);
         }
+        applyServerClearedLocations(data.clearedLocationContractIds, data.deletedRecordIds);
 
         // Apply authoritative datasets from server cleanly
         // 1. Process payments first so incoming payments from other reps are saved
@@ -1784,20 +2025,25 @@ export async function reconcileAllLocalWithDatabase(options?: {
           setLocalCache('payments', mergedPayments);
         }
 
-        // 2. Process contracts and recalculate totalPaid (الواصل) and remainingBalance (الباقي)
+        // 2. Process customers BEFORE contracts so enrichment has fresh customer clearance timestamps
+        if (Array.isArray(data.customers)) {
+          const mappedCusts = data.customers.map((cu: any) => mapRow('customers', cu));
+          setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
+        }
+
+        // 3. Process contracts and recalculate totalPaid (الواصل) and remainingBalance (الباقي)
         if (Array.isArray(data.contracts)) {
           const mergedContracts = mergeRemoteWithPendingLocal('contracts', data.contracts);
           const currentPayments = getLocalCache<any>('payments');
           const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
-          const enriched = enrichContractsWithCustomerLocations(recalculated, data.customers);
+          const freshCustomers = getLocalCache<any>('customers');
+          const enriched = enrichContractsWithCustomerLocations(recalculated, freshCustomers);
           setLocalCache('contracts', enriched);
         } else {
           recalculateAllContractsFromPayments(undefined, undefined, true);
         }
 
-        if (Array.isArray(data.customers)) {
-          setLocalCache('customers', mergeRemoteWithPendingLocal('customers', data.customers));
-        }
+        applyServerClearedLocations(data.clearedLocationContractIds, data.deletedRecordIds);
         if (Array.isArray(data.inventory)) {
           setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', data.inventory));
         }
@@ -1898,7 +2144,13 @@ export async function verifyAndReconcileWithServer(): Promise<{
     const employeeIds = localEmployees.map((e: any) => String(e.id)).filter((id) => id && !deletedSet.has(id));
     const appointmentIds = localAppointments.map((a: any) => String(a.id)).filter((id) => id && !deletedSet.has(id));
     const locatedContractIds = localContracts
-      .filter((c: any) => c && c.id && !deletedSet.has(String(c.id)) && c.latitude != null && c.longitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0)
+      .filter((c: any) => {
+        if (!c || !c.id || deletedSet.has(String(c.id)) || deletedSet.has(`loc_clear_${c.id}`)) return false;
+        const cCleared = c.locationClearedAt ?? c.location_cleared_at;
+        const cUpdated = c.locationUpdatedAt ?? c.location_updated_at;
+        if (cCleared && (!cUpdated || String(cCleared) >= String(cUpdated))) return false;
+        return c.latitude != null && c.longitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0;
+      })
       .map((c: any) => String(c.id));
 
     const response = await fetchWithFallback(
@@ -1942,9 +2194,12 @@ export async function verifyAndReconcileWithServer(): Promise<{
       };
     }
 
-    // Process deleted records reported by the server to guarantee 100% bi-directional deletion parity
+    // Process deleted records and cleared locations reported by the server to guarantee 100% bi-directional deletion parity
     if (Array.isArray(resData.deletedRecordIds) && resData.deletedRecordIds.length > 0) {
       markRecordAsDeleted(resData.deletedRecordIds);
+    }
+    if (Array.isArray(resData.clearedLocationContractIds) || Array.isArray(resData.deletedRecordIds)) {
+      applyServerClearedLocations(resData.clearedLocationContractIds, resData.deletedRecordIds);
     }
 
     if (resData.matched) {
@@ -1978,9 +2233,16 @@ export async function verifyAndReconcileWithServer(): Promise<{
       `[Auto Match Verification] Discrepancy detected: ${resData.totalMissing} records missing on server! Uploading missing data immediately...`
     );
 
+    const serverClearedLocSet = new Set<string>(
+      Array.isArray(resData.clearedLocationContractIds) ? resData.clearedLocationContractIds.map(String) : []
+    );
+    const updatedDeletedSet = getDeletedRecordIds();
+
     const missingContractSet = new Set<string>([
       ...(resData.missingContractIds || []),
-      ...(resData.missingLocationContractIds || []),
+      ...(resData.missingLocationContractIds || []).filter(
+        (id: string) => !serverClearedLocSet.has(String(id)) && !updatedDeletedSet.has(`loc_clear_${id}`)
+      ),
     ]);
     const missingPaymentSet = new Set<string>(resData.missingPaymentIds || []);
     const missingInventorySet = new Set<string>(resData.missingInventoryIds || []);
@@ -1990,7 +2252,7 @@ export async function verifyAndReconcileWithServer(): Promise<{
     const missingEmployeeSet = new Set<string>(resData.missingEmployeeIds || []);
     const missingAppointmentSet = new Set<string>(resData.missingAppointmentIds || []);
 
-    const missingContracts = localContracts.filter((c: any) => missingContractSet.has(String(c.id)));
+    const missingContracts = getLocalCache<any>('contracts').filter((c: any) => missingContractSet.has(String(c.id)));
     const missingPayments = localPayments.filter((p: any) => missingPaymentSet.has(String(p.id)));
     const missingInventory = localInventory.filter((i: any) => missingInventorySet.has(String(i.id)));
     const missingReps = localReps.filter((r: any) => missingRepSet.has(String(r.id)));
@@ -2671,11 +2933,13 @@ export const recordPaymentInDatabase = async (arg1: any, arg2?: any, arg3?: any,
       };
 
       // Automatically update customer's GPS location from payment location if available
-      if (pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng)) {
+      if (pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng) && pLat !== 0 && pLng !== 0) {
+        unmarkRecordAsDeleted(`loc_clear_${contract.id}`);
         contractUpdates.latitude = pLat;
         contractUpdates.longitude = pLng;
         contractUpdates.locationAddress = paymentRecord.locationAddress || contract.locationAddress || `موقع تسديد (${payload.paymentDate})`;
         contractUpdates.locationUpdatedAt = new Date().toISOString();
+        contractUpdates.locationClearedAt = null;
       }
 
       updateLocalCacheItem('contracts', contractUpdates);
@@ -3649,19 +3913,25 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
           if (Array.isArray(data.deletedRecordIds)) {
             markRecordAsDeleted(data.deletedRecordIds);
           }
-          // Process payments first so payments from other reps are saved
+          applyServerClearedLocations(data.clearedLocationContractIds, data.deletedRecordIds);
+          // Process payments & customers first
           if (Array.isArray(data.payments)) setLocalCache('payments', mergeRemoteWithPendingLocal('payments', data.payments));
-          if (Array.isArray(data.customers)) setLocalCache('customers', mergeRemoteWithPendingLocal('customers', data.customers));
+          if (Array.isArray(data.customers)) {
+            const mappedCusts = data.customers.map((cu: any) => mapRow('customers', cu));
+            setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
+          }
           // Recalculate contracts with all payments
           if (Array.isArray(data.contracts)) {
             const mergedContracts = mergeRemoteWithPendingLocal('contracts', data.contracts);
             const currentPayments = getLocalCache<any>('payments');
             const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
-            const enriched = enrichContractsWithCustomerLocations(recalculated, data.customers);
+            const freshCustomers = getLocalCache<any>('customers');
+            const enriched = enrichContractsWithCustomerLocations(recalculated, freshCustomers);
             setLocalCache('contracts', enriched);
           } else {
             recalculateAllContractsFromPayments(undefined, undefined, true);
           }
+          applyServerClearedLocations(data.clearedLocationContractIds, data.deletedRecordIds);
           if (Array.isArray(data.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', data.inventory));
           if (Array.isArray(data.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', data.reps));
           if (Array.isArray(data.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', data.funds));
@@ -3898,50 +4168,99 @@ export const updateCustomerLocation = async (
   locationAddress?: string | null
 ): Promise<boolean> => {
   if (!contractId) return false;
-  const isClearing = latitude == null || longitude == null || (latitude === 0 && longitude === 0);
-  const nowIso = isClearing ? null : new Date().toISOString();
+  const isClearing = latitude == null || longitude == null || (Number(latitude) === 0 && Number(longitude) === 0);
+  const nowIso = new Date().toISOString();
+  const clearIso = isClearing ? nowIso : null;
   const currentContracts = getLocalCache<any>('contracts');
   const contract = currentContracts.find((c: any) => c.id === contractId);
+  const targetNormName = contract?.customerName ? normName(contract.customerName) : '';
+  const targetCustomerId = (contract as any)?.customerId || '';
 
-  const updates = {
+  const updates: any = {
     latitude: isClearing ? null : latitude,
     longitude: isClearing ? null : longitude,
     locationAddress: isClearing ? null : (locationAddress || contract?.customerAddress || ''),
-    locationUpdatedAt: nowIso,
+    locationUpdatedAt: isClearing ? null : nowIso,
+    locationCleared: isClearing,
+    locationClearedAt: isClearing ? clearIso : null,
   };
 
-  if (contract) {
-    const updated = { ...contract, ...updates };
-    updateLocalCacheItem('contracts', updated);
+  // Update tombstone set + ALL sibling contracts for the same customer so enrichment/fallback cannot resurrect
+  const affectedContractIds = new Set<string>([contractId]);
+  const updatedContractsList = currentContracts.map((c: any) => {
+    if (!c) return c;
+    const isSame =
+      c.id === contractId ||
+      (targetCustomerId && (c.id === targetCustomerId || c.customerId === targetCustomerId)) ||
+      (targetNormName && c.customerName && normName(c.customerName) === targetNormName);
+    if (!isSame) return c;
+    if (c.id) affectedContractIds.add(String(c.id));
+    return {
+      ...c,
+      latitude: isClearing ? undefined : latitude,
+      longitude: isClearing ? undefined : longitude,
+      locationAddress: isClearing ? '' : updates.locationAddress,
+      locationUpdatedAt: isClearing ? undefined : nowIso,
+      locationClearedAt: isClearing ? clearIso : null,
+    };
+  });
+
+  if (isClearing) {
+    markRecordAsDeleted(Array.from(affectedContractIds).map((id) => `loc_clear_${id}`));
+  } else {
+    unmarkRecordAsDeleted(Array.from(affectedContractIds).map((id) => `loc_clear_${id}`));
   }
 
-  // Update in customers cache and push to /api/customers/:id
-  const localCustomers = getLocalCache<any>('customers');
-  const matchedCustomer = localCustomers.find((cu: any) =>
-    (cu.id && (cu.id === contractId || cu.id === (contract as any)?.customerId)) ||
-    (contract?.customerName && cu.name && normName(cu.name) === normName(contract.customerName))
-  );
+  if (contract || updatedContractsList.length > 0) {
+    setLocalCache('contracts', updatedContractsList);
+  }
 
-  if (matchedCustomer) {
-    const custUpdates = {
-      ...matchedCustomer,
+  // Update ALL matching entries in customers cache and push to /api/customers/:id
+  const localCustomers = getLocalCache<any>('customers');
+  const matchedCustomerIds: string[] = [];
+  let custCacheChanged = false;
+  const updatedCustomersList = localCustomers.map((cu: any) => {
+    if (!cu) return cu;
+    const isMatch =
+      (cu.id && (cu.id === contractId || (targetCustomerId && cu.id === targetCustomerId))) ||
+      (targetNormName && cu.name && normName(cu.name) === targetNormName);
+    if (!isMatch) return cu;
+    custCacheChanged = true;
+    if (cu.id) matchedCustomerIds.push(String(cu.id));
+    return {
+      ...cu,
       latitude: updates.latitude,
       longitude: updates.longitude,
       location_address: updates.locationAddress,
+      locationAddress: isClearing ? '' : updates.locationAddress,
       location_updated_at: updates.locationUpdatedAt,
+      locationUpdatedAt: updates.locationUpdatedAt,
+      location_cleared_at: isClearing ? clearIso : null,
+      locationClearedAt: isClearing ? clearIso : null,
     };
-    updateLocalCacheItem('customers', custUpdates);
+  });
 
-    fetchWithFallback(`/api/customers/${matchedCustomer.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        latitude: updates.latitude,
-        longitude: updates.longitude,
-        location_address: updates.locationAddress,
-        location_updated_at: updates.locationUpdatedAt,
-      }),
-    }, 8000).catch(() => {});
+  if (custCacheChanged) {
+    setLocalCache('customers', updatedCustomersList);
+    if (isClearing) {
+      markRecordAsDeleted(matchedCustomerIds.map((id) => `loc_clear_${id}`));
+    } else {
+      unmarkRecordAsDeleted(matchedCustomerIds.map((id) => `loc_clear_${id}`));
+    }
+    for (const cid of matchedCustomerIds) {
+      fetchWithFallback(`/api/customers/${cid}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          latitude: updates.latitude,
+          longitude: updates.longitude,
+          location_address: updates.locationAddress,
+          location_updated_at: updates.locationUpdatedAt,
+          locationCleared: isClearing,
+          locationClearedAt: isClearing ? clearIso : null,
+        }),
+      }, 8000).catch(() => {});
+    }
   }
 
   if (isClearing) {
@@ -3949,7 +4268,10 @@ export const updateCustomerLocation = async (
     const localPayments = getLocalCache<any>('payments');
     let payChanged = false;
     const updatedPayments = localPayments.map((p: any) => {
-      if (p.contractId === contractId || (contract?.customerName && p.customerName && normName(p.customerName) === normName(contract.customerName))) {
+      if (
+        (p.contractId && affectedContractIds.has(String(p.contractId))) ||
+        (targetNormName && p.customerName && normName(p.customerName) === targetNormName)
+      ) {
         if (p.latitude != null || p.longitude != null) {
           payChanged = true;
           return { ...p, latitude: null, longitude: null };
@@ -3965,7 +4287,12 @@ export const updateCustomerLocation = async (
   mirrorLocalSnapshotToIndexedDb(true);
   notifySubscribersRefresh();
 
-  const qPromise = addToPendingQueue('UPDATE_CONTRACT', { id: contractId, ...updates });
+  const queuePayload = {
+    id: contractId,
+    customerName: contract?.customerName,
+    ...updates,
+  };
+  const qPromise = addToPendingQueue('UPDATE_CONTRACT', queuePayload);
   let resOk = false;
   try {
     const res = await fetchWithFallback(`/api/contracts/${contractId}`, {
@@ -3979,13 +4306,14 @@ export const updateCustomerLocation = async (
       if (act?.id) {
         await removeFromPendingQueue(act.id).catch(() => {});
       }
+      // If clearing offline or online, sync deleted location tombstones & confirm with server
+      reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
     }
   } catch (err) {
     console.warn('[updateCustomerLocation] Offline or network error, kept in pendingQueue:', err);
     resOk = typeof navigator !== 'undefined' && navigator.onLine === false;
   }
 
-  reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
   return resOk;
 };
 
