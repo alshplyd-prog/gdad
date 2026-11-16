@@ -53,7 +53,19 @@ export function bumpSyncVersion() {
 import fs from "fs";
 import webpush from "web-push";
 
-function mapContractRow(r: any) {
+function normalizeServerName(name?: string | null): string {
+  return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isLocationClearedRow(r: any, clearedSet?: Set<string>): boolean {
+  if (!r) return false;
+  if (clearedSet && r.id && clearedSet.has(String(r.id))) return true;
+  const locClearedAt = r.location_cleared_at ?? r.locationClearedAt ?? null;
+  const locUpdatedAt = r.location_updated_at ?? r.locationUpdatedAt ?? null;
+  return Boolean(locClearedAt && (!locUpdatedAt || String(locClearedAt) >= String(locUpdatedAt)));
+}
+
+function mapContractRow(r: any, clearedSet?: Set<string>) {
   const totalPrice = Number(r.total_price ?? r.totalPrice) || 0;
   const advancePayment = Number(r.advance_payment ?? r.advancePayment) || 0;
   const actualPaid = Number(r.actual_total_paid);
@@ -65,6 +77,9 @@ function mapContractRow(r: any) {
   const remainingBalance = Math.max(0, netFinanced - rawTotalPaid);
   const status = (remainingBalance === 0 && (netFinanced === 0 || rawTotalPaid > 0)) ? 'completed' : 'active';
   const lastPaymentDate = r.actual_last_payment_date !== undefined ? r.actual_last_payment_date : (r.last_payment_date ?? r.lastPaymentDate ?? null);
+  const locClearedAt = r.location_cleared_at ?? r.locationClearedAt ?? null;
+  const locUpdatedAt = r.location_updated_at ?? r.locationUpdatedAt ?? undefined;
+  const locCleared = isLocationClearedRow(r, clearedSet);
 
   return {
     id: r.id,
@@ -89,11 +104,11 @@ function mapContractRow(r: any) {
     excessAmount,
     rawTotalPaid,
     repName: r.rep_name ?? r.repName ?? '',
-    latitude: r.latitude != null ? Number(r.latitude) : (r.lat != null ? Number(r.lat) : undefined),
-    longitude: r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : undefined),
-    locationAddress: r.location_address ?? r.locationAddress ?? '',
-    locationUpdatedAt: r.location_updated_at ?? r.locationUpdatedAt ?? undefined,
-    locationClearedAt: r.location_cleared_at ?? r.locationClearedAt ?? null,
+    latitude: locCleared ? undefined : (r.latitude != null ? Number(r.latitude) : (r.lat != null ? Number(r.lat) : undefined)),
+    longitude: locCleared ? undefined : (r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : undefined)),
+    locationAddress: locCleared ? '' : (r.location_address ?? r.locationAddress ?? ''),
+    locationUpdatedAt: locCleared ? undefined : locUpdatedAt,
+    locationClearedAt: locCleared ? (locClearedAt || new Date().toISOString()) : null,
     createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
     completedAt: r.completed_at ?? r.completedAt ?? null,
     updatedAt: r.updated_at ?? r.updatedAt ?? null,
@@ -201,7 +216,11 @@ function mapAppointmentRow(r: any) {
   };
 }
 
-function mapCustomerRow(r: any) {
+function mapCustomerRow(r: any, clearedSet?: Set<string>) {
+  const locClearedAt = r.location_cleared_at ?? r.locationClearedAt ?? null;
+  const locUpdatedAt = r.location_updated_at ?? r.locationUpdatedAt ?? undefined;
+  const locCleared = isLocationClearedRow(r, clearedSet);
+
   return {
     id: r.id,
     name: r.name ?? '',
@@ -211,13 +230,139 @@ function mapCustomerRow(r: any) {
     listName: r.list_name ?? r.listName ?? null,
     notes: r.notes ?? '',
     status: r.status ?? 'active',
-    latitude: r.latitude != null ? Number(r.latitude) : undefined,
-    longitude: r.longitude != null ? Number(r.longitude) : undefined,
-    locationAddress: r.location_address ?? r.locationAddress ?? '',
-    locationUpdatedAt: r.location_updated_at ?? r.locationUpdatedAt ?? undefined,
-    locationClearedAt: r.location_cleared_at ?? r.locationClearedAt ?? null,
+    sales_count: r.sales_count !== undefined ? Number(r.sales_count) : undefined,
+    latitude: locCleared ? null : (r.latitude != null ? Number(r.latitude) : undefined),
+    longitude: locCleared ? null : (r.longitude != null ? Number(r.longitude) : undefined),
+    locationAddress: locCleared ? '' : (r.location_address ?? r.locationAddress ?? ''),
+    locationUpdatedAt: locCleared ? null : locUpdatedAt,
+    locationClearedAt: locCleared ? (locClearedAt || new Date().toISOString()) : null,
     createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
   };
+}
+
+async function getServerClearedLocationState(
+  contractId: string,
+  customerNameHint?: string
+): Promise<{ cleared: boolean; clearedAt: string | null; customerId: string; customerName: string }> {
+  let customerId = '';
+  let customerName = (customerNameHint || '').trim();
+  const clearTimestamps: string[] = [];
+
+  if (!isPgConfigured()) {
+    const fileC = (fileDb.get<any>("contracts") || []).find((c: any) => c?.id === contractId);
+    if (fileC?.locationClearedAt && (!fileC?.locationUpdatedAt || String(fileC.locationClearedAt) >= String(fileC.locationUpdatedAt))) {
+      return { cleared: true, clearedAt: String(fileC.locationClearedAt), customerId: '', customerName: fileC.customerName || customerName };
+    }
+    return { cleared: false, clearedAt: null, customerId: '', customerName };
+  }
+
+  try {
+    const saleRows = await executePg(
+      `SELECT id, customer_id, customer_name, location_cleared_at, location_updated_at FROM sales WHERE id = $1 LIMIT 1`,
+      [contractId]
+    ).catch(() => []);
+    if (saleRows && saleRows[0]) {
+      customerId = String(saleRows[0].customer_id || '').trim();
+      if (!customerName && saleRows[0].customer_name) {
+        customerName = String(saleRows[0].customer_name).trim();
+      }
+      if (saleRows[0].location_cleared_at && (!saleRows[0].location_updated_at || String(saleRows[0].location_cleared_at) >= String(saleRows[0].location_updated_at))) {
+        clearTimestamps.push(String(saleRows[0].location_cleared_at));
+      }
+    }
+
+    const normCustName = normalizeServerName(customerName);
+    const checkIds = new Set<string>([contractId]);
+    if (customerId) checkIds.add(customerId);
+
+    if (customerId || normCustName) {
+      const [siblingSales, matchingCusts] = await Promise.all([
+        executePg(
+          `SELECT id, location_cleared_at, location_updated_at FROM sales
+           WHERE ($1 != '' AND customer_id = $1)
+              OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+          [customerId, normCustName]
+        ).catch(() => []),
+        executePg(
+          `SELECT id, location_cleared_at, location_updated_at FROM customers
+           WHERE id = $1
+              OR ($2 != '' AND id = $2)
+              OR ($3 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $3)`,
+          [contractId, customerId, normCustName]
+        ).catch(() => []),
+      ]);
+      for (const s of siblingSales || []) {
+        if (s?.id) checkIds.add(String(s.id));
+        if (s?.location_cleared_at && (!s?.location_updated_at || String(s.location_cleared_at) >= String(s.location_updated_at))) {
+          clearTimestamps.push(String(s.location_cleared_at));
+        }
+      }
+      for (const cu of matchingCusts || []) {
+        if (cu?.id) checkIds.add(String(cu.id));
+        if (cu?.location_cleared_at && (!cu?.location_updated_at || String(cu.location_cleared_at) >= String(cu.location_updated_at))) {
+          clearTimestamps.push(String(cu.location_cleared_at));
+        }
+      }
+    }
+
+    const tombstoneRows = await executePg(
+      `SELECT record_id, deleted_at FROM deleted_records WHERE record_id = ANY($1)`,
+      [Array.from(checkIds).map((id) => `loc_clear_${id}`)]
+    ).catch(() => []);
+    for (const tr of tombstoneRows || []) {
+      const ts = tr?.deleted_at ? new Date(tr.deleted_at).toISOString() : '1970-01-01T00:00:00.000Z';
+      clearTimestamps.push(ts);
+    }
+  } catch (err) {}
+
+  if (clearTimestamps.length === 0) {
+    return { cleared: false, clearedAt: null, customerId, customerName };
+  }
+  clearTimestamps.sort();
+  return {
+    cleared: true,
+    clearedAt: clearTimestamps[clearTimestamps.length - 1],
+    customerId,
+    customerName,
+  };
+}
+
+function buildExpandedClearedSet(
+  baseIds: Iterable<string>,
+  contractsRows: any[],
+  customersRows: any[]
+): Set<string> {
+  const clearedSet = new Set<string>(baseIds);
+  const clearedNames = new Set<string>();
+
+  for (const r of contractsRows || []) {
+    if (!r) continue;
+    if (clearedSet.has(String(r.id)) || isLocationClearedRow(r)) {
+      if (r.id) clearedSet.add(String(r.id));
+      if (r.customer_id) clearedSet.add(String(r.customer_id));
+      const n = normalizeServerName(r.customer_name ?? r.customerName);
+      if (n) clearedNames.add(n);
+    }
+  }
+  for (const c of customersRows || []) {
+    if (!c) continue;
+    const n = normalizeServerName(c.name ?? c.customerName);
+    if (clearedSet.has(String(c.id)) || isLocationClearedRow(c) || (n && clearedNames.has(n))) {
+      if (c.id) clearedSet.add(String(c.id));
+      if (n) clearedNames.add(n);
+    }
+  }
+  if (clearedNames.size > 0) {
+    for (const r of contractsRows || []) {
+      const n = normalizeServerName(r?.customer_name ?? r?.customerName);
+      if (n && clearedNames.has(n) && r?.id) clearedSet.add(String(r.id));
+    }
+    for (const c of customersRows || []) {
+      const n = normalizeServerName(c?.name ?? c?.customerName);
+      if (n && clearedNames.has(n) && c?.id) clearedSet.add(String(c.id));
+    }
+  }
+  return clearedSet;
 }
 
 async function clearContractAndCustomerLocations(contractId: string, clearIso?: string, customerNameHint?: string) {
@@ -234,6 +379,7 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
       ).catch(() => []);
       if (saleRows && saleRows[0]) {
         customerId = String(saleRows[0].customer_id || '').trim();
+        if (customerId) relatedIds.add(customerId);
         if (!customerName && saleRows[0].customer_name) {
           customerName = String(saleRows[0].customer_name).trim();
         }
@@ -242,13 +388,23 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
         const custRows = await executePg(`SELECT id, name FROM customers WHERE id = $1 LIMIT 1`, [contractId]).catch(() => []);
         if (custRows && custRows[0]?.name) customerName = String(custRows[0].name).trim();
       }
-      if (customerId || customerName) {
-        const siblingRows = await executePg(
-          `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2)))`,
-          [customerId, customerName]
-        ).catch(() => []);
+      const normCustName = normalizeServerName(customerName);
+      if (customerId || normCustName) {
+        const [siblingRows, matchingCustRows] = await Promise.all([
+          executePg(
+            `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+            [customerId, normCustName]
+          ).catch(() => []),
+          executePg(
+            `SELECT id FROM customers WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $3)`,
+            [contractId, customerId, normCustName]
+          ).catch(() => []),
+        ]);
         for (const sr of siblingRows || []) {
           if (sr?.id) relatedIds.add(String(sr.id));
+        }
+        for (const cr of matchingCustRows || []) {
+          if (cr?.id) relatedIds.add(String(cr.id));
         }
       }
 
@@ -274,25 +430,26 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
          SET latitude = NULL, longitude = NULL, location_address = NULL, location_updated_at = NULL, location_cleared_at = $1
          WHERE id = $2
             OR ($3 != '' AND id = $3)
-            OR ($4 != '' AND TRIM(LOWER(name)) = TRIM(LOWER($4)))`,
-        [iso, contractId, customerId, customerName]
+            OR id = ANY($4)
+            OR ($5 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $5)`,
+        [iso, contractId, customerId, Array.from(relatedIds), normCustName]
       ).catch(() => {});
 
       await executePg(
         `UPDATE payments
          SET latitude = NULL, longitude = NULL
-         WHERE (contract_id = ANY($1) OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2))))
-           AND COALESCE(created_at, payment_date, '') <= $3`,
-        [Array.from(relatedIds), customerName, iso]
+         WHERE contract_id = ANY($1)
+            OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+        [Array.from(relatedIds), normCustName]
       ).catch(() => {});
     }
 
-    const normTarget = customerName ? customerName.toLowerCase().replace(/\s+/g, ' ') : '';
+    const normTarget = normalizeServerName(customerName);
     const allContracts = fileDb.get<any>("contracts") || [];
     let cChanged = false;
     const nextContracts = allContracts.map((c: any) => {
       const matchId = relatedIds.has(String(c.id));
-      const matchName = normTarget && c.customerName && String(c.customerName).trim().toLowerCase().replace(/\s+/g, ' ') === normTarget;
+      const matchName = normTarget && c.customerName && normalizeServerName(c.customerName) === normTarget;
       if (matchId || matchName) {
         if (c.id) relatedIds.add(String(c.id));
         cChanged = true;
@@ -313,7 +470,7 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
     let cuChanged = false;
     const nextCusts = allCusts.map((cu: any) => {
       const matchId = relatedIds.has(String(cu.id)) || (customerId && cu.id === customerId);
-      const matchName = normTarget && cu.name && String(cu.name).trim().toLowerCase().replace(/\s+/g, ' ') === normTarget;
+      const matchName = normTarget && cu.name && normalizeServerName(cu.name) === normTarget;
       if (matchId || matchName) {
         cuChanged = true;
         return {
@@ -336,7 +493,7 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
     let pChanged = false;
     const nextPays = allPays.map((p: any) => {
       const matchId = p.contractId && relatedIds.has(String(p.contractId));
-      const matchName = normTarget && p.customerName && String(p.customerName).trim().toLowerCase().replace(/\s+/g, ' ') === normTarget;
+      const matchName = normTarget && p.customerName && normalizeServerName(p.customerName) === normTarget;
       if (matchId || matchName) {
         if (p.latitude != null || p.longitude != null) {
           pChanged = true;
@@ -364,17 +521,28 @@ async function unclearContractLocation(contractId: string, customerNameHint?: st
       ).catch(() => []);
       if (saleRows && saleRows[0]) {
         customerId = String(saleRows[0].customer_id || '').trim();
+        if (customerId) relatedIds.add(customerId);
         if (!customerName && saleRows[0].customer_name) {
           customerName = String(saleRows[0].customer_name).trim();
         }
       }
-      if (customerId || customerName) {
-        const siblingRows = await executePg(
-          `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2)))`,
-          [customerId, customerName]
-        ).catch(() => []);
+      const normCustName = normalizeServerName(customerName);
+      if (customerId || normCustName) {
+        const [siblingRows, matchingCustRows] = await Promise.all([
+          executePg(
+            `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+            [customerId, normCustName]
+          ).catch(() => []),
+          executePg(
+            `SELECT id FROM customers WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $3)`,
+            [contractId, customerId, normCustName]
+          ).catch(() => []),
+        ]);
         for (const sr of siblingRows || []) {
           if (sr?.id) relatedIds.add(String(sr.id));
+        }
+        for (const cr of matchingCustRows || []) {
+          if (cr?.id) relatedIds.add(String(cr.id));
         }
       }
 
@@ -388,8 +556,8 @@ async function unclearContractLocation(contractId: string, customerNameHint?: st
       ).catch(() => {});
       await executePg(
         `UPDATE customers SET location_cleared_at = NULL
-         WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND TRIM(LOWER(name)) = TRIM(LOWER($3)))`,
-        [contractId, customerId, customerName]
+         WHERE id = $1 OR ($2 != '' AND id = $2) OR id = ANY($3) OR ($4 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $4)`,
+        [contractId, customerId, Array.from(relatedIds), normCustName]
       ).catch(() => {});
     }
   } catch (err) {
@@ -1911,7 +2079,7 @@ async function startServer() {
             ORDER BY c.created_at ASC, c.id ASC
           `).catch(() => []);
           if (Array.isArray(pgContracts)) {
-            fileDb.setAll("contracts", pgContracts.map(mapContractRow));
+            fileDb.setAll("contracts", pgContracts.map((r: any) => mapContractRow(r)));
           }
           const pgPayments = await executePg(`
             SELECT * FROM payments
@@ -1984,8 +2152,16 @@ async function startServer() {
               AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name IN ('sales', 'contracts') OR dr.table_name IS NULL))
             ORDER BY c.created_at ASC, c.id ASC
           `;
-          const rows = await executePg(sql);
-          let contracts = (rows || []).map(mapContractRow).filter(c => c && c.id && !c.id.startsWith('pay_') && !c.id.startsWith('ft_') && !c.id.startsWith('emptx_'));
+          const [rows, tombRows, custClearRows] = await Promise.all([
+            executePg(sql),
+            executePg(`SELECT record_id FROM deleted_records WHERE record_id LIKE 'loc_clear_%'`).catch(() => []),
+            executePg(`SELECT id, name, location_cleared_at, location_updated_at FROM customers WHERE location_cleared_at IS NOT NULL`).catch(() => []),
+          ]);
+          const baseClearedIds = (tombRows || [])
+            .map((r: any) => String(r?.record_id || '').replace(/^loc_clear_/, ''))
+            .filter(Boolean);
+          const clearedSet = buildExpandedClearedSet(baseClearedIds, rows || [], custClearRows || []);
+          let contracts = (rows || []).map((r: any) => mapContractRow(r, clearedSet)).filter(c => c && c.id && !c.id.startsWith('pay_') && !c.id.startsWith('ft_') && !c.id.startsWith('emptx_'));
           fileDb.setAll("contracts", contracts);
           return res.json(contracts);
         } catch (pgErr) {
@@ -2008,6 +2184,7 @@ async function startServer() {
         const status = (remainingBalance === 0 && (net === 0 || paymentsSum > 0)) ? 'completed' : 'active';
         const sorted = [...cPayments].sort((a: any, b: any) => new Date(b.paymentDate).getTime() - new Date(a.paymentDate).getTime());
         const lastPaymentDate = sorted[0]?.paymentDate || null;
+        const isCleared = isLocationClearedRow(c);
         return {
           ...c,
           totalPaid,
@@ -2016,6 +2193,7 @@ async function startServer() {
           remainingBalance,
           status,
           lastPaymentDate,
+          ...(isCleared ? { latitude: undefined, longitude: undefined, locationAddress: '', locationUpdatedAt: undefined } : {}),
         };
       });
       res.json(contracts);
@@ -2032,6 +2210,32 @@ async function startServer() {
         return res.status(400).json({ error: 'Invalid contract ID' });
       }
       const id = c.id || `contract_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+      let latVal: number | null = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : (c.lat != null && !isNaN(Number(c.lat)) && Number(c.lat) !== 0 ? Number(c.lat) : null);
+      let lngVal: number | null = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : (c.lng != null && !isNaN(Number(c.lng)) && Number(c.lng) !== 0 ? Number(c.lng) : null);
+      let locAddrVal: string = c.locationAddress || c.location_address || '';
+      let locUpdatedVal: string | null = c.locationUpdatedAt || c.location_updated_at || null;
+      let locClearedVal: string | null = c.locationClearedAt || c.location_cleared_at || null;
+
+      const serverClearState = await getServerClearedLocationState(id, c.customerName);
+      const explicitClear = c.locationCleared === true || Boolean(locClearedVal && (!locUpdatedVal || String(locClearedVal) >= String(locUpdatedVal)));
+      if (explicitClear) {
+        latVal = null;
+        lngVal = null;
+        locAddrVal = '';
+        locUpdatedVal = null;
+        locClearedVal = locClearedVal || new Date().toISOString();
+      } else if (serverClearState.cleared && serverClearState.clearedAt) {
+        const isStrictlyNewer = Boolean(locUpdatedVal && String(locUpdatedVal) > String(serverClearState.clearedAt));
+        if (!isStrictlyNewer) {
+          latVal = null;
+          lngVal = null;
+          locAddrVal = '';
+          locUpdatedVal = null;
+          locClearedVal = serverClearState.clearedAt;
+        }
+      }
+
       const saved = fileDb.upsert("contracts", {
         id,
         customerName: c.customerName || '',
@@ -2053,10 +2257,11 @@ async function startServer() {
         lastPaymentDate: c.lastPaymentDate || null,
         totalPaid: Number(c.totalPaid) || 0,
         repName: c.repName || '',
-        latitude: c.latitude != null ? Number(c.latitude) : (c.lat != null ? Number(c.lat) : null),
-        longitude: c.longitude != null ? Number(c.longitude) : (c.lng != null ? Number(c.lng) : null),
-        locationAddress: c.locationAddress || c.location_address || '',
-        locationUpdatedAt: c.locationUpdatedAt || c.location_updated_at || null,
+        latitude: latVal,
+        longitude: lngVal,
+        locationAddress: locAddrVal,
+        locationUpdatedAt: locUpdatedVal,
+        locationClearedAt: locClearedVal,
         createdAt: c.createdAt || new Date().toISOString(),
         completedAt: c.completedAt || null,
         updatedAt: c.updatedAt || null,
@@ -2068,8 +2273,8 @@ async function startServer() {
           item_quantity, purchase_price, list_id, list_name, total_price, advance_payment,
           remaining_balance, daily_installment, start_date, notes, status, last_payment_date,
           total_paid, rep_name, created_at, completed_at, updated_at, is_edited,
-          latitude, longitude, location_address, location_updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+          latitude, longitude, location_address, location_updated_at, location_cleared_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
         ON CONFLICT (id) DO UPDATE SET
           customer_name = EXCLUDED.customer_name,
           customer_phone = EXCLUDED.customer_phone,
@@ -2089,20 +2294,22 @@ async function startServer() {
           longitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
           location_address = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
           location_updated_at = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END,
-          location_cleared_at = CASE WHEN EXCLUDED.location_updated_at IS NOT NULL AND sales.location_cleared_at IS NOT NULL AND EXCLUDED.location_updated_at > sales.location_cleared_at THEN NULL ELSE sales.location_cleared_at END`;
+          location_cleared_at = CASE WHEN EXCLUDED.location_updated_at IS NOT NULL AND sales.location_cleared_at IS NOT NULL AND EXCLUDED.location_updated_at > sales.location_cleared_at THEN NULL ELSE COALESCE(sales.location_cleared_at, EXCLUDED.location_cleared_at) END`;
       const vals = [
         id, saved.customerName, saved.customerPhone, saved.customerAddress, saved.itemId, saved.itemName,
         saved.itemQuantity, saved.purchasePrice, saved.listId, saved.listName,
         saved.totalPrice, saved.advancePayment, saved.remainingBalance, saved.dailyInstallment,
         saved.startDate, saved.notes, saved.status, saved.lastPaymentDate, saved.totalPaid,
         saved.repName, saved.createdAt, saved.completedAt, saved.updatedAt, saved.isEdited,
-        saved.latitude, saved.longitude, saved.locationAddress, saved.locationUpdatedAt
+        saved.latitude, saved.longitude, saved.locationAddress, saved.locationUpdatedAt, saved.locationClearedAt
       ];
 
       console.log(`[POST /api/contracts] Inserting contract ${id} for customer ${saved.customerName}...`);
       await executePg(sql1, vals);
       await executePg("DELETE FROM deleted_records WHERE record_id = $1", [id]).catch(() => {});
-      if (saved.latitude != null && saved.longitude != null && !isNaN(Number(saved.latitude)) && !isNaN(Number(saved.longitude)) && Number(saved.latitude) !== 0 && Number(saved.longitude) !== 0) {
+      if (locClearedVal && latVal == null) {
+        await clearContractAndCustomerLocations(id, locClearedVal, saved.customerName);
+      } else if (latVal != null && lngVal != null) {
         await unclearContractLocation(id, saved.customerName);
         await executePg(`
           UPDATE customers
@@ -2110,8 +2317,8 @@ async function startServer() {
               longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
               location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
               location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
-          WHERE id = $5 OR TRIM(LOWER(name)) = TRIM(LOWER($6))
-        `, [saved.latitude, saved.longitude, saved.locationAddress || '', saved.locationUpdatedAt || new Date().toISOString(), id, saved.customerName]).catch(() => {});
+          WHERE id = $5 OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $6
+        `, [latVal, lngVal, locAddrVal || '', locUpdatedVal || new Date().toISOString(), id, normalizeServerName(saved.customerName)]).catch(() => {});
       }
       console.log(`[POST /api/contracts] Inserted ${id} into PostgreSQL successfully.`);
 
@@ -2255,8 +2462,48 @@ async function startServer() {
         console.warn(`[PUT /api/contracts/:id] Blocked non-contract ID: ${id}`);
         return res.status(400).json({ error: 'Invalid contract ID' });
       }
-      const updates = req.body;
-      fileDb.update("contracts", id, updates);
+      const rawUpdates = { ...(req.body || {}) };
+      const isClearingLoc =
+        rawUpdates.locationCleared === true ||
+        ((rawUpdates.latitude !== undefined || rawUpdates.longitude !== undefined) &&
+          (rawUpdates.latitude == null || rawUpdates.longitude == null || Number(rawUpdates.latitude) === 0 || Number(rawUpdates.longitude) === 0));
+
+      let updates = rawUpdates;
+      let rejectedStalePin = false;
+      if (!isClearingLoc && (updates.latitude !== undefined || updates.longitude !== undefined)) {
+        const hasPosLat = updates.latitude != null && updates.latitude !== 0 && !isNaN(Number(updates.latitude));
+        const hasPosLng = updates.longitude != null && updates.longitude !== 0 && !isNaN(Number(updates.longitude));
+        if (hasPosLat && hasPosLng) {
+          const clearState = await getServerClearedLocationState(id, updates.customerName || updates.customer_name);
+          const incomingLocUpdated = updates.locationUpdatedAt ?? updates.location_updated_at ?? null;
+          if (clearState.cleared && clearState.clearedAt && (!incomingLocUpdated || String(incomingLocUpdated) <= String(clearState.clearedAt))) {
+            rejectedStalePin = true;
+            const sanitized = { ...updates };
+            delete sanitized.latitude;
+            delete sanitized.longitude;
+            delete sanitized.locationAddress;
+            delete sanitized.location_address;
+            delete sanitized.locationUpdatedAt;
+            delete sanitized.location_updated_at;
+            delete sanitized.locationClearedAt;
+            delete sanitized.location_cleared_at;
+            updates = sanitized;
+          }
+        }
+      }
+
+      if (isClearingLoc) {
+        const clearIsoPre = updates.locationClearedAt || updates.location_cleared_at || new Date().toISOString();
+        updates = {
+          ...updates,
+          latitude: null,
+          longitude: null,
+          locationAddress: null,
+          locationUpdatedAt: null,
+          locationClearedAt: clearIsoPre,
+        };
+      }
+
       fileDb.update("contracts", id, updates);
 
       const fieldMap: Record<string, string> = {
@@ -2283,7 +2530,6 @@ async function startServer() {
         completedAt: 'completed_at',
         updatedAt: 'updated_at',
         isEdited: 'is_edited',
-        // Also support snake_case keys if passed directly
         customer_name: 'customer_name',
         customer_phone: 'customer_phone',
         customer_address: 'customer_address',
@@ -2315,11 +2561,6 @@ async function startServer() {
         location_cleared_at: 'location_cleared_at'
       };
 
-      const isClearingLoc =
-        updates.locationCleared === true ||
-        ((updates.latitude !== undefined || updates.longitude !== undefined) &&
-          (updates.latitude == null || updates.longitude == null || Number(updates.latitude) === 0 || Number(updates.longitude) === 0));
-
       const setClauses: string[] = [];
       const values: any[] = [];
       let idx = 1;
@@ -2345,7 +2586,7 @@ async function startServer() {
         if (isClearingLoc) {
           const clearIso = updates.locationClearedAt || updates.location_cleared_at || new Date().toISOString();
           await clearContractAndCustomerLocations(id, clearIso, updates.customerName || updates.customer_name);
-        } else if (updates.latitude !== undefined || updates.longitude !== undefined) {
+        } else if (!rejectedStalePin && (updates.latitude !== undefined || updates.longitude !== undefined)) {
           const newLat = (updates.latitude != null && updates.latitude !== 0 && !isNaN(Number(updates.latitude))) ? Number(updates.latitude) : null;
           const newLng = (updates.longitude != null && updates.longitude !== 0 && !isNaN(Number(updates.longitude))) ? Number(updates.longitude) : null;
           const newLocAddress = updates.locationAddress ?? updates.location_address ?? null;
@@ -2362,16 +2603,17 @@ async function startServer() {
               UPDATE customers
               SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
               WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
-                 OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $5)
+                 OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $5)
             `, [newLat, newLng, newLocAddress, newLocUpdated, id]).catch(() => {});
 
             const allCusts = fileDb.get<any>("customers") || [];
             const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === id);
+            const matchedNorm = normalizeServerName(matchedSale?.customerName);
             let custChanged = false;
             for (let i = 0; i < allCusts.length; i++) {
               if (
                 (matchedSale?.customerId && allCusts[i].id === matchedSale.customerId) ||
-                (matchedSale?.customerName && allCusts[i].name && allCusts[i].name.trim().toLowerCase() === matchedSale.customerName.trim().toLowerCase()) ||
+                (matchedNorm && allCusts[i].name && normalizeServerName(allCusts[i].name) === matchedNorm) ||
                 allCusts[i].id === id
               ) {
                 allCusts[i].latitude = newLat;
@@ -2802,16 +3044,12 @@ async function startServer() {
       // If payment has GPS location and was captured AFTER any prior location clear, reflect it on the map
       if (contractId && latitude != null && longitude != null && !isNaN(latitude) && !isNaN(longitude) && latitude !== 0 && longitude !== 0) {
         const nowIso = new Date().toISOString();
-        const paymentTs = String(createdAt || nowIso);
-        const existingSaleRows = await executePg(
-          `SELECT customer_name, location_cleared_at FROM sales WHERE id = $1 LIMIT 1`,
-          [contractId]
-        ).catch(() => []);
-        const clearedAt = existingSaleRows?.[0]?.location_cleared_at || '';
-        const shouldApplyPaymentGps = !clearedAt || paymentTs > clearedAt;
+        const paymentTs = String(p.locationUpdatedAt || p.location_updated_at || p.createdAt || p.created_at || '');
+        const clearState = await getServerClearedLocationState(contractId, customerName);
+        const shouldApplyPaymentGps = !clearState.cleared || Boolean(paymentTs && clearState.clearedAt && paymentTs > clearState.clearedAt);
 
         if (shouldApplyPaymentGps) {
-          await unclearContractLocation(contractId, customerName || existingSaleRows?.[0]?.customer_name);
+          await unclearContractLocation(contractId, customerName || clearState.customerName);
           await executePg(`
             UPDATE sales 
             SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
@@ -2822,7 +3060,7 @@ async function startServer() {
             UPDATE customers 
             SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
             WHERE id IN (SELECT customer_id FROM sales WHERE id = $4)
-               OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $4)
+               OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $4)
           `, [latitude, longitude, nowIso, contractId]).catch(() => {});
 
           const allC = fileDb.get<any>("contracts") || [];
@@ -3550,21 +3788,27 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg(`
-            SELECT 
-              c.*,
-              (SELECT COUNT(*) FROM sales s WHERE s.customer_name = c.name OR s.customer_id = c.id) as sales_count
-            FROM customers c
-            WHERE NOT EXISTS (
-              SELECT 1 FROM deleted_records dr 
-              WHERE dr.record_id = c.id AND (dr.table_name = 'customers' OR dr.table_name = 'unknown')
-            )
-            ORDER BY c.name ASC
-          `);
-          if (rows && rows.length > 0) {
-            return res.json(rows);
-          }
-          return res.json([]);
+          const [rows, tombRows, salesClearRows] = await Promise.all([
+            executePg(`
+              SELECT 
+                c.*,
+                (SELECT COUNT(*) FROM sales s WHERE s.customer_name = c.name OR s.customer_id = c.id) as sales_count
+              FROM customers c
+              WHERE NOT EXISTS (
+                SELECT 1 FROM deleted_records dr 
+                WHERE dr.record_id = c.id AND (dr.table_name = 'customers' OR dr.table_name = 'unknown')
+              )
+              ORDER BY c.name ASC
+            `),
+            executePg(`SELECT record_id FROM deleted_records WHERE record_id LIKE 'loc_clear_%'`).catch(() => []),
+            executePg(`SELECT id, customer_id, customer_name, location_cleared_at, location_updated_at FROM sales WHERE location_cleared_at IS NOT NULL`).catch(() => []),
+          ]);
+          const baseClearedIds = (tombRows || [])
+            .map((r: any) => String(r?.record_id || '').replace(/^loc_clear_/, ''))
+            .filter(Boolean);
+          const clearedSet = buildExpandedClearedSet(baseClearedIds, salesClearRows || [], rows || []);
+          const mapped = (rows || []).map((r: any) => mapCustomerRow(r, clearedSet));
+          return res.json(mapped);
         } catch (pgErr) {
           console.warn("Postgres fetch customers error:", pgErr);
         }
@@ -3620,11 +3864,24 @@ async function startServer() {
         b.locationCleared === true ||
         ((b.latitude !== undefined || b.longitude !== undefined) &&
           (b.latitude == null || b.longitude == null || Number(b.latitude) === 0 || Number(b.longitude) === 0));
-      const latVal = isClearingLoc ? null : (b.latitude !== undefined && b.latitude != null && b.latitude !== 0 && !isNaN(Number(b.latitude)) ? Number(b.latitude) : undefined);
-      const lngVal = isClearingLoc ? null : (b.longitude !== undefined && b.longitude != null && b.longitude !== 0 && !isNaN(Number(b.longitude)) ? Number(b.longitude) : undefined);
-      const locAddrVal = isClearingLoc ? null : (b.locationAddress ?? b.location_address);
-      const locUpdVal = isClearingLoc ? null : (b.locationUpdatedAt ?? b.location_updated_at ?? (latVal != null ? new Date().toISOString() : undefined));
+      let latVal = isClearingLoc ? null : (b.latitude !== undefined && b.latitude != null && b.latitude !== 0 && !isNaN(Number(b.latitude)) ? Number(b.latitude) : undefined);
+      let lngVal = isClearingLoc ? null : (b.longitude !== undefined && b.longitude != null && b.longitude !== 0 && !isNaN(Number(b.longitude)) ? Number(b.longitude) : undefined);
+      let locAddrVal = isClearingLoc ? null : (b.locationAddress ?? b.location_address);
+      let locUpdVal = isClearingLoc ? null : (b.locationUpdatedAt ?? b.location_updated_at ?? (latVal != null ? new Date().toISOString() : undefined));
       const clearIso = isClearingLoc ? (b.locationClearedAt || b.location_cleared_at || new Date().toISOString()) : null;
+
+      let rejectedStaleCustomerPin = false;
+      if (!isClearingLoc && latVal != null && lngVal != null) {
+        const clearState = await getServerClearedLocationState(id, b.name || b.customerName);
+        const incomingUpd = b.locationUpdatedAt ?? b.location_updated_at ?? null;
+        if (clearState.cleared && clearState.clearedAt && (!incomingUpd || String(incomingUpd) <= String(clearState.clearedAt))) {
+          rejectedStaleCustomerPin = true;
+          latVal = undefined;
+          lngVal = undefined;
+          locAddrVal = undefined;
+          locUpdVal = undefined;
+        }
+      }
 
       if (isPgConfigured()) {
         await executePg(`
@@ -3650,9 +3907,9 @@ async function startServer() {
           b.listName ?? b.list_name,
           b.notes,
           b.status,
-          isClearingLoc || b.latitude !== undefined,
+          isClearingLoc || (!rejectedStaleCustomerPin && b.latitude !== undefined),
           latVal ?? null,
-          isClearingLoc || b.longitude !== undefined,
+          isClearingLoc || (!rejectedStaleCustomerPin && b.longitude !== undefined),
           lngVal ?? null,
           isClearingLoc,
           locAddrVal ?? null,
@@ -3664,33 +3921,44 @@ async function startServer() {
         if (isClearingLoc) {
           const custRows = await executePg(`SELECT name FROM customers WHERE id = $1 LIMIT 1`, [id]).catch(() => []);
           const custName = b.name || custRows?.[0]?.name || '';
+          const normCustName = normalizeServerName(custName);
           const relSales = await executePg(
-            `SELECT id FROM sales WHERE customer_id = $1 OR ($2 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($2))) OR id = $1`,
-            [id, custName]
+            `SELECT id FROM sales WHERE customer_id = $1 OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2) OR id = $1`,
+            [id, normCustName]
           ).catch(() => []);
           await clearContractAndCustomerLocations(id, clearIso!, custName);
           for (const sr of relSales || []) {
             if (sr?.id) await clearContractAndCustomerLocations(String(sr.id), clearIso!, custName);
           }
-        } else if (latVal != null && lngVal != null) {
+        } else if (!rejectedStaleCustomerPin && latVal != null && lngVal != null) {
           const custRows = await executePg(`SELECT name FROM customers WHERE id = $1 LIMIT 1`, [id]).catch(() => []);
           const custName = b.name || custRows?.[0]?.name || '';
+          const normCustName = normalizeServerName(custName);
           await unclearContractLocation(id, custName);
           await executePg(`
             UPDATE sales
             SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
-            WHERE customer_id = $5 OR ($6 != '' AND TRIM(LOWER(customer_name)) = TRIM(LOWER($6)))
-          `, [latVal, lngVal, locAddrVal ?? null, locUpdVal ?? new Date().toISOString(), id, custName]).catch(() => {});
+            WHERE customer_id = $5 OR ($6 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $6)
+          `, [latVal, lngVal, locAddrVal ?? null, locUpdVal ?? new Date().toISOString(), id, normCustName]).catch(() => {});
         }
       }
 
+      const fileCustUpdate: any = { ...b };
+      if (rejectedStaleCustomerPin) {
+        delete fileCustUpdate.latitude;
+        delete fileCustUpdate.longitude;
+        delete fileCustUpdate.locationAddress;
+        delete fileCustUpdate.location_address;
+        delete fileCustUpdate.locationUpdatedAt;
+        delete fileCustUpdate.location_updated_at;
+      }
       fileDb.update("customers", id, {
-        ...b,
+        ...fileCustUpdate,
         ...(isClearingLoc ? { latitude: null, longitude: null, locationAddress: null, location_address: null, locationUpdatedAt: null, location_updated_at: null, locationClearedAt: clearIso, location_cleared_at: clearIso } : {}),
-        ...(!isClearingLoc && latVal !== undefined ? { latitude: latVal, locationClearedAt: null, location_cleared_at: null } : {}),
-        ...(!isClearingLoc && lngVal !== undefined ? { longitude: lngVal } : {}),
-        ...(!isClearingLoc && locAddrVal !== undefined ? { locationAddress: locAddrVal, location_address: locAddrVal } : {}),
-        ...(!isClearingLoc && locUpdVal !== undefined ? { locationUpdatedAt: locUpdVal, location_updated_at: locUpdVal } : {})
+        ...(!isClearingLoc && !rejectedStaleCustomerPin && latVal !== undefined ? { latitude: latVal, locationClearedAt: null, location_cleared_at: null } : {}),
+        ...(!isClearingLoc && !rejectedStaleCustomerPin && lngVal !== undefined ? { longitude: lngVal } : {}),
+        ...(!isClearingLoc && !rejectedStaleCustomerPin && locAddrVal !== undefined ? { locationAddress: locAddrVal, location_address: locAddrVal } : {}),
+        ...(!isClearingLoc && !rejectedStaleCustomerPin && locUpdVal !== undefined ? { locationUpdatedAt: locUpdVal, location_updated_at: locUpdVal } : {})
       });
       bumpSyncVersion();
       res.json({ success: true });
@@ -5610,12 +5878,7 @@ async function startServer() {
           let locClearedAt = payload.locationClearedAt ?? payload.location_cleared_at ?? null;
 
           if (isPgConfigured()) {
-            const [saleStateRows, clearRows] = await Promise.all([
-              executePg(`SELECT location_cleared_at FROM sales WHERE id = $1 LIMIT 1`, [payload.id]).catch(() => []),
-              executePg(`SELECT 1 FROM deleted_records WHERE record_id = $1 LIMIT 1`, [`loc_clear_${payload.id}`]).catch(() => []),
-            ]);
-            const serverClearedAt = saleStateRows?.[0]?.location_cleared_at || '';
-            const hasTombstone = Boolean(clearRows && clearRows.length > 0);
+            const clearState = await getServerClearedLocationState(payload.id, cName);
             const payloadExplicitlyCleared = payload.locationCleared === true || Boolean(locClearedAt && (!locUpAt || locClearedAt >= locUpAt));
 
             if (payloadExplicitlyCleared) {
@@ -5624,14 +5887,14 @@ async function startServer() {
               locAddr = null;
               locUpAt = null;
               locClearedAt = locClearedAt || new Date().toISOString();
-            } else if (serverClearedAt || hasTombstone) {
-              const incomingIsStrictlyNewer = Boolean(locUpAt && serverClearedAt && String(locUpAt) > String(serverClearedAt));
+            } else if (clearState.cleared && clearState.clearedAt) {
+              const incomingIsStrictlyNewer = Boolean(locUpAt && String(locUpAt) > String(clearState.clearedAt));
               if (!incomingIsStrictlyNewer) {
                 lat = null;
                 lng = null;
                 locAddr = null;
                 locUpAt = null;
-                locClearedAt = serverClearedAt || locClearedAt || new Date().toISOString();
+                locClearedAt = clearState.clearedAt;
               } else {
                 await unclearContractLocation(payload.id, cName);
                 locClearedAt = null;
@@ -5723,11 +5986,49 @@ async function startServer() {
             console.warn(`[Sync] Skipped invalid contract ID in UPDATE_CONTRACT: ${payload.id}`);
             return true;
           }
-          fileDb.update("contracts", payload.id, payload);
+          const rawPayload = { ...payload };
           const isClearingLoc =
-            payload.locationCleared === true ||
-            ((payload.latitude !== undefined || payload.longitude !== undefined) &&
-              (payload.latitude == null || payload.longitude == null || Number(payload.latitude) === 0 || Number(payload.longitude) === 0));
+            rawPayload.locationCleared === true ||
+            ((rawPayload.latitude !== undefined || rawPayload.longitude !== undefined) &&
+              (rawPayload.latitude == null || rawPayload.longitude == null || Number(rawPayload.latitude) === 0 || Number(rawPayload.longitude) === 0));
+
+          let effectivePayload = rawPayload;
+          let rejectedStalePin = false;
+          if (!isClearingLoc && (effectivePayload.latitude !== undefined || effectivePayload.longitude !== undefined)) {
+            const hasPosLat = effectivePayload.latitude != null && effectivePayload.latitude !== 0 && !isNaN(Number(effectivePayload.latitude));
+            const hasPosLng = effectivePayload.longitude != null && effectivePayload.longitude !== 0 && !isNaN(Number(effectivePayload.longitude));
+            if (hasPosLat && hasPosLng) {
+              const clearState = await getServerClearedLocationState(effectivePayload.id, effectivePayload.customerName || effectivePayload.customer_name);
+              const incomingLocUpdated = effectivePayload.locationUpdatedAt ?? effectivePayload.location_updated_at ?? null;
+              if (clearState.cleared && clearState.clearedAt && (!incomingLocUpdated || String(incomingLocUpdated) <= String(clearState.clearedAt))) {
+                rejectedStalePin = true;
+                const sanitized = { ...effectivePayload };
+                delete sanitized.latitude;
+                delete sanitized.longitude;
+                delete sanitized.locationAddress;
+                delete sanitized.location_address;
+                delete sanitized.locationUpdatedAt;
+                delete sanitized.location_updated_at;
+                delete sanitized.locationClearedAt;
+                delete sanitized.location_cleared_at;
+                effectivePayload = sanitized;
+              }
+            }
+          }
+
+          if (isClearingLoc) {
+            const clearIsoPre = effectivePayload.locationClearedAt || effectivePayload.location_cleared_at || new Date().toISOString();
+            effectivePayload = {
+              ...effectivePayload,
+              latitude: null,
+              longitude: null,
+              locationAddress: null,
+              locationUpdatedAt: null,
+              locationClearedAt: clearIsoPre,
+            };
+          }
+
+          fileDb.update("contracts", effectivePayload.id, effectivePayload);
 
           const fields: string[] = [];
           const vals: any[] = [];
@@ -5785,7 +6086,7 @@ async function startServer() {
             location_cleared_at: "location_cleared_at"
           };
           const addedCols = new Set<string>();
-          for (const [k, v] of Object.entries(payload)) {
+          for (const [k, v] of Object.entries(effectivePayload)) {
             if (k === "id" || k === "locationCleared") continue;
             const mappedCol = colMap[k];
             if (mappedCol && !addedCols.has(mappedCol)) {
@@ -5796,36 +6097,37 @@ async function startServer() {
           }
           if (fields.length > 0 || isClearingLoc) {
             if (fields.length > 0) {
-              vals.push(payload.id);
+              vals.push(effectivePayload.id);
               await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx}`, vals).catch(() => {});
             }
             if (isClearingLoc) {
-              const clearIso = payload.locationClearedAt || payload.location_cleared_at || new Date().toISOString();
-              await clearContractAndCustomerLocations(payload.id, clearIso, payload.customerName || payload.customer_name);
-            } else if (payload.latitude !== undefined || payload.longitude !== undefined) {
-              const newLat = (payload.latitude != null && payload.latitude !== 0 && !isNaN(Number(payload.latitude))) ? Number(payload.latitude) : null;
-              const newLng = (payload.longitude != null && payload.longitude !== 0 && !isNaN(Number(payload.longitude))) ? Number(payload.longitude) : null;
-              const newLocAddress = payload.locationAddress ?? payload.location_address ?? null;
-              const newLocUpdated = payload.locationUpdatedAt ?? payload.location_updated_at ?? new Date().toISOString();
+              const clearIso = effectivePayload.locationClearedAt || effectivePayload.location_cleared_at || new Date().toISOString();
+              await clearContractAndCustomerLocations(effectivePayload.id, clearIso, effectivePayload.customerName || effectivePayload.customer_name);
+            } else if (!rejectedStalePin && (effectivePayload.latitude !== undefined || effectivePayload.longitude !== undefined)) {
+              const newLat = (effectivePayload.latitude != null && effectivePayload.latitude !== 0 && !isNaN(Number(effectivePayload.latitude))) ? Number(effectivePayload.latitude) : null;
+              const newLng = (effectivePayload.longitude != null && effectivePayload.longitude !== 0 && !isNaN(Number(effectivePayload.longitude))) ? Number(effectivePayload.longitude) : null;
+              const newLocAddress = effectivePayload.locationAddress ?? effectivePayload.location_address ?? null;
+              const newLocUpdated = effectivePayload.locationUpdatedAt ?? effectivePayload.location_updated_at ?? new Date().toISOString();
               if (newLat != null && newLng != null) {
-                await unclearContractLocation(payload.id, payload.customerName || payload.customer_name);
-                await executePg(`UPDATE sales SET location_cleared_at = NULL WHERE id = $1`, [payload.id]).catch(() => {});
+                await unclearContractLocation(effectivePayload.id, effectivePayload.customerName || effectivePayload.customer_name);
+                await executePg(`UPDATE sales SET location_cleared_at = NULL WHERE id = $1`, [effectivePayload.id]).catch(() => {});
                 await executePg(`
                   UPDATE customers
                   SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
                   WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
-                     OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $5)
+                     OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $5)
                      OR id = $5
-                `, [newLat, newLng, newLocAddress, newLocUpdated, payload.id]).catch(() => {});
+                `, [newLat, newLng, newLocAddress, newLocUpdated, effectivePayload.id]).catch(() => {});
 
                 const allCusts = fileDb.get<any>("customers") || [];
-                const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === payload.id);
+                const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === effectivePayload.id);
+                const matchedNorm = normalizeServerName(matchedSale?.customerName);
                 let custChanged = false;
                 for (let i = 0; i < allCusts.length; i++) {
                   if (
                     (matchedSale?.customerId && allCusts[i].id === matchedSale.customerId) ||
-                    (matchedSale?.customerName && allCusts[i].name && allCusts[i].name.trim().toLowerCase() === matchedSale.customerName.trim().toLowerCase()) ||
-                    allCusts[i].id === payload.id
+                    (matchedNorm && allCusts[i].name && normalizeServerName(allCusts[i].name) === matchedNorm) ||
+                    allCusts[i].id === effectivePayload.id
                   ) {
                     allCusts[i].latitude = newLat;
                     allCusts[i].longitude = newLng;
@@ -6010,37 +6312,37 @@ async function startServer() {
 
           if (cId && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng) && pLat !== 0 && pLng !== 0) {
             const nowIso = new Date().toISOString();
-            const paymentTs = String(cAt || nowIso);
+            const paymentTs = String(payload.locationUpdatedAt || payload.location_updated_at || payload.createdAt || payload.created_at || '');
             const shouldForceUpdate = Boolean(payload.updateCustomerLocation || payload.shouldUpdateCustomerLocation);
-            const saleCheckRows = await executePg(
-              `SELECT location_cleared_at FROM sales WHERE id = $1 LIMIT 1`,
-              [cId]
-            ).catch(() => []);
-            const clearedAt = saleCheckRows?.[0]?.location_cleared_at || '';
+            // During full-cache reconciliation (skipBalanceRecalc=true), historical payments must NEVER resurrect cleared customer coordinates
+            if (!skipBalanceRecalc || shouldForceUpdate) {
+              const clearState = await getServerClearedLocationState(cId, cName);
+              const clearedAt = clearState.clearedAt || '';
 
-            if (!clearedAt || paymentTs > clearedAt || shouldForceUpdate) {
-              await unclearContractLocation(cId, cName);
-              await executePg(`
-                UPDATE sales 
-                SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                WHERE id = $4 AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
-              `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
+              if (!clearState.cleared || shouldForceUpdate || (paymentTs && clearedAt && paymentTs > clearedAt)) {
+                await unclearContractLocation(cId, cName || clearState.customerName);
+                await executePg(`
+                  UPDATE sales 
+                  SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                  WHERE id = $4 AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
+                `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
 
-              await executePg(`
-                UPDATE customers 
-                SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $4))
-                  AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
-              `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
+                await executePg(`
+                  UPDATE customers 
+                  SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                  WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $4))
+                    AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
+                `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
 
-              const allC = fileDb.get<any>("contracts") || [];
-              const cIdx = allC.findIndex((x: any) => x.id === cId);
-              if (cIdx !== -1) {
-                const existingC = allC[cIdx];
-                const hasOldLoc = existingC.latitude != null && Number(existingC.latitude) !== 0;
-                if (shouldForceUpdate || !hasOldLoc) {
-                  allC[cIdx] = { ...existingC, latitude: pLat, longitude: pLng, locationUpdatedAt: nowIso, locationClearedAt: null };
-                  fileDb.setAll("contracts", allC);
+                const allC = fileDb.get<any>("contracts") || [];
+                const cIdx = allC.findIndex((x: any) => x.id === cId);
+                if (cIdx !== -1) {
+                  const existingC = allC[cIdx];
+                  const hasOldLoc = existingC.latitude != null && Number(existingC.latitude) !== 0;
+                  if (shouldForceUpdate || !hasOldLoc) {
+                    allC[cIdx] = { ...existingC, latitude: pLat, longitude: pLng, locationUpdatedAt: nowIso, locationClearedAt: null };
+                    fileDb.setAll("contracts", allC);
+                  }
                 }
               }
             }
@@ -7000,15 +7302,17 @@ async function startServer() {
           executePg(`SELECT record_id, table_name FROM deleted_records ORDER BY deleted_at DESC LIMIT 5000`).catch(() => []),
         ]);
 
-        const contracts = (contractsRows || []).map(mapContractRow);
-        const customers = (customersRows || []).map((c: any) => ({
-          ...c,
-          latitude: c.latitude != null ? Number(c.latitude) : null,
-          longitude: c.longitude != null ? Number(c.longitude) : null,
-          locationAddress: c.location_address || c.locationAddress || '',
-          locationUpdatedAt: c.location_updated_at || c.locationUpdatedAt || null,
-          locationClearedAt: c.location_cleared_at || c.locationClearedAt || null,
-        }));
+        const baseClearedIds: string[] = [];
+        for (const r of deletedRows || []) {
+          const rid = String(r?.record_id || '');
+          if (rid.startsWith('loc_clear_')) {
+            baseClearedIds.push(rid.replace(/^loc_clear_/, ''));
+          }
+        }
+        const clearedLocationSet = buildExpandedClearedSet(baseClearedIds, contractsRows || [], customersRows || []);
+
+        const contracts = (contractsRows || []).map((r: any) => mapContractRow(r, clearedLocationSet));
+        const customers = (customersRows || []).map((c: any) => mapCustomerRow(c, clearedLocationSet));
         const payments = (paymentsRows || []).map(mapPaymentRow);
         const inventory = (inventoryRows || []).map(mapInventoryRow);
         const reps = (repsRows || []).map(mapRepRow);
@@ -7105,19 +7409,6 @@ async function startServer() {
             !activeListIds.has(String(id)) &&
             !activeEmpIds.has(String(id))
           );
-
-        const clearedLocationSet = new Set<string>();
-        for (const r of deletedRows || []) {
-          const rid = String(r?.record_id || '');
-          if (rid.startsWith('loc_clear_')) {
-            clearedLocationSet.add(rid.replace(/^loc_clear_/, ''));
-          }
-        }
-        for (const c of contracts) {
-          if (c?.id && c.locationClearedAt && (!c.locationUpdatedAt || String(c.locationClearedAt) >= String(c.locationUpdatedAt))) {
-            clearedLocationSet.add(String(c.id));
-          }
-        }
 
         return res.json({
           success: true,
@@ -7373,11 +7664,11 @@ async function startServer() {
               }
               if (row.contract_id && row.latitude != null && row.longitude != null && row.latitude !== 0 && row.longitude !== 0) {
                 const nowIso = new Date().toISOString();
-                const paymentTs = String(row.created_at || nowIso);
-                const saleState = await executePg(`SELECT location_cleared_at FROM sales WHERE id = $1 LIMIT 1`, [row.contract_id]).catch(() => []);
-                const clearedAt = saleState?.[0]?.location_cleared_at || '';
-                if (!clearedAt || paymentTs > clearedAt) {
-                  await unclearContractLocation(row.contract_id, row.customer_name);
+                const paymentTs = String(row.created_at || '');
+                const clearState = await getServerClearedLocationState(row.contract_id, row.customer_name);
+                const clearedAt = clearState.clearedAt || '';
+                if (!clearState.cleared || (paymentTs && clearedAt && paymentTs > clearedAt)) {
+                  await unclearContractLocation(row.contract_id, row.customer_name || clearState.customerName);
                   await executePg(`
                     UPDATE sales
                     SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
@@ -7386,7 +7677,7 @@ async function startServer() {
                   await executePg(`
                     UPDATE customers
                     SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                    WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR TRIM(LOWER(name)) IN (SELECT TRIM(LOWER(customer_name)) FROM sales WHERE id = $4))
+                    WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $4))
                       AND (latitude IS NULL OR latitude = 0)
                   `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
                 }
@@ -7881,19 +8172,19 @@ async function startServer() {
       ]);
 
       const deletedSet = new Set((deletedRecordsRows || []).map((r: any) => String(r.record_id)));
-      const clearedLocationSet = new Set<string>();
+      const baseClearedIds: string[] = [];
       for (const id of deletedSet) {
-        if (id.startsWith('loc_clear_')) clearedLocationSet.add(id.replace(/^loc_clear_/, ''));
+        if (id.startsWith('loc_clear_')) baseClearedIds.push(id.replace(/^loc_clear_/, ''));
       }
-      if (clientLocatedContractIds.length > 0 && isPgConfigured()) {
-        const clearedSalesRows = await executePg(
-          `SELECT id FROM sales WHERE id = ANY($1) AND location_cleared_at IS NOT NULL AND (latitude IS NULL OR location_cleared_at >= COALESCE(location_updated_at, ''))`,
-          [clientLocatedContractIds]
-        ).catch(() => []);
-        for (const r of clearedSalesRows || []) {
-          if (r?.id) clearedLocationSet.add(String(r.id));
-        }
+      let allSalesClearRows: any[] = [];
+      let allCustClearRows: any[] = [];
+      if (isPgConfigured()) {
+        [allSalesClearRows, allCustClearRows] = await Promise.all([
+          executePg(`SELECT id, customer_id, customer_name, location_cleared_at, location_updated_at FROM sales WHERE location_cleared_at IS NOT NULL OR id = ANY($1)`, [baseClearedIds.length > 0 ? baseClearedIds : ['']]).catch(() => []),
+          executePg(`SELECT id, name, location_cleared_at, location_updated_at FROM customers WHERE location_cleared_at IS NOT NULL`).catch(() => []),
+        ]);
       }
+      const clearedLocationSet = buildExpandedClearedSet(baseClearedIds, allSalesClearRows || [], allCustClearRows || []);
 
       const foundContractSet = new Set((existingContracts || []).map((r: any) => String(r.id)));
       const foundPaymentSet = new Set((existingPayments || []).map((r: any) => String(r.id)));
@@ -8010,12 +8301,12 @@ async function startServer() {
         missingAppointmentIds,
         missingLocationContractIds,
         clearedLocationContractIds: Array.from(clearedLocationSet),
+        deletedRecordIds: Array.from(deletedSet),
         confirmedContractCount: foundContractSet.size,
         confirmedPaymentCount: foundPaymentSet.size,
         serverContractCount,
         serverPaymentCount,
         hasNewServerData,
-        deletedRecordIds: Array.from(deletedSet),
         syncVersion: globalSyncVersion,
         timestamp: Date.now(),
       });

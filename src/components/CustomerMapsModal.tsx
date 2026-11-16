@@ -262,6 +262,9 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     return null;
   }, [customers]);
 
+  const getCustomerCoordsRef = useRef(getCustomerCoords);
+  getCustomerCoordsRef.current = getCustomerCoords;
+
   const headingBadgeRef = useRef<HTMLDivElement | null>(null);
   const headingDegreeTextRef = useRef<HTMLSpanElement | null>(null);
 
@@ -685,12 +688,15 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   // Handle initialCustomer if passed and auto-draw street route if requested
   useEffect(() => {
     if (isOpen && initialCustomer) {
-      setSelectedCustomer(initialCustomer);
-      const coords = getCustomerCoords(initialCustomer);
+      const deletedSet = getDeletedRecordIds();
+      const refreshed = contracts.find((c) => c.id === initialCustomer.id) || initialCustomer;
+      const isCleared = Boolean(refreshed.id && deletedSet.has(`loc_clear_${refreshed.id}`));
+      setSelectedCustomer(refreshed);
+      const coords = isCleared ? null : getCustomerCoordsRef.current(refreshed);
       if (coords) {
         if (autoDrawRoute) {
           const routeTimer = setTimeout(() => {
-            handleDrawRouteToCustomer(initialCustomer);
+            handleDrawRouteToCustomer(refreshed);
           }, 80);
           return () => clearTimeout(routeTimer);
         } else {
@@ -705,7 +711,30 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
         }
       }
     }
-  }, [isOpen, initialCustomer, autoDrawRoute, getCustomerCoords]);
+  }, [isOpen, initialCustomer, autoDrawRoute]);
+
+  // Keep selectedCustomer and activeRoute synchronized if contract location is deleted or updated
+  useEffect(() => {
+    if (!isOpen) return;
+    if (selectedCustomer) {
+      const updated = contracts.find((c) => c.id === selectedCustomer.id);
+      if (updated && updated !== selectedCustomer) {
+        setSelectedCustomer(updated);
+      }
+    }
+    if (activeRoute?.contract?.id) {
+      const routeContract = contracts.find((c) => c.id === activeRoute.contract.id);
+      if (!routeContract || !getCustomerCoords(routeContract)) {
+        if (routeLayerRef.current) {
+          try {
+            routeLayerRef.current.clearLayers();
+          } catch (e) {}
+        }
+        routeLatLngsRef.current = [];
+        setActiveRoute(null);
+      }
+    }
+  }, [isOpen, contracts, customers, selectedCustomer, activeRoute, getCustomerCoords]);
 
   // Reset initial bounds fitting when modal opens
   useEffect(() => {
@@ -1075,10 +1104,29 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     }
     try {
       setIsUpdatingLocation(true);
-      await updateCustomerLocation(contractId, null, null, '');
+      const ok = await updateCustomerLocation(contractId, null, null, '');
       setIsUpdatingLocation(false);
-      setSelectedCustomer(null);
-      showFeedback(isAr ? 'تم حذف الموقع ومزامنته مع السيرفر والأجهزة ✅' : 'Location removed and synced with server');
+      if (ok) {
+        if (activeRoute?.contract?.id === contractId) {
+          handleClearRoute();
+        }
+        setSelectedCustomer(null);
+        showFeedback(
+          isAr
+            ? (navigator.onLine === false
+                ? 'تم حذف الموقع محلياً وسيتم تأكيد الحذف مع السيرفر فور توفر الإنترنت ⏳'
+                : 'تم حذف الموقع ومزامنته مع السيرفر والأجهزة ✅')
+            : (navigator.onLine === false
+                ? 'Location cleared locally and queued for server sync'
+                : 'Location removed and synced with server')
+        );
+      } else {
+        showFeedback(
+          isAr
+            ? 'تعذر حذف الموقع من السيرفر — يرجى تأكيد تسجيل الدخول والمحاولة مرة أخرى'
+            : 'Failed to remove location from server — please verify sign-in and try again'
+        );
+      }
     } catch (e) {
       setIsUpdatingLocation(false);
       showFeedback(isAr ? 'حدث خطأ أثناء الحذف' : 'Error removing location');

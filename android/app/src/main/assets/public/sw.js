@@ -568,8 +568,62 @@ async function reconcileDatabaseInBackground() {
     // 3. Ingest payments and recalculate all contract balances (including payments from other reps)
     const rawPayments = Array.isArray(serverData.payments) ? serverData.payments : (localSnapshot.payments || []);
     const rawContracts = Array.isArray(serverData.contracts) ? serverData.contracts : (localSnapshot.contracts || []);
+    const rawCustomers = Array.isArray(serverData.customers) ? serverData.customers : (localSnapshot.customers || []);
 
     const deletedIds = new Set(Array.isArray(serverData.deletedRecordIds) ? serverData.deletedRecordIds : (localSnapshot.deletedIds || []));
+    const clearedLocationIds = new Set(
+      Array.isArray(serverData.clearedLocationContractIds) ? serverData.clearedLocationContractIds.map(String) : []
+    );
+    const clearedLocationNames = new Set();
+
+    deletedIds.forEach((id) => {
+      const s = String(id || '');
+      if (s.startsWith('loc_clear_')) {
+        clearedLocationIds.add(s.slice('loc_clear_'.length));
+      }
+    });
+
+    for (const c of rawContracts) {
+      if (!c) continue;
+      const cId = c.id ? String(c.id) : '';
+      const cClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? null;
+      const cUpdatedAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
+      const hasClearedMeta = Boolean(cClearedAt && (!cUpdatedAt || String(cClearedAt) >= String(cUpdatedAt)));
+      if ((cId && clearedLocationIds.has(cId)) || hasClearedMeta) {
+        if (cId) clearedLocationIds.add(cId);
+        const norm = swNormName(c.customerName ?? c.customer_name);
+        if (norm) clearedLocationNames.add(norm);
+      }
+    }
+
+    for (const cu of rawCustomers) {
+      if (!cu) continue;
+      const cuId = cu.id ? String(cu.id) : '';
+      const cuClearedAt = cu.locationClearedAt ?? cu.location_cleared_at ?? null;
+      const cuUpdatedAt = cu.locationUpdatedAt ?? cu.location_updated_at ?? null;
+      const hasClearedMeta = Boolean(cuClearedAt && (!cuUpdatedAt || String(cuClearedAt) >= String(cuUpdatedAt)));
+      if ((cuId && clearedLocationIds.has(cuId)) || hasClearedMeta) {
+        if (cuId) clearedLocationIds.add(cuId);
+        const norm = swNormName(cu.name ?? cu.customerName ?? cu.customer_name);
+        if (norm) clearedLocationNames.add(norm);
+      }
+    }
+
+    const isItemLocationCleared = (item) => {
+      if (!item) return false;
+      const id = item.id ? String(item.id) : '';
+      if (id && (clearedLocationIds.has(id) || deletedIds.has('loc_clear_' + id))) return true;
+      const norm = swNormName(item.customerName ?? item.customer_name ?? item.name);
+      if (norm && clearedLocationNames.has(norm)) return true;
+      const clearedAt = item.locationClearedAt ?? item.location_cleared_at ?? null;
+      const updatedAt = item.locationUpdatedAt ?? item.location_updated_at ?? null;
+      return Boolean(clearedAt && (!updatedAt || String(clearedAt) >= String(updatedAt)));
+    };
+
+    clearedLocationIds.forEach((id) => {
+      if (id) deletedIds.add('loc_clear_' + id);
+    });
+
     const activePayments = rawPayments.filter((p) => p && p.id && !deletedIds.has(String(p.id)));
 
     const paymentsByContractId = new Map();
@@ -636,8 +690,18 @@ async function reconcileDatabaseInBackground() {
         lastPaymentDate = sorted[0]?.paymentDate || sorted[0]?.payment_date || lastPaymentDate;
       }
 
+      const clearedLoc = isItemLocationCleared(c);
       return {
         ...c,
+        ...(clearedLoc
+          ? {
+              latitude: null,
+              longitude: null,
+              locationAddress: null,
+              locationUpdatedAt: null,
+              locationClearedAt: c.locationClearedAt ?? c.location_cleared_at ?? new Date().toISOString(),
+            }
+          : {}),
         totalPaid: authoritativePaid,
         remainingBalance,
         status,
@@ -645,9 +709,23 @@ async function reconcileDatabaseInBackground() {
       };
     });
 
+    const cleanedCustomers = rawCustomers.map((cu) => {
+      if (!cu) return cu;
+      if (!isItemLocationCleared(cu)) return cu;
+      return {
+        ...cu,
+        latitude: null,
+        longitude: null,
+        locationAddress: null,
+        locationUpdatedAt: null,
+        locationClearedAt: cu.locationClearedAt ?? cu.location_cleared_at ?? new Date().toISOString(),
+      };
+    });
+
     // 4. Save updated snapshot back to IndexedDB so it's ready when the app is opened
     const updatedSnapshot = {
       contracts: recalculatedContracts,
+      customers: cleanedCustomers,
       payments: rawPayments,
       inventory: serverData.inventory || localSnapshot.inventory || [],
       reps: serverData.reps || localSnapshot.reps || [],
@@ -657,6 +735,7 @@ async function reconcileDatabaseInBackground() {
       fundTx: serverData.fundTransactions || localSnapshot.fundTx || [],
       empTx: serverData.employeeTransactions || localSnapshot.empTx || [],
       deletedIds: Array.from(deletedIds),
+      clearedLocationContractIds: Array.from(clearedLocationIds),
       timestamp: Date.now(),
     };
 

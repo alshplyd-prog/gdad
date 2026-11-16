@@ -15,6 +15,80 @@ interface LoginViewProps {
   onRefreshReps?: () => void;
 }
 
+let pendingPinCredsMemory: { repId: string; repName: string; pin: string } | null = null;
+let pendingExchangeTimer: any = null;
+let onlineExchangeListenerBound = false;
+
+async function attemptServerJwtExchangeOnce(): Promise<boolean> {
+  if (!pendingPinCredsMemory) return false;
+  const creds = { ...pendingPinCredsMemory };
+  try {
+    const res = await fetchWithFallback(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repId: creds.repId,
+          repName: creds.repName,
+          pin: creds.pin,
+        }),
+      },
+      3500
+    );
+    const data = await res.json().catch(() => null);
+    if (res.ok && data?.success && data?.token && data?.rep) {
+      const cleanRep = sanitizeRepForStorage(data.rep);
+      setAuthSession({
+        token: data.token,
+        hmacKey: data.hmacKey || '',
+        rep: cleanRep,
+        issuedAt: Date.now(),
+        offlinePendingExchange: false,
+      });
+      pendingPinCredsMemory = null;
+      if (pendingExchangeTimer) {
+        clearTimeout(pendingExchangeTimer);
+        pendingExchangeTimer = null;
+      }
+      reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+      return true;
+    }
+    if (res.status === 401 || res.status === 403) {
+      pendingPinCredsMemory = null;
+    }
+  } catch (e) {}
+  return false;
+}
+
+export async function retryPendingJwtExchangeNow(): Promise<boolean> {
+  return attemptServerJwtExchangeOnce();
+}
+
+function scheduleServerJwtExchange(repObj: SalesRepresentative, pinStr: string, attempt = 0) {
+  pendingPinCredsMemory = { repId: repObj.id, repName: repObj.name, pin: pinStr };
+  if (typeof window !== 'undefined' && !onlineExchangeListenerBound) {
+    onlineExchangeListenerBound = true;
+    window.addEventListener('online', () => {
+      if (pendingPinCredsMemory) {
+        attemptServerJwtExchangeOnce().catch(() => {});
+      }
+    });
+  }
+  if (pendingExchangeTimer) {
+    clearTimeout(pendingExchangeTimer);
+    pendingExchangeTimer = null;
+  }
+  const delay = attempt === 0 ? 500 : Math.min(30000, 2000 * Math.pow(2, attempt - 1));
+  pendingExchangeTimer = setTimeout(async () => {
+    if (!pendingPinCredsMemory) return;
+    const ok = await attemptServerJwtExchangeOnce();
+    if (!ok && pendingPinCredsMemory && attempt < 5) {
+      scheduleServerJwtExchange(repObj, pinStr, attempt + 1);
+    }
+  }, delay);
+}
+
 export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onViewSplash, onRefreshReps }) => {
   const isAr = lang === 'ar';
   const activeRepsList = React.useMemo(() => {
@@ -88,33 +162,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
   };
 
   const exchangeServerJwtInBackground = (repObj: SalesRepresentative, pinStr: string) => {
-    fetchWithFallback(
-      '/api/auth/login',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          repId: repObj.id,
-          repName: repObj.name,
-          pin: pinStr,
-        }),
-      },
-      3500
-    )
-      .then(async (res) => {
-        const data = await res.json().catch(() => null);
-        if (res.ok && data?.success && data?.token && data?.rep) {
-          const cleanRep = sanitizeRepForStorage(data.rep);
-          setAuthSession({
-            token: data.token,
-            hmacKey: data.hmacKey || '',
-            rep: cleanRep,
-            issuedAt: Date.now(),
-            offlinePendingExchange: false,
-          });
-        }
-      })
-      .catch(() => {});
+    scheduleServerJwtExchange(repObj, pinStr, 0);
   };
 
   // Submit PIN for Modal (Local App PIN + Server JWT Exchange)
@@ -138,61 +186,52 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
 
     setIsSubmitting(true);
     try {
-      // Check local app PIN immediately so APK & in-app login stays instant with zero barrier
+      // Check local app PIN so offline fallback works seamlessly when server is unreachable
       const localCheck = await verifyLocalPinAcrossSources(targetRep, normalizedEnteredPin);
 
-      // Inside exported APK, honor in-app PIN immediately with zero network stall and exchange JWT silently in background
-      if (localCheck.matched && isNativeOrApkEnvironment()) {
-        const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
-        setAuthSession({
-          token: 'offline_pending',
-          hmacKey: '',
-          rep: cleanRep,
-          issuedAt: Date.now(),
-          offlinePendingExchange: true,
-        });
-        onLogin(cleanRep);
-        exchangeServerJwtInBackground(targetRep, normalizedEnteredPin);
-        return;
-      }
+      // 1. Primary: Always try Server-side PIN verification & HS256 JWT + Per-Session HMAC Key issuance first when online
+      //    (Fast timeout in native APK when local PIN matches so UI stays snappy without sacrificing JWT auth)
+      const isApk = isNativeOrApkEnvironment();
+      const loginTimeout = localCheck.matched ? (isApk ? 2800 : 2500) : 4500;
+      const shouldTryServerNow = typeof navigator === 'undefined' || navigator.onLine !== false;
+      if (shouldTryServerNow) {
+        try {
+          const res = await fetchWithFallback(
+            '/api/auth/login',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                repId: targetRep.id,
+                repName: targetRep.name,
+                pin: normalizedEnteredPin,
+              }),
+            },
+            loginTimeout
+          );
 
-      // 1. Primary: Server-side PIN verification & HS256 JWT + Per-Session HMAC Key issuance
-      try {
-        const res = await fetchWithFallback(
-          '/api/auth/login',
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              repId: targetRep.id,
-              repName: targetRep.name,
-              pin: normalizedEnteredPin,
-            }),
-          },
-          localCheck.matched ? 2200 : 4000
-        );
+          const data = await res.json().catch(() => null);
+          if (res.ok && data?.success && data?.token && data?.rep) {
+            const cleanRep = sanitizeRepForStorage(data.rep);
+            setAuthSession({
+              token: data.token,
+              hmacKey: data.hmacKey || '',
+              rep: cleanRep,
+              issuedAt: Date.now(),
+              offlinePendingExchange: false,
+            });
+            onLogin(cleanRep);
+            return;
+          }
 
-        const data = await res.json().catch(() => null);
-        if (res.ok && data?.success && data?.token && data?.rep) {
-          const cleanRep = sanitizeRepForStorage(data.rep);
-          setAuthSession({
-            token: data.token,
-            hmacKey: data.hmacKey || '',
-            rep: cleanRep,
-            issuedAt: Date.now(),
-            offlinePendingExchange: false,
-          });
-          onLogin(cleanRep);
-          return;
+          // Reject ONLY when both server and in-app PIN verification fail
+          if ((res.status === 401 || res.status === 403) && !localCheck.matched) {
+            setError(data?.error || (isAr ? `رمز الأمان غير صحيح لحساب (${pinModalRep.name})!` : 'Incorrect PIN code!'));
+            return;
+          }
+        } catch (networkErr) {
+          // Server unreachable -> fall through to in-app PIN verification + background JWT retry
         }
-
-        // Reject ONLY when both server and in-app PIN verification fail
-        if ((res.status === 401 || res.status === 403) && !localCheck.matched) {
-          setError(data?.error || (isAr ? `رمز الأمان غير صحيح لحساب (${pinModalRep.name})!` : 'Incorrect PIN code!'));
-          return;
-        }
-      } catch (networkErr) {
-        // Server unreachable -> fall through to in-app PIN verification
       }
 
       // 2. Local in-app PIN verification fallback (keeps in-app & APK login functional)
@@ -296,48 +335,38 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
     if (matched) {
       const localCheck = await verifyLocalPinAcrossSources(matched, normalizedEnteredPin);
 
-      if (localCheck.matched && isNativeOrApkEnvironment()) {
-        const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);
-        setAuthSession({
-          token: 'offline_pending',
-          hmacKey: '',
-          rep: cleanRep,
-          issuedAt: Date.now(),
-          offlinePendingExchange: true,
-        });
-        onLogin(cleanRep);
-        exchangeServerJwtInBackground(matched, normalizedEnteredPin);
-        return;
+      const isApk = isNativeOrApkEnvironment();
+      const loginTimeout = localCheck.matched ? (isApk ? 2800 : 2500) : 4500;
+      if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+        try {
+          const res = await fetchWithFallback(
+            '/api/auth/login',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ repId: matched.id, repName: matched.name, pin: normalizedEnteredPin }),
+            },
+            loginTimeout
+          );
+          const data = await res.json().catch(() => null);
+          if (res.ok && data?.success && data?.token && data?.rep) {
+            const cleanRep = sanitizeRepForStorage(data.rep);
+            setAuthSession({
+              token: data.token,
+              hmacKey: data.hmacKey || '',
+              rep: cleanRep,
+              issuedAt: Date.now(),
+              offlinePendingExchange: false,
+            });
+            onLogin(cleanRep);
+            return;
+          }
+          if ((res.status === 401 || res.status === 403) && !localCheck.matched) {
+            setError(data?.error || (isAr ? `رمز الأمان غير صحيح لحساب (${matched.name})` : 'Incorrect PIN code'));
+            return;
+          }
+        } catch (e) {}
       }
-
-      try {
-        const res = await fetchWithFallback(
-          '/api/auth/login',
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ repId: matched.id, repName: matched.name, pin: normalizedEnteredPin }),
-          },
-          localCheck.matched ? 2200 : 4000
-        );
-        const data = await res.json().catch(() => null);
-        if (res.ok && data?.success && data?.token && data?.rep) {
-          const cleanRep = sanitizeRepForStorage(data.rep);
-          setAuthSession({
-            token: data.token,
-            hmacKey: data.hmacKey || '',
-            rep: cleanRep,
-            issuedAt: Date.now(),
-            offlinePendingExchange: false,
-          });
-          onLogin(cleanRep);
-          return;
-        }
-        if ((res.status === 401 || res.status === 403) && !localCheck.matched) {
-          setError(data?.error || (isAr ? `رمز الأمان غير صحيح لحساب (${matched.name})` : 'Incorrect PIN code'));
-          return;
-        }
-      } catch (e) {}
 
       if (localCheck.matched) {
         const cleanRep = sanitizeRepForStorage(localCheck.resolvedRep);

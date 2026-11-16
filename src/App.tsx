@@ -59,7 +59,7 @@ import { RepsManagementModal } from './components/RepsManagementModal';
 import { FundsView } from './components/FundsView';
 import { OfflinePaymentConflictsModal } from './components/OfflinePaymentConflictsModal';
 import { EmployeesView } from './components/EmployeesView';
-import { LoginView } from './components/LoginView';
+import { LoginView, retryPendingJwtExchangeNow } from './components/LoginView';
 import { SplashScreen } from './components/SplashScreen';
 import { EmptyState } from './components/EmptyState';
 import { AddPaymentModal } from './components/AddPaymentModal';
@@ -694,13 +694,22 @@ export default function App() {
     const handleAuth401 = async () => {
       if (authVerifyInFlightRef.current) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-      const currentSession = getAuthSession();
-      // Keep local/offline APK PIN sessions active until user explicitly re-authenticates or connects to live server
-      if (!currentSession?.token || currentSession.offlinePendingExchange || currentSession.token === 'offline_pending') {
-        return;
-      }
       authVerifyInFlightRef.current = true;
       try {
+        let currentSession = getAuthSession();
+        if (!currentSession?.token || currentSession.offlinePendingExchange || currentSession.token === 'offline_pending') {
+          const exchanged = await retryPendingJwtExchangeNow().catch(() => false);
+          if (exchanged) {
+            flushPendingQueue().catch(() => {});
+            return;
+          }
+          currentSession = getAuthSession();
+          if (currentSession?.token && currentSession.token !== 'offline_pending' && !currentSession.offlinePendingExchange) {
+            flushPendingQueue().catch(() => {});
+            return;
+          }
+        }
+
         const res = await fetchWithFallback('/api/auth/verify', { method: 'POST' }, 5000).catch(() => null);
         if (res && res.status === 401) {
           const data = await res.json().catch(() => null);

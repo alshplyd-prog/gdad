@@ -173,9 +173,15 @@ export const ContractDetailsModal: React.FC<ContractDetailsModalProps> = ({
     }
     setIsSettingGps(true);
     try {
-      await updateCustomerLocation(contract.id, null, null, '');
-    } catch (e) {}
-    setIsSettingGps(false);
+      const ok = await updateCustomerLocation(contract.id, null, null, '');
+      if (!ok) {
+        alert(isAr ? 'تعذر تأكيد حذف الموقع من السيرفر — يرجى التحقق من الاتصال وتسجيل الدخول' : 'Failed to confirm location removal from server — please check connection and login');
+      }
+    } catch (e) {
+      alert(isAr ? 'حدث خطأ أثناء حذف الموقع' : 'Error removing location');
+    } finally {
+      setIsSettingGps(false);
+    }
   };
 
   const [deletingPaymentId, setDeletingPaymentId] = useState<string | null>(null);

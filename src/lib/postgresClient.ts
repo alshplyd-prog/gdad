@@ -953,6 +953,7 @@ export async function mirrorLocalSnapshotToIndexedDb(immediate = false): Promise
     try {
       const rawContracts = getLocalCache<any>('contracts');
       const payments = getLocalCache<any>('payments');
+      const customers = getLocalCache<any>('customers');
       const contracts = recalculateAllContractsFromPayments(rawContracts, payments, false);
       const inventory = getLocalCache<any>('inventory');
       const reps = getLocalCache<any>('reps');
@@ -962,7 +963,7 @@ export async function mirrorLocalSnapshotToIndexedDb(immediate = false): Promise
       const fundTx = getLocalCache<any>('fund_transactions');
       const empTx = getLocalCache<any>('employee_transactions');
       const appointments = getLocalCache<any>('appointments');
-      const deletedIds = getLocalCache<string>('deleted_record_ids');
+      const deletedIds = Array.from(getDeletedRecordIds());
 
       const db = await new Promise<IDBDatabase>((resolve, reject) => {
         const req = indexedDB.open('alkarrar_sync_db', 2);
@@ -978,6 +979,7 @@ export async function mirrorLocalSnapshotToIndexedDb(immediate = false): Promise
           type: '__META_CONFIG__',
           payload: {
             contracts,
+            customers,
             payments,
             inventory,
             reps,
@@ -1067,9 +1069,16 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
 
     const snapshot = item?.payload || item?.snapshot;
     if (snapshot && typeof snapshot === 'object') {
+      if (Array.isArray(snapshot.deletedIds) && snapshot.deletedIds.length > 0) {
+        markRecordAsDeleted(snapshot.deletedIds);
+      }
       if (Array.isArray(snapshot.payments)) {
         const merged = mergeRemoteWithPendingLocal('payments', snapshot.payments);
         setLocalCache('payments', merged);
+      }
+      if (Array.isArray(snapshot.customers)) {
+        const mappedCusts = snapshot.customers.map((cu: any) => mapRow('customers', cu));
+        setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
       }
       if (Array.isArray(snapshot.contracts)) {
         const merged = mergeRemoteWithPendingLocal('contracts', snapshot.contracts);
@@ -1077,6 +1086,7 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
         const recalculated = recalculateAllContractsFromPayments(merged, currentPayments, false);
         setLocalCache('contracts', recalculated);
       }
+      applyServerClearedLocations(snapshot.clearedLocationContractIds, snapshot.deletedIds);
       if (Array.isArray(snapshot.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', snapshot.inventory));
       if (Array.isArray(snapshot.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', snapshot.reps));
       if (Array.isArray(snapshot.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', snapshot.funds));
@@ -1810,6 +1820,64 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
 // Module-level cached server sync version to avoid redundant heavy downloads
 let cachedServerSyncVersion: number | string | null = null;
 
+function syncClearedLocationTombstonesFromServer(
+  clearedIdsInput?: string[],
+  deletedIdsInput?: string[],
+  serverContracts?: any[],
+  serverCustomers?: any[]
+) {
+  try {
+    if (!Array.isArray(clearedIdsInput)) return;
+    const serverClearedSet = new Set<string>();
+    for (const id of clearedIdsInput) {
+      if (id && typeof id === 'string') serverClearedSet.add(id.replace(/^loc_clear_/, ''));
+    }
+    if (Array.isArray(deletedIdsInput)) {
+      for (const raw of deletedIdsInput) {
+        if (typeof raw === 'string' && raw.startsWith('loc_clear_')) {
+          serverClearedSet.add(raw.replace(/^loc_clear_/, ''));
+        }
+      }
+    }
+
+    const pendingClearIds = new Set<string>();
+    try {
+      const pendingActions = getPendingQueueSync().filter((a) => a.status !== 'synced');
+      for (const act of pendingActions) {
+        if (act.type === 'UPDATE_CONTRACT' && act.payload?.id && act.payload.locationCleared === true) {
+          pendingClearIds.add(String(act.payload.id));
+        }
+      }
+    } catch (e) {}
+
+    const repinnedIdsOnServer = new Set<string>();
+    for (const c of serverContracts || []) {
+      if (c?.id && !serverClearedSet.has(String(c.id)) && !c.locationClearedAt && c.locationUpdatedAt && c.latitude != null && Number(c.latitude) !== 0) {
+        repinnedIdsOnServer.add(String(c.id));
+      }
+    }
+    for (const cu of serverCustomers || []) {
+      if (cu?.id && !serverClearedSet.has(String(cu.id)) && !cu.locationClearedAt && cu.locationUpdatedAt && cu.latitude != null && Number(cu.latitude) !== 0) {
+        repinnedIdsOnServer.add(String(cu.id));
+      }
+    }
+
+    const existingDeleted = getDeletedRecordIds();
+    const toUnmark: string[] = [];
+    for (const delId of existingDeleted) {
+      if (typeof delId === 'string' && delId.startsWith('loc_clear_')) {
+        const rawId = delId.replace(/^loc_clear_/, '');
+        if (!serverClearedSet.has(rawId) && !pendingClearIds.has(rawId) && repinnedIdsOnServer.has(rawId)) {
+          toUnmark.push(delId);
+        }
+      }
+    }
+    if (toUnmark.length > 0) {
+      unmarkRecordAsDeleted(toUnmark);
+    }
+  } catch (e) {}
+}
+
 function applyServerClearedLocations(clearedIdsInput?: string[], deletedIdsInput?: string[]) {
   try {
     const idSet = new Set<string>();
@@ -1823,6 +1891,11 @@ function applyServerClearedLocations(clearedIdsInput?: string[], deletedIdsInput
         if (typeof raw === 'string' && raw.startsWith('loc_clear_')) {
           idSet.add(raw.replace(/^loc_clear_/, ''));
         }
+      }
+    }
+    for (const existingDel of getDeletedRecordIds()) {
+      if (typeof existingDel === 'string' && existingDel.startsWith('loc_clear_')) {
+        idSet.add(existingDel.replace(/^loc_clear_/, ''));
       }
     }
     if (idSet.size === 0) return;
@@ -1852,11 +1925,27 @@ function applyServerClearedLocations(clearedIdsInput?: string[], deletedIdsInput
     const clearedCustomerNames = new Set<string>();
 
     const localContracts = getLocalCache<any>('contracts');
+    const localCustomers = getLocalCache<any>('customers');
+    for (const c of localContracts) {
+      if (c && effectiveSet.has(String(c.id)) && c.customerName) {
+        clearedCustomerNames.add(normName(c.customerName));
+      }
+    }
+    for (const cu of localCustomers) {
+      if (cu && effectiveSet.has(String(cu.id)) && cu.name) {
+        clearedCustomerNames.add(normName(cu.name));
+      }
+    }
+
     let contractsChanged = false;
     const nextContracts = localContracts.map((c: any) => {
       if (!c) return c;
-      if (effectiveSet.has(String(c.id))) {
-        if (c.customerName) clearedCustomerNames.add(normName(c.customerName));
+      const matchId = effectiveSet.has(String(c.id)) || (c.customerId && effectiveSet.has(String(c.customerId)));
+      const matchName = c.customerName && clearedCustomerNames.has(normName(c.customerName));
+      if (matchId || matchName) {
+        if (c.id && !effectiveSet.has(String(c.id))) {
+          effectiveSet.add(String(c.id));
+        }
         if (c.latitude != null || c.longitude != null || c.locationAddress || !c.locationClearedAt) {
           contractsChanged = true;
           return {
@@ -1873,7 +1962,6 @@ function applyServerClearedLocations(clearedIdsInput?: string[], deletedIdsInput
     });
     if (contractsChanged) setLocalCache('contracts', nextContracts);
 
-    const localCustomers = getLocalCache<any>('customers');
     let customersChanged = false;
     const nextCustomers = localCustomers.map((cu: any) => {
       if (!cu) return cu;
@@ -2013,6 +2101,7 @@ export async function reconcileAllLocalWithDatabase(options?: {
       const data = await res.json().catch(() => null);
       if (data && data.success) {
         // Sync deleted IDs & cleared GPS locations first
+        syncClearedLocationTombstonesFromServer(data.clearedLocationContractIds, data.deletedRecordIds, data.contracts, data.customers);
         if (Array.isArray(data.deletedRecordIds)) {
           markRecordAsDeleted(data.deletedRecordIds);
         }
@@ -3910,6 +3999,7 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
       if (allRes && allRes.ok) {
         const data = await allRes.json();
         if (data && data.success) {
+          syncClearedLocationTombstonesFromServer(data.clearedLocationContractIds, data.deletedRecordIds, data.contracts, data.customers);
           if (Array.isArray(data.deletedRecordIds)) {
             markRecordAsDeleted(data.deletedRecordIds);
           }
@@ -3985,6 +4075,12 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
       })
     );
 
+    applyServerClearedLocations();
+    const refreshedCusts = getLocalCache<any>('customers');
+    const refreshedContracts = getLocalCache<any>('contracts');
+    if (refreshedContracts.length > 0) {
+      setLocalCache('contracts', enrichContractsWithCustomerLocations(refreshedContracts, refreshedCusts));
+    }
     recalculateAllContractsFromPayments(undefined, undefined, true);
     recalculateLocalFundBalances(true);
     mirrorLocalSnapshotToIndexedDb(true);
@@ -4174,7 +4270,7 @@ export const updateCustomerLocation = async (
   const currentContracts = getLocalCache<any>('contracts');
   const contract = currentContracts.find((c: any) => c.id === contractId);
   const targetNormName = contract?.customerName ? normName(contract.customerName) : '';
-  const targetCustomerId = (contract as any)?.customerId || '';
+  const targetCustomerId = (contract as any)?.customerId ? String((contract as any).customerId) : '';
 
   const updates: any = {
     latitude: isClearing ? null : latitude,
@@ -4187,6 +4283,7 @@ export const updateCustomerLocation = async (
 
   // Update tombstone set + ALL sibling contracts for the same customer so enrichment/fallback cannot resurrect
   const affectedContractIds = new Set<string>([contractId]);
+  if (targetCustomerId) affectedContractIds.add(targetCustomerId);
   const updatedContractsList = currentContracts.map((c: any) => {
     if (!c) return c;
     const isSame =
@@ -4215,7 +4312,7 @@ export const updateCustomerLocation = async (
     setLocalCache('contracts', updatedContractsList);
   }
 
-  // Update ALL matching entries in customers cache and push to /api/customers/:id
+  // Update ALL matching entries in customers cache and collect /api/customers/:id promises
   const localCustomers = getLocalCache<any>('customers');
   const matchedCustomerIds: string[] = [];
   let custCacheChanged = false;
@@ -4240,6 +4337,7 @@ export const updateCustomerLocation = async (
     };
   });
 
+  const customerPutPromises: Promise<Response | null>[] = [];
   if (custCacheChanged) {
     setLocalCache('customers', updatedCustomersList);
     if (isClearing) {
@@ -4248,18 +4346,20 @@ export const updateCustomerLocation = async (
       unmarkRecordAsDeleted(matchedCustomerIds.map((id) => `loc_clear_${id}`));
     }
     for (const cid of matchedCustomerIds) {
-      fetchWithFallback(`/api/customers/${cid}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          latitude: updates.latitude,
-          longitude: updates.longitude,
-          location_address: updates.locationAddress,
-          location_updated_at: updates.locationUpdatedAt,
-          locationCleared: isClearing,
-          locationClearedAt: isClearing ? clearIso : null,
-        }),
-      }, 8000).catch(() => {});
+      customerPutPromises.push(
+        fetchWithFallback(`/api/customers/${cid}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            latitude: updates.latitude,
+            longitude: updates.longitude,
+            location_address: updates.locationAddress,
+            location_updated_at: updates.locationUpdatedAt,
+            locationCleared: isClearing,
+            locationClearedAt: isClearing ? clearIso : null,
+          }),
+        }, 8000).catch(() => null)
+      );
     }
   }
 
@@ -4284,7 +4384,7 @@ export const updateCustomerLocation = async (
     }
   }
 
-  mirrorLocalSnapshotToIndexedDb(true);
+  await mirrorLocalSnapshotToIndexedDb(true);
   notifySubscribersRefresh();
 
   const queuePayload = {
@@ -4295,19 +4395,27 @@ export const updateCustomerLocation = async (
   const qPromise = addToPendingQueue('UPDATE_CONTRACT', queuePayload);
   let resOk = false;
   try {
-    const res = await fetchWithFallback(`/api/contracts/${contractId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
-    }, 8000);
+    const [res] = await Promise.all([
+      fetchWithFallback(`/api/contracts/${contractId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      }, 8000),
+      ...customerPutPromises,
+    ]);
     resOk = Boolean(res && res.ok);
     if (resOk) {
       const act = await qPromise.catch(() => null);
       if (act?.id) {
         await removeFromPendingQueue(act.id).catch(() => {});
       }
-      // If clearing offline or online, sync deleted location tombstones & confirm with server
+      await mirrorLocalSnapshotToIndexedDb(true);
+      notifySubscribersRefresh();
       reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+    } else if (res && (res.status === 401 || res.status === 403)) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('alkarrar:auth-401', { detail: { endpoint: `/api/contracts/${contractId}`, status: res.status } }));
+      }
     }
   } catch (err) {
     console.warn('[updateCustomerLocation] Offline or network error, kept in pendingQueue:', err);
