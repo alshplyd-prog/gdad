@@ -467,11 +467,14 @@ export default function App() {
       if (Network && typeof Network.addListener === 'function') {
         listenerPromise = Network.addListener('networkStatusChange', async (status) => {
           if (status.connected) {
+            if (isUserActivelyTypingOrInputFocused()) return;
             console.log("عادت الشبكة، جاري المزامنة...");
             try {
               await flushPendingQueue();
-              await silentBackgroundSync();
-              await forceRefreshAllDataFromPostgres();
+              if (!isUserActivelyTypingOrInputFocused()) {
+                await silentBackgroundSync();
+                await forceRefreshAllDataFromPostgres();
+              }
             } catch (e) {}
           }
         });
@@ -652,7 +655,7 @@ export default function App() {
           try {
             if (!state.isActive) {
               handleAppCloseOrHide();
-            } else {
+            } else if (!isUserActivelyTypingOrInputFocused()) {
               handleOnline();
             }
           } catch (stErr) {
@@ -971,6 +974,18 @@ export default function App() {
     isDatabaseSchemaOpen,
     activeTab,
   ]);
+
+  // Resume any deferred background sync once all data-entry modals are closed
+  useEffect(() => {
+    if (!isFormModalOpen && !isAddAppointmentModalOpen && !addPaymentModalContract) {
+      const t = setTimeout(() => {
+        if (!isUserActivelyTypingOrInputFocused()) {
+          window.dispatchEvent(new Event('alkarrar:sync-resume'));
+        }
+      }, 150);
+      return () => clearTimeout(t);
+    }
+  }, [isFormModalOpen, isAddAppointmentModalOpen, addPaymentModalContract]);
 
   // Purge any old legacy collections (such as 'contacts' from old templates) on boot
   useEffect(() => {

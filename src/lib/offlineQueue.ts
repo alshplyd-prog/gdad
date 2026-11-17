@@ -11,6 +11,7 @@ import {
   generateCryptoNonce,
   signRequestHeaders,
 } from './securityClient';
+import { normalizeArabicPersonName } from './nameHelpers';
 import {
   reconcileAllLocalWithDatabase,
   verifyAndReconcileWithServer,
@@ -279,27 +280,50 @@ async function syncQueueToIndexedDb(queue: PendingAction[]): Promise<void> {
 }
 
 let lastUserInteractionTime = 0;
+let isImeComposing = false;
 if (typeof window !== 'undefined') {
   const markInteraction = () => {
     lastUserInteractionTime = Date.now();
   };
+  const markCompStart = () => {
+    isImeComposing = true;
+    lastUserInteractionTime = Date.now();
+  };
+  const markCompEnd = () => {
+    isImeComposing = false;
+    lastUserInteractionTime = Date.now();
+  };
   window.addEventListener('input', markInteraction, { passive: true, capture: true });
   window.addEventListener('keydown', markInteraction, { passive: true, capture: true });
-  window.addEventListener('compositionstart', markInteraction, { passive: true, capture: true });
+  window.addEventListener('compositionstart', markCompStart, { passive: true, capture: true });
   window.addEventListener('compositionupdate', markInteraction, { passive: true, capture: true });
+  window.addEventListener('compositionend', markCompEnd, { passive: true, capture: true });
 }
 
-export function isUserActivelyTypingOrInputFocused(): boolean {
+export function isUiEntryOrSearchProtected(): boolean {
   if (typeof document === 'undefined') return false;
-  if (Date.now() - lastUserInteractionTime < 4000) return true;
+  if (isImeComposing) return true;
+  if (Date.now() - lastUserInteractionTime < 10000) return true;
   const activeEl = document.activeElement;
   if (activeEl) {
     const tagName = (activeEl.tagName || '').toUpperCase();
-    if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT' || activeEl.hasAttribute('contenteditable')) {
+    if (
+      tagName === 'INPUT' ||
+      tagName === 'TEXTAREA' ||
+      tagName === 'SELECT' ||
+      activeEl.hasAttribute('contenteditable')
+    ) {
       return true;
     }
   }
+  if (document.querySelector('[data-sync-pause="true"]')) {
+    return true;
+  }
   return false;
+}
+
+export function isUserActivelyTypingOrInputFocused(): boolean {
+  return isUiEntryOrSearchProtected();
 }
 
 let queueListeners: Array<(count: number) => void> = [];
@@ -728,6 +752,81 @@ export async function clearPendingActionsByFilter(predicate: (action: PendingAct
     await syncQueueToIndexedDb(toKeep).catch(() => {});
     notifyQueueListeners(toKeep.filter((i) => i.status !== 'synced').length);
     notifyServiceWorker();
+  } catch (e) {}
+}
+
+/**
+ * Scrubs any stale GPS coordinates from queued offline contract/payment actions
+ * when a customer's location is cleared so flushing old offline items can never resurrect it.
+ */
+export async function scrubLocationFromPendingQueue(
+  contractIds: string[],
+  customerNameHint?: string,
+  clearIso?: string
+): Promise<void> {
+  try {
+    const idSet = new Set((contractIds || []).filter(Boolean).map(String));
+    const normCust = normalizeArabicPersonName(customerNameHint);
+    const iso = clearIso || new Date().toISOString();
+    const queue = await getPendingQueue();
+    if (!Array.isArray(queue) || queue.length === 0) return;
+
+    let changed = false;
+    const updatedQueue = queue.map((act) => {
+      if (!act || !act.payload || typeof act.payload !== 'object') return act;
+      const p = act.payload;
+      const pid = String(p.contractId || p.contract_id || p.id || '');
+      const pName = normalizeArabicPersonName(p.customerName || p.customer_name || p.name || '');
+      const matchesTarget = Boolean((pid && idSet.has(pid)) || (normCust && pName && pName === normCust));
+      if (!matchesTarget) return act;
+
+      if (act.type === 'CREATE_CONTRACT' || act.type === 'UPDATE_CONTRACT' || act.type === 'CREATE_CUSTOMER' || act.type === 'UPDATE_CUSTOMER') {
+        changed = true;
+        return {
+          ...act,
+          payload: {
+            ...p,
+            latitude: null,
+            longitude: null,
+            lat: null,
+            lng: null,
+            locationAddress: null,
+            location_address: null,
+            locationUpdatedAt: null,
+            location_updated_at: null,
+            locationCleared: true,
+            locationClearedAt: iso,
+            location_cleared_at: iso,
+          },
+        };
+      }
+
+      if (act.type === 'CREATE_PAYMENT' || act.type === 'RECORD_PAYMENT' || act.type === 'ADD_PAYMENT' || act.type === 'UPDATE_PAYMENT') {
+        if (p.latitude != null || p.longitude != null || p.updateCustomerLocation || p.shouldUpdateCustomerLocation) {
+          changed = true;
+          return {
+            ...act,
+            payload: {
+              ...p,
+              latitude: null,
+              longitude: null,
+              lat: null,
+              lng: null,
+              updateCustomerLocation: false,
+              shouldUpdateCustomerLocation: false,
+            },
+          };
+        }
+      }
+      return act;
+    });
+
+    if (changed) {
+      const jsonStr = JSON.stringify(updatedQueue);
+      secureStorageSetSync(QUEUE_KEY, jsonStr);
+      syncToNativeAndroid(updatedQueue);
+      await syncQueueToIndexedDb(updatedQueue).catch(() => {});
+    }
   } catch (e) {}
 }
 

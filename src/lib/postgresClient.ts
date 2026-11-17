@@ -1,6 +1,7 @@
 // PostgreSQL client wrapper (With bulletproof offline cache & persistence for APK)
-import { addToPendingQueue, removeFromPendingQueue, flushPendingQueue, getPendingQueueSync, onSyncSuccess, clearPendingQueue, clearPendingActionsByFilter, scheduleIdleVerification } from './offlineQueue';
+import { addToPendingQueue, removeFromPendingQueue, flushPendingQueue, getPendingQueueSync, onSyncSuccess, clearPendingQueue, clearPendingActionsByFilter, scheduleIdleVerification, isUiEntryOrSearchProtected, scrubLocationFromPendingQueue } from './offlineQueue';
 import { getFullApiUrl, fetchWithFallback } from './apiConfig';
+import { normalizeArabicPersonName } from './nameHelpers';
 import {
   secureStorageGetSync,
   secureStorageSetSync,
@@ -54,15 +55,75 @@ export const logoutUserAuth = async () => {
 
 const refreshListeners: Set<() => void> = new Set();
 let notifyTimeout: any = null;
+let hasDeferredRefresh = false;
+let hasDeferredReconcile = false;
+let deferredFlushTimer: any = null;
 
 function normName(s: string) {
-  if (!s) return '';
-  return s.trim().toLowerCase().replace(/\s+/g, ' ');
+  return normalizeArabicPersonName(s);
 }
 
-export function notifySubscribersRefresh() {
+function scheduleDeferredFlushCheck() {
+  if (deferredFlushTimer) return;
+  deferredFlushTimer = setInterval(() => {
+    if (!hasDeferredRefresh && !hasDeferredReconcile) {
+      clearInterval(deferredFlushTimer);
+      deferredFlushTimer = null;
+      return;
+    }
+    if (!isUiEntryOrSearchProtected()) {
+      clearInterval(deferredFlushTimer);
+      deferredFlushTimer = null;
+      if (hasDeferredRefresh) {
+        hasDeferredRefresh = false;
+        notifySubscribersRefresh(true);
+      }
+      if (hasDeferredReconcile) {
+        hasDeferredReconcile = false;
+        reconcileAllLocalWithDatabase().catch(() => {});
+      }
+    }
+  }, 1500);
+}
+
+if (typeof window !== 'undefined') {
+  const tryResumeDeferredSync = () => {
+    if (!hasDeferredRefresh && !hasDeferredReconcile) return;
+    setTimeout(() => {
+      if (!isUiEntryOrSearchProtected()) {
+        if (deferredFlushTimer) {
+          clearInterval(deferredFlushTimer);
+          deferredFlushTimer = null;
+        }
+        if (hasDeferredRefresh) {
+          hasDeferredRefresh = false;
+          notifySubscribersRefresh(true);
+        }
+        if (hasDeferredReconcile) {
+          hasDeferredReconcile = false;
+          reconcileAllLocalWithDatabase().catch(() => {});
+        }
+      }
+    }, 350);
+  };
+  window.addEventListener('alkarrar:sync-resume', tryResumeDeferredSync);
+  window.addEventListener('focusout', tryResumeDeferredSync);
+}
+
+export function notifySubscribersRefresh(immediate = false) {
+  if (!immediate && isUiEntryOrSearchProtected()) {
+    hasDeferredRefresh = true;
+    scheduleDeferredFlushCheck();
+    return;
+  }
+  hasDeferredRefresh = false;
   if (notifyTimeout) clearTimeout(notifyTimeout);
   notifyTimeout = setTimeout(() => {
+    if (!immediate && isUiEntryOrSearchProtected()) {
+      hasDeferredRefresh = true;
+      scheduleDeferredFlushCheck();
+      return;
+    }
     refreshListeners.forEach((fn) => {
       try {
         fn();
@@ -70,13 +131,13 @@ export function notifySubscribersRefresh() {
         // ignore
       }
     });
-  }, 120);
+  }, immediate ? 40 : 120);
 }
 
 // Auto-trigger subscriber refresh whenever offline queue successfully flushes to server
 try {
   onSyncSuccess(() => {
-    notifySubscribersRefresh();
+    notifySubscribersRefresh(false);
   });
 } catch (e) {}
 
@@ -797,8 +858,10 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
   if (Array.isArray(custs)) {
     for (const cu of custs) {
       if (cu.id) custMap.set(String(cu.id).trim(), cu);
-      if (cu.name) custMap.set(String(cu.name).trim().toLowerCase(), cu);
-      if (cu.customerName) custMap.set(String(cu.customerName).trim().toLowerCase(), cu);
+      const n1 = normName(cu.name || '');
+      if (n1) custMap.set(n1, cu);
+      const n2 = normName(cu.customerName || '');
+      if (n2) custMap.set(n2, cu);
     }
   }
 
@@ -827,8 +890,9 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
     let locUpdated = cUpdatedAt;
 
     if (lat == null || isNaN(Number(lat)) || Number(lat) === 0) {
+      const cNameNorm = normName(c.customerName || '');
       const matchedCust = (c.customerId && custMap.get(String(c.customerId).trim())) ||
-                          (c.customerName && custMap.get(String(c.customerName).trim().toLowerCase())) ||
+                          (cNameNorm && custMap.get(cNameNorm)) ||
                           (c.id && custMap.get(String(c.id).trim()));
       if (matchedCust) {
         const custClearedAt = matchedCust.locationClearedAt ?? matchedCust.location_cleared_at ?? null;
@@ -1122,6 +1186,7 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
           if (Array.isArray(bundled.reps) && getLocalCache('reps').length === 0) {
             setLocalCache('reps', bundled.reps);
           }
+          applyServerClearedLocations();
           notifySubscribersRefresh();
           return true;
         }
@@ -1819,6 +1884,41 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
 
 // Module-level cached server sync version to avoid redundant heavy downloads
 let cachedServerSyncVersion: number | string | null = null;
+const LOC_CLEAR_TS_MAP_KEY = 'alkarrar_loc_clear_timestamps';
+
+function getLocalLocationClearTimestamps(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(LOC_CLEAR_TS_MAP_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch (e) {}
+  return {};
+}
+
+function setLocalLocationClearTimestamps(ids: string[], iso: string | null) {
+  try {
+    const map = getLocalLocationClearTimestamps();
+    let changed = false;
+    for (const raw of ids) {
+      const id = String(raw || '').replace(/^loc_clear_/, '');
+      if (!id) continue;
+      if (iso) {
+        if (!map[id] || iso > map[id]) {
+          map[id] = iso;
+          changed = true;
+        }
+      } else if (map[id]) {
+        delete map[id];
+        changed = true;
+      }
+    }
+    if (changed) {
+      localStorage.setItem(LOC_CLEAR_TS_MAP_KEY, JSON.stringify(map));
+    }
+  } catch (e) {}
+}
 
 function syncClearedLocationTombstonesFromServer(
   clearedIdsInput?: string[],
@@ -1850,15 +1950,30 @@ function syncClearedLocationTombstonesFromServer(
       }
     } catch (e) {}
 
+    const localClearTsMap = getLocalLocationClearTimestamps();
     const repinnedIdsOnServer = new Set<string>();
     for (const c of serverContracts || []) {
-      if (c?.id && !serverClearedSet.has(String(c.id)) && !c.locationClearedAt && c.locationUpdatedAt && c.latitude != null && Number(c.latitude) !== 0) {
-        repinnedIdsOnServer.add(String(c.id));
+      const cid = c?.id ? String(c.id) : '';
+      if (!cid || serverClearedSet.has(cid)) continue;
+      const cClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? null;
+      const cUpdatedAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
+      const localClearTs = localClearTsMap[cid];
+      if (!cClearedAt && cUpdatedAt && c.latitude != null && Number(c.latitude) !== 0) {
+        if (!localClearTs || String(cUpdatedAt) > String(localClearTs)) {
+          repinnedIdsOnServer.add(cid);
+        }
       }
     }
     for (const cu of serverCustomers || []) {
-      if (cu?.id && !serverClearedSet.has(String(cu.id)) && !cu.locationClearedAt && cu.locationUpdatedAt && cu.latitude != null && Number(cu.latitude) !== 0) {
-        repinnedIdsOnServer.add(String(cu.id));
+      const cuid = cu?.id ? String(cu.id) : '';
+      if (!cuid || serverClearedSet.has(cuid)) continue;
+      const cuClearedAt = cu.locationClearedAt ?? cu.location_cleared_at ?? null;
+      const cuUpdatedAt = cu.locationUpdatedAt ?? cu.location_updated_at ?? null;
+      const localClearTs = localClearTsMap[cuid];
+      if (!cuClearedAt && cuUpdatedAt && cu.latitude != null && Number(cu.latitude) !== 0) {
+        if (!localClearTs || String(cuUpdatedAt) > String(localClearTs)) {
+          repinnedIdsOnServer.add(cuid);
+        }
       }
     }
 
@@ -1874,6 +1989,7 @@ function syncClearedLocationTombstonesFromServer(
     }
     if (toUnmark.length > 0) {
       unmarkRecordAsDeleted(toUnmark);
+      setLocalLocationClearTimestamps(toUnmark, null);
     }
   } catch (e) {}
 }
@@ -2015,12 +2131,11 @@ export async function reconcileAllLocalWithDatabase(options?: {
   forcePushAll?: boolean;
 }): Promise<{ success: boolean; totalInserted: number; message: string }> {
   try {
-    // Skip non-forced reconciliation if user is currently typing in an input/textarea/select
-    if (!options?.force && typeof document !== 'undefined' && document.activeElement) {
-      const tag = (document.activeElement.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || document.activeElement.hasAttribute('contenteditable')) {
-        return { success: true, totalInserted: 0, message: 'مؤجل أثناء الكتابة' };
-      }
+    // Skip non-forced reconciliation if user is searching, typing, or has Add/Edit form modal open
+    if (!options?.force && isUiEntryOrSearchProtected()) {
+      hasDeferredReconcile = true;
+      scheduleDeferredFlushCheck();
+      return { success: true, totalInserted: 0, message: 'مؤجل أثناء الكتابة أو الإدخال' };
     }
 
     // 0. Audit local cache and ensure any offline payments are queued
@@ -2606,12 +2721,9 @@ function startUnifiedPollingLoop() {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
     if (typeof document !== 'undefined' && document.hidden) return;
     
-    // Check if user is typing
-    if (typeof document !== 'undefined' && document.activeElement) {
-      const tag = (document.activeElement.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || document.activeElement.hasAttribute('contenteditable')) {
-        return;
-      }
+    // Check if user is typing, searching, or entering data in a form modal
+    if (isUiEntryOrSearchProtected()) {
+      return;
     }
 
     // Skip disruptive background polling if user has an interactive modal open (e.g. Payments History, Statements)
@@ -4303,9 +4415,13 @@ export const updateCustomerLocation = async (
   });
 
   if (isClearing) {
-    markRecordAsDeleted(Array.from(affectedContractIds).map((id) => `loc_clear_${id}`));
+    const clearIds = Array.from(affectedContractIds);
+    markRecordAsDeleted(clearIds.map((id) => `loc_clear_${id}`));
+    setLocalLocationClearTimestamps(clearIds, clearIso);
   } else {
-    unmarkRecordAsDeleted(Array.from(affectedContractIds).map((id) => `loc_clear_${id}`));
+    const clearIds = Array.from(affectedContractIds);
+    unmarkRecordAsDeleted(clearIds.map((id) => `loc_clear_${id}`));
+    setLocalLocationClearTimestamps(clearIds, null);
   }
 
   if (contract || updatedContractsList.length > 0) {
@@ -4342,8 +4458,10 @@ export const updateCustomerLocation = async (
     setLocalCache('customers', updatedCustomersList);
     if (isClearing) {
       markRecordAsDeleted(matchedCustomerIds.map((id) => `loc_clear_${id}`));
+      setLocalLocationClearTimestamps(matchedCustomerIds, clearIso);
     } else {
       unmarkRecordAsDeleted(matchedCustomerIds.map((id) => `loc_clear_${id}`));
+      setLocalLocationClearTimestamps(matchedCustomerIds, null);
     }
     for (const cid of matchedCustomerIds) {
       customerPutPromises.push(
@@ -4382,10 +4500,17 @@ export const updateCustomerLocation = async (
     if (payChanged) {
       setLocalCache('payments', updatedPayments);
     }
+
+    // Scrub any old offline-queued GPS coordinates for this customer/contracts before queuing the clear
+    await scrubLocationFromPendingQueue(
+      [...Array.from(affectedContractIds), ...matchedCustomerIds],
+      contract?.customerName,
+      clearIso || undefined
+    );
   }
 
   await mirrorLocalSnapshotToIndexedDb(true);
-  notifySubscribersRefresh();
+  notifySubscribersRefresh(true);
 
   const queuePayload = {
     id: contractId,
@@ -4410,7 +4535,7 @@ export const updateCustomerLocation = async (
         await removeFromPendingQueue(act.id).catch(() => {});
       }
       await mirrorLocalSnapshotToIndexedDb(true);
-      notifySubscribersRefresh();
+      notifySubscribersRefresh(true);
       reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
     } else if (res && (res.status === 401 || res.status === 403)) {
       if (typeof window !== 'undefined') {

@@ -7,7 +7,7 @@ import { fileDb } from "./src/db/fileDb.ts";
 import { executePg, executePgWithContext, isPgConfigured, type PgSecurityContext } from "./src/db/dbExecutor.ts";
 import { initializeDatabaseSchema } from "./src/db/init.ts";
 import { cleanupDuplicateEntities } from "./src/db/cleanupDuplicates.ts";
-import { normalizeEntityName } from "./src/lib/nameHelpers.ts";
+import { normalizeEntityName, normalizeArabicPersonName } from "./src/lib/nameHelpers.ts";
 import {
   extractAuthUser,
   requireAuth,
@@ -54,7 +54,11 @@ import fs from "fs";
 import webpush from "web-push";
 
 function normalizeServerName(name?: string | null): string {
-  return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return normalizeArabicPersonName(name);
+}
+
+function pgNormColSql(colExpr: string): string {
+  return `REGEXP_REPLACE(TRANSLATE(TRIM(LOWER(COALESCE(${colExpr}, ''))), 'أإآٱةىؤئء', 'اااهيويي'), '\\s+', ' ', 'g')`;
 }
 
 function isLocationClearedRow(r: any, clearedSet?: Set<string>): boolean {
@@ -280,14 +284,14 @@ async function getServerClearedLocationState(
         executePg(
           `SELECT id, location_cleared_at, location_updated_at FROM sales
            WHERE ($1 != '' AND customer_id = $1)
-              OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+              OR ($2 != '' AND ${pgNormColSql('customer_name')} = $2)`,
           [customerId, normCustName]
         ).catch(() => []),
         executePg(
           `SELECT id, location_cleared_at, location_updated_at FROM customers
            WHERE id = $1
               OR ($2 != '' AND id = $2)
-              OR ($3 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $3)`,
+              OR ($3 != '' AND ${pgNormColSql('name')} = $3)`,
           [contractId, customerId, normCustName]
         ).catch(() => []),
       ]);
@@ -310,7 +314,7 @@ async function getServerClearedLocationState(
       [Array.from(checkIds).map((id) => `loc_clear_${id}`)]
     ).catch(() => []);
     for (const tr of tombstoneRows || []) {
-      const ts = tr?.deleted_at ? new Date(tr.deleted_at).toISOString() : '1970-01-01T00:00:00.000Z';
+      const ts = tr?.deleted_at ? new Date(tr.deleted_at).toISOString() : new Date().toISOString();
       clearTimestamps.push(ts);
     }
   } catch (err) {}
@@ -392,11 +396,11 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
       if (customerId || normCustName) {
         const [siblingRows, matchingCustRows] = await Promise.all([
           executePg(
-            `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+            `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND ${pgNormColSql('customer_name')} = $2)`,
             [customerId, normCustName]
           ).catch(() => []),
           executePg(
-            `SELECT id FROM customers WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $3)`,
+            `SELECT id FROM customers WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND ${pgNormColSql('name')} = $3)`,
             [contractId, customerId, normCustName]
           ).catch(() => []),
         ]);
@@ -431,7 +435,7 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
          WHERE id = $2
             OR ($3 != '' AND id = $3)
             OR id = ANY($4)
-            OR ($5 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $5)`,
+            OR ($5 != '' AND ${pgNormColSql('name')} = $5)`,
         [iso, contractId, customerId, Array.from(relatedIds), normCustName]
       ).catch(() => {});
 
@@ -439,7 +443,7 @@ async function clearContractAndCustomerLocations(contractId: string, clearIso?: 
         `UPDATE payments
          SET latitude = NULL, longitude = NULL
          WHERE contract_id = ANY($1)
-            OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+            OR ($2 != '' AND ${pgNormColSql('customer_name')} = $2)`,
         [Array.from(relatedIds), normCustName]
       ).catch(() => {});
     }
@@ -530,11 +534,11 @@ async function unclearContractLocation(contractId: string, customerNameHint?: st
       if (customerId || normCustName) {
         const [siblingRows, matchingCustRows] = await Promise.all([
           executePg(
-            `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') = $2)`,
+            `SELECT id FROM sales WHERE ($1 != '' AND customer_id = $1) OR ($2 != '' AND ${pgNormColSql('customer_name')} = $2)`,
             [customerId, normCustName]
           ).catch(() => []),
           executePg(
-            `SELECT id FROM customers WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $3)`,
+            `SELECT id FROM customers WHERE id = $1 OR ($2 != '' AND id = $2) OR ($3 != '' AND ${pgNormColSql('name')} = $3)`,
             [contractId, customerId, normCustName]
           ).catch(() => []),
         ]);
@@ -556,7 +560,7 @@ async function unclearContractLocation(contractId: string, customerNameHint?: st
       ).catch(() => {});
       await executePg(
         `UPDATE customers SET location_cleared_at = NULL
-         WHERE id = $1 OR ($2 != '' AND id = $2) OR id = ANY($3) OR ($4 != '' AND REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $4)`,
+         WHERE id = $1 OR ($2 != '' AND id = $2) OR id = ANY($3) OR ($4 != '' AND ${pgNormColSql('name')} = $4)`,
         [contractId, customerId, Array.from(relatedIds), normCustName]
       ).catch(() => {});
     }
@@ -6330,7 +6334,7 @@ async function startServer() {
                 await executePg(`
                   UPDATE customers 
                   SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                  WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $4))
+                  WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR ${pgNormColSql('name')} IN (SELECT ${pgNormColSql('customer_name')} FROM sales WHERE id = $4))
                     AND ($5::boolean = true OR latitude IS NULL OR latitude = 0)
                 `, [pLat, pLng, nowIso, cId, shouldForceUpdate]).catch(() => {});
 
@@ -7677,7 +7681,7 @@ async function startServer() {
                   await executePg(`
                     UPDATE customers
                     SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                    WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $4))
+                    WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR ${pgNormColSql('name')} IN (SELECT ${pgNormColSql('customer_name')} FROM sales WHERE id = $4))
                       AND (latitude IS NULL OR latitude = 0)
                   `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
                 }
@@ -7703,17 +7707,44 @@ async function startServer() {
       if (contractActions.length > 0) {
         const candIds = contractActions.map((a) => String(a?.payload?.id || '')).filter(Boolean);
         const clearedLookup = new Map<string, string>();
-        if (candIds.length > 0 && isPgConfigured()) {
-          const [saleClearRows, tombClearRows] = await Promise.all([
-            executePg(`SELECT id, location_cleared_at FROM sales WHERE id = ANY($1) AND location_cleared_at IS NOT NULL`, [candIds]).catch(() => []),
-            executePg(`SELECT record_id FROM deleted_records WHERE record_id = ANY($1)`, [candIds.map((id) => `loc_clear_${id}`)]).catch(() => []),
+        const clearedNameLookup = new Map<string, string>();
+        const explicitClearBatch: Array<{ id: string; iso: string; name: string }> = [];
+
+        if (isPgConfigured()) {
+          const [saleClearRows, custClearRows, tombClearRows] = await Promise.all([
+            executePg(`SELECT id, customer_id, customer_name, location_cleared_at FROM sales WHERE location_cleared_at IS NOT NULL`).catch(() => []),
+            executePg(`SELECT id, name, location_cleared_at FROM customers WHERE location_cleared_at IS NOT NULL`).catch(() => []),
+            executePg(`SELECT record_id, deleted_at FROM deleted_records WHERE record_id LIKE 'loc_clear_%'`).catch(() => []),
           ]);
           for (const sr of saleClearRows || []) {
-            if (sr?.id && sr?.location_cleared_at) clearedLookup.set(String(sr.id), String(sr.location_cleared_at));
+            if (sr?.location_cleared_at) {
+              const iso = String(sr.location_cleared_at);
+              if (sr.id) clearedLookup.set(String(sr.id), iso);
+              if (sr.customer_id) clearedLookup.set(String(sr.customer_id), iso);
+              const n = normalizeServerName(sr.customer_name);
+              if (n && (!clearedNameLookup.get(n) || iso > clearedNameLookup.get(n)!)) {
+                clearedNameLookup.set(n, iso);
+              }
+            }
+          }
+          for (const cu of custClearRows || []) {
+            if (cu?.location_cleared_at) {
+              const iso = String(cu.location_cleared_at);
+              if (cu.id) clearedLookup.set(String(cu.id), iso);
+              const n = normalizeServerName(cu.name);
+              if (n && (!clearedNameLookup.get(n) || iso > clearedNameLookup.get(n)!)) {
+                clearedNameLookup.set(n, iso);
+              }
+            }
           }
           for (const tr of tombClearRows || []) {
             const rawId = String(tr?.record_id || '').replace(/^loc_clear_/, '');
-            if (rawId && !clearedLookup.has(rawId)) clearedLookup.set(rawId, '1970-01-01T00:00:00.000Z');
+            if (rawId) {
+              const iso = tr?.deleted_at ? new Date(tr.deleted_at).toISOString() : new Date().toISOString();
+              if (!clearedLookup.get(rawId) || iso > clearedLookup.get(rawId)!) {
+                clearedLookup.set(rawId, iso);
+              }
+            }
           }
         }
 
@@ -7735,15 +7766,33 @@ async function startServer() {
           let locUpAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
           let locClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? null;
 
-          const serverClearedAt = clearedLookup.get(String(c.id));
-          if (serverClearedAt) {
-            const incomingNewer = Boolean(locUpAt && String(locUpAt) > String(serverClearedAt));
-            if (!incomingNewer) {
-              latVal = null;
-              lngVal = null;
-              locAddr = null;
-              locUpAt = null;
-              locClearedAt = serverClearedAt;
+          const normCName = normalizeServerName(c.customerName ?? c.customer_name);
+          const isExplicitClear = c.locationCleared === true || Boolean(locClearedAt && (!locUpAt || String(locClearedAt) >= String(locUpAt)));
+
+          if (isExplicitClear) {
+            const clearIso = String(locClearedAt || new Date().toISOString());
+            latVal = null;
+            lngVal = null;
+            locAddr = null;
+            locUpAt = null;
+            locClearedAt = clearIso;
+            if (c.id) {
+              explicitClearBatch.push({ id: String(c.id), iso: clearIso, name: c.customerName ?? c.customer_name ?? '' });
+            }
+          } else {
+            const serverClearedAt =
+              clearedLookup.get(String(c.id)) ||
+              (c.customerId ? clearedLookup.get(String(c.customerId)) : undefined) ||
+              (normCName ? clearedNameLookup.get(normCName) : undefined);
+            if (serverClearedAt) {
+              const incomingNewer = Boolean(locUpAt && String(locUpAt) > String(serverClearedAt));
+              if (!incomingNewer) {
+                latVal = null;
+                lngVal = null;
+                locAddr = null;
+                locUpAt = null;
+                locClearedAt = serverClearedAt;
+              }
             }
           }
 
@@ -7758,7 +7807,7 @@ async function startServer() {
               remainingBalance: rem,
               dailyInstallment: daily,
               status: stat,
-              ...(latVal != null ? { latitude: latVal, longitude: lngVal, locationAddress: locAddr || '', locationUpdatedAt: locUpAt } : { latitude: null, longitude: null, locationClearedAt: locClearedAt }),
+              ...(latVal != null ? { latitude: latVal, longitude: lngVal, locationAddress: locAddr || '', locationUpdatedAt: locUpAt } : { latitude: null, longitude: null, locationAddress: null, locationUpdatedAt: null, locationClearedAt: locClearedAt }),
             });
           } catch (e) {}
 
@@ -7870,9 +7919,13 @@ async function startServer() {
                       longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
                       location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
                       location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
-                  WHERE id = $5 OR TRIM(LOWER(name)) = TRIM(LOWER($6))
+                  WHERE id = $5 OR ${pgNormColSql('name')} = ${pgNormColSql('$6')}
                 `, [row.latitude, row.longitude, row.location_address || '', row.location_updated_at || new Date().toISOString(), row.id, row.customer_name]).catch(() => {});
               }
+            }
+
+            for (const ec of explicitClearBatch) {
+              await clearContractAndCustomerLocations(ec.id, ec.iso, ec.name).catch(() => {});
             }
 
             for (const act of contractActions) {

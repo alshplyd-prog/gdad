@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Search,
   X,
@@ -200,6 +200,9 @@ export const HeaderAndStats: React.FC<HeaderAndStatsProps> = ({
   const [isListDropdownOpen, setIsListDropdownOpen] = useState(false);
   const listDropdownRef = useRef<HTMLDivElement>(null);
   const [localSearch, setLocalSearch] = useState(searchQuery);
+  const isSearchFocusedRef = useRef(false);
+  const isSearchComposingRef = useRef(false);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -375,9 +378,24 @@ export const HeaderAndStats: React.FC<HeaderAndStatsProps> = ({
     }
   };
 
+  const scheduleSearchSync = useCallback((val: string) => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      onSearchChange(val);
+    }, 220);
+  }, [onSearchChange]);
+
   useEffect(() => {
-    setLocalSearch(searchQuery);
+    if (!isSearchFocusedRef.current && !isSearchComposingRef.current && searchQuery !== localSearch) {
+      setLocalSearch(searchQuery);
+    }
   }, [searchQuery]);
+
+  useEffect(() => {
+    return () => {
+      if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    };
+  }, []);
   const [readNotifIds, setReadNotifIds] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem(storageKey);
@@ -1288,10 +1306,37 @@ export const HeaderAndStats: React.FC<HeaderAndStatsProps> = ({
               <input
                 type="text"
                 value={localSearch}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                onFocus={() => {
+                  isSearchFocusedRef.current = true;
+                }}
+                onBlur={() => {
+                  isSearchFocusedRef.current = false;
+                }}
+                onCompositionStart={() => {
+                  isSearchComposingRef.current = true;
+                }}
+                onCompositionEnd={(e) => {
+                  isSearchComposingRef.current = false;
+                  const val = e.currentTarget.value;
+                  setLocalSearch(val);
+                  scheduleSearchSync(val);
+                }}
                 onChange={(e) => {
                   const val = e.target.value;
                   setLocalSearch(val);
-                  onSearchChange(val);
+                  if (!isSearchComposingRef.current) {
+                    scheduleSearchSync(val);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+                    onSearchChange(localSearch);
+                  }
                 }}
                 placeholder={isAr ? 'البحث عن زبون أو رقم هاتف...' : 'Search customer or phone...'}
                 className="w-full pr-8 pl-8 py-2 rounded-xl border border-slate-300/80 dark:border-slate-700/80 bg-white/60 dark:bg-slate-900/60 hover:bg-white/80 dark:hover:bg-slate-900/80 backdrop-blur-md text-slate-900 dark:text-slate-100 text-xs font-bold focus:outline-none focus:border-teal-500 text-center sm:text-right shadow-xs transition-all"
@@ -1299,7 +1344,9 @@ export const HeaderAndStats: React.FC<HeaderAndStatsProps> = ({
               {localSearch && (
                 <button
                   type="button"
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => {
+                    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
                     setLocalSearch('');
                     onSearchChange('');
                   }}

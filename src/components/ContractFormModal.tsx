@@ -459,7 +459,7 @@ export const ContractFormModal: React.FC<ContractFormModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-900/65 backdrop-blur-sm animate-in fade-in duration-200 dir-rtl">
+    <div data-sync-pause="true" className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-900/65 backdrop-blur-sm animate-in fade-in duration-200 dir-rtl">
       <div
         className="bg-white dark:bg-slate-800 rounded-3xl w-full max-w-3xl lg:max-w-4xl shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[96vh]"
         onClick={(e) => e.stopPropagation()}

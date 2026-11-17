@@ -173,7 +173,7 @@ export const AddAppointmentModal: React.FC<AddAppointmentModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-900/80 backdrop-blur-xs animate-in fade-in duration-200 dir-rtl">
+    <div data-sync-pause="true" className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-900/80 backdrop-blur-xs animate-in fade-in duration-200 dir-rtl">
       <div
         className="bg-white dark:bg-slate-800 rounded-2xl sm:rounded-3xl w-full max-w-md shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[96vh] text-right"
         onClick={(e) => e.stopPropagation()}

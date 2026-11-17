@@ -310,7 +310,7 @@ export const AddPaymentModal: React.FC<AddPaymentModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-900/80 backdrop-blur-sm animate-in fade-in duration-200 dir-rtl">
+    <div data-sync-pause="true" className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-900/80 backdrop-blur-sm animate-in fade-in duration-200 dir-rtl">
       <div
         className="bg-white dark:bg-slate-800 rounded-3xl w-full max-w-lg sm:max-w-xl md:max-w-2xl shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[94vh]"
         onClick={(e) => e.stopPropagation()}

@@ -11,6 +11,21 @@ export const normalizeEntityName = (name?: string | null): string => {
     .toLowerCase();
 };
 
+export const normalizeArabicPersonName = (name?: string | null): string => {
+  if (!name) return '';
+  return String(name)
+    .toLowerCase()
+    .trim()
+    .replace(/[\u064B-\u065F\u0670]/g, '')
+    .replace(/\u0640/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/[ىي]/g, 'ي')
+    .replace(/[ةه]/g, 'ه')
+    .replace(/ؤ/g, 'و')
+    .replace(/[ئء]/g, 'ي')
+    .replace(/\s+/g, ' ');
+};
+
 /**
  * Checks if a name already exists in an entity collection (ignoring whitespace and case).
  * Optionally excludes an entity by ID (useful when updating an existing record).
