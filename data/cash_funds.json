@@ -74,7 +74,7 @@
   {
     "id": "fund-4",
     "name": "صندوق ماهر 1",
-    "balance": 5047000,
+    "balance": 5445000,
     "description": "",
     "orderIndex": 0,
     "createdAt": "2026-09-04T18:20:53.845Z"
@@ -82,7 +82,7 @@
   {
     "id": "fund_1791618782897_u79cy",
     "name": "هيثم",
-    "balance": 592000,
+    "balance": 597000,
     "description": "",
     "orderIndex": 0,
     "createdAt": "2026-10-10T07:53:02.897Z"

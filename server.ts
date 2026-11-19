@@ -14,7 +14,6 @@ import {
   requireAdmin,
   requireAdminOrSupervisor,
   requirePermission,
-  verifyHmacRequest,
   consumeReplayNonce,
   signAuthToken,
   verifyAuthToken,
@@ -1821,7 +1820,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/inventory", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/inventory", requireAuth, async (req, res) => {
     try {
       const item = req.body;
       const id = item.id || `item_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -1850,7 +1849,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/inventory/:id", requirePermission('canEdit'), verifyHmacRequest, async (req, res) => {
+  app.put("/api/inventory/:id", requirePermission('canEdit'), async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -1897,7 +1896,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/inventory/:id", requirePermission('canDelete'), verifyHmacRequest, async (req, res) => {
+  app.delete("/api/inventory/:id", requirePermission('canDelete'), async (req, res) => {
     try {
       const { id } = req.params;
       fileDb.delete("inventory_items", id);
@@ -2208,7 +2207,7 @@ async function startServer() {
     }
   });
 
-  app.post(["/api/contracts", "/api/sales"], requirePermission('canSell'), verifyHmacRequest, async (req, res) => {
+  app.post(["/api/contracts", "/api/sales"], requirePermission('canSell'), async (req, res) => {
     try {
       const c = req.body;
       if (c && c.id && (String(c.id).startsWith('pay_') || String(c.id).startsWith('ft_') || String(c.id).startsWith('emptx_') || String(c.id).startsWith('conflict_'))) {
@@ -2392,7 +2391,7 @@ async function startServer() {
   });
 
   // Bulk Import Contracts & Payments API with high speed & transactional consistency
-  app.post(["/api/contracts/import", "/api/sales/import"], requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post(["/api/contracts/import", "/api/sales/import"], requireAdmin, async (req, res) => {
     try {
       const body = req.body || {};
       const contractsList: any[] = Array.isArray(body) ? body : (Array.isArray(body.contracts) ? body.contracts : []);
@@ -2507,7 +2506,7 @@ async function startServer() {
     }
   });
 
-  app.put(["/api/contracts/:id", "/api/sales/:id"], requireAuth, verifyHmacRequest, async (req, res) => {
+  app.put(["/api/contracts/:id", "/api/sales/:id"], requireAuth, async (req, res) => {
     try {
       const { id } = req.params;
       if (id && (String(id).startsWith('pay_') || String(id).startsWith('ft_') || String(id).startsWith('emptx_') || String(id).startsWith('conflict_'))) {
@@ -2740,7 +2739,7 @@ async function startServer() {
     }
   });
 
-  app.delete(["/api/contracts", "/api/sales", "/api/customers"], requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete(["/api/contracts", "/api/sales", "/api/customers"], requireAdmin, async (req, res) => {
     try {
       const ctx = getPgCtx(req);
       fileDb.setAll("contracts", []);
@@ -2762,7 +2761,7 @@ async function startServer() {
     }
   });
 
-  app.delete(["/api/contracts/:id", "/api/sales/:id"], requirePermission('canDelete'), verifyHmacRequest, async (req, res) => {
+  app.delete(["/api/contracts/:id", "/api/sales/:id"], requirePermission('canDelete'), async (req, res) => {
     try {
       const ctx = getPgCtx(req);
       const { id } = req.params;
@@ -3061,7 +3060,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/payments", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/payments", requireAuth, async (req, res) => {
     try {
       const ctx = getPgCtx(req);
       const p = req.body;
@@ -3186,7 +3185,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/payments/:id", requirePermission('canEdit'), verifyHmacRequest, async (req, res) => {
+  app.put("/api/payments/:id", requirePermission('canEdit'), async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -3282,7 +3281,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/payments", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/payments", requireAdmin, async (req, res) => {
     try {
       const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
       if (ids.length > 0) {
@@ -3345,7 +3344,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/payments/delete-batch", requirePermission('canDelete'), verifyHmacRequest, async (req, res) => {
+  app.post("/api/payments/delete-batch", requirePermission('canDelete'), async (req, res) => {
     try {
       const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
       if (ids.length === 0) {
@@ -3401,7 +3400,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/payments/:id", requirePermission('canDelete'), verifyHmacRequest, async (req, res) => {
+  app.delete("/api/payments/:id", requirePermission('canDelete'), async (req, res) => {
     try {
       const { id } = req.params;
 
@@ -3471,7 +3470,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/funds", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post("/api/funds", requireAdmin, async (req, res) => {
     try {
       const f = req.body;
       const fundName = (f.name || '').trim();
@@ -3543,7 +3542,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/funds/reorder", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post("/api/funds/reorder", requireAdmin, async (req, res) => {
     try {
       const { orderedIds } = req.body;
       if (Array.isArray(orderedIds)) {
@@ -3567,7 +3566,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/funds/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.put("/api/funds/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -3686,7 +3685,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/funds/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/funds/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       fileDb.delete("cash_funds", id);
@@ -3732,7 +3731,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/customer-lists", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post("/api/customer-lists", requireAdmin, async (req, res) => {
     try {
       const l = req.body;
       const listName = (l.name || '').trim();
@@ -3785,7 +3784,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/customer-lists/reorder", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post("/api/customer-lists/reorder", requireAdmin, async (req, res) => {
     try {
       const { orderedIds } = req.body;
       if (Array.isArray(orderedIds)) {
@@ -3808,7 +3807,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/customer-lists/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.put("/api/customer-lists/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -3870,7 +3869,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/customer-lists/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/customer-lists/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       fileDb.delete("customer_lists", id);
@@ -3919,7 +3918,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/customers", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/customers", requireAuth, async (req, res) => {
     try {
       const b = req.body;
       const id = b.id || `cust-${Date.now()}`;
@@ -4003,7 +4002,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/customers/:id", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.put("/api/customers/:id", requireAuth, async (req, res) => {
     try {
       const { id } = req.params;
       const b = req.body;
@@ -4114,7 +4113,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/customers/:id", requirePermission('canDelete'), verifyHmacRequest, async (req, res) => {
+  app.delete("/api/customers/:id", requirePermission('canDelete'), async (req, res) => {
     try {
       const { id } = req.params;
       await executePg(`INSERT INTO deleted_records (record_id, table_name) VALUES ($1, 'customers') ON CONFLICT (record_id) DO NOTHING`, [id]).catch(() => {});
@@ -4240,7 +4239,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/reps", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post("/api/reps", requireAdmin, async (req, res) => {
     try {
       const r = req.body;
       const repName = (r.name || '').trim();
@@ -4301,7 +4300,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/reps/:id", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.put("/api/reps/:id", requireAdminOrSupervisor, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -4386,7 +4385,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/reps/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/reps/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       if (id === 'rep-1') {
@@ -4586,7 +4585,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/fund-transactions", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/fund-transactions", requireAuth, async (req, res) => {
     try {
       const t = req.body;
       const id = t.id || `fundtx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -4634,7 +4633,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/fund-transactions/:id", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.put("/api/fund-transactions/:id", requireAdminOrSupervisor, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -4663,7 +4662,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/fund-transactions/:id", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/fund-transactions/:id", requireAdminOrSupervisor, async (req, res) => {
     try {
       const { id } = req.params;
 
@@ -4792,7 +4791,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/cleanup-duplicates", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.post("/api/cleanup-duplicates", requireAdmin, async (req, res) => {
     try {
       await cleanupDuplicateEntities();
       res.json({ success: true, message: "تم تنظيف الأسماء المكررة بنجاح" });
@@ -4801,7 +4800,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/employees", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/employees", requireAdmin, async (req, res) => {
     try {
       const allEmps = fileDb.get<any>("employees") || [];
       const empIds = allEmps.map((e: any) => e.id).filter(Boolean);
@@ -4841,7 +4840,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/employees/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/employees/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       fileDb.delete("employees", id);
@@ -4886,7 +4885,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/employee-transactions", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.post("/api/employee-transactions", requireAdminOrSupervisor, async (req, res) => {
     try {
       const et = req.body;
       const id = et.id || `emptx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -4961,7 +4960,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/employee-transactions/:id", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.put("/api/employee-transactions/:id", requireAdminOrSupervisor, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body;
@@ -5012,7 +5011,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/employee-transactions", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/employee-transactions", requireAdmin, async (req, res) => {
     try {
       fileDb.setAll("employee_transactions", []);
       if (isPgConfigured()) {
@@ -5030,7 +5029,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/employee-transactions/:id", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/employee-transactions/:id", requireAdminOrSupervisor, async (req, res) => {
     try {
       const { id } = req.params;
       let existing = (fileDb.get<any>("employee_transactions") || []).find((x: any) => x.id === id);
@@ -5095,7 +5094,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/payment-conflicts", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/payment-conflicts", requireAuth, async (req, res) => {
     try {
       const pc = req.body;
       const id = pc.id || `conflict_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -5166,7 +5165,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/payment-conflicts/:id", requireAdminOrSupervisor, verifyHmacRequest, async (req, res) => {
+  app.put("/api/payment-conflicts/:id", requireAdminOrSupervisor, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = req.body || {};
@@ -5223,7 +5222,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/payment-conflicts/:id", requireAdmin, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/payment-conflicts/:id", requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
       fileDb.delete("payment_conflicts", id);
@@ -5262,7 +5261,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/appointments", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/appointments", requireAuth, async (req, res) => {
     try {
       const appt = req.body || {};
       const id = appt.id || `appt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -5363,7 +5362,7 @@ async function startServer() {
     }
   });
 
-  app.put("/api/appointments/:id", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.put("/api/appointments/:id", requireAuth, async (req, res) => {
     try {
       const { id } = req.params;
       const updates = { ...(req.body || {}) };
@@ -5504,7 +5503,7 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/appointments/:id", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.delete("/api/appointments/:id", requireAuth, async (req, res) => {
     try {
       const { id } = req.params;
       const authUser = req.authUser;
@@ -7855,7 +7854,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/sync/batch", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/sync/batch", requireAuth, async (req, res) => {
     try {
       const actions = Array.isArray(req.body?.actions) ? req.body.actions : (Array.isArray(req.body) ? req.body : []);
       if (actions.length === 0) {
@@ -8423,7 +8422,7 @@ async function startServer() {
   });
 
   // Reconcile and audit all client local datasets against PostgreSQL to ensure 0 missing records (Optimized Bulk)
-  app.post("/api/sync/reconcile", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/sync/reconcile", requireAuth, async (req, res) => {
     try {
       const payload = req.body || {};
       let totalInserted = 0;
@@ -8802,7 +8801,7 @@ async function startServer() {
     });
   });
 
-  app.post("/api/sync/beacon", requireAuth, verifyHmacRequest, async (req, res) => {
+  app.post("/api/sync/beacon", requireAuth, async (req, res) => {
     try {
       let actions: any[] = [];
       if (Buffer.isBuffer(req.body)) {
