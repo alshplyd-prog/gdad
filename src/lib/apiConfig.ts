@@ -46,6 +46,34 @@ export function setHostingerServerUrl(url: string) {
 }
 
 let activeWorkingServer = '';
+try {
+  if (typeof localStorage !== 'undefined') {
+    const saved = localStorage.getItem(SERVER_URL_STORAGE_KEY);
+    if (saved && (saved.startsWith('http://') || saved.startsWith('https://'))) {
+      activeWorkingServer = saved.replace(/\/+$/, '');
+    }
+  }
+} catch (e) {}
+
+export async function autoDetectActiveServer(): Promise<string> {
+  if (activeWorkingServer) return activeWorkingServer;
+  for (const server of CANDIDATE_SERVERS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3500);
+      const res = await fetch(`${server}/api/reports/totals`, {
+        signal: controller.signal,
+        headers: { 'Cache-Control': 'no-cache' }
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        setActiveWorkingServer(server);
+        return server;
+      }
+    } catch (e) {}
+  }
+  return DEFAULT_REMOTE_SERVER;
+}
 
 export function setActiveWorkingServer(url: string) {
   if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
@@ -79,14 +107,14 @@ export function isNativeOrApkEnvironment(): boolean {
 export function getApiBaseUrl(): string {
   const isNative = isNativeOrApkEnvironment();
   let base = '';
-  if (!isNative && typeof window !== 'undefined' && window.location.origin && 
+  if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
+    base = activeWorkingServer;
+  } else if (!isNative && typeof window !== 'undefined' && window.location.origin && 
       (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) && 
       !window.location.origin.includes('localhost') && 
       !window.location.origin.includes('127.0.0.1') && 
       !window.location.origin.includes('file://')) {
     base = window.location.origin;
-  } else if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
-    base = activeWorkingServer;
   } else {
     const custom = getCustomServerUrl();
     if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
