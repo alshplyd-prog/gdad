@@ -27,7 +27,15 @@ import {
   Minus,
 } from 'lucide-react';
 import { InstallmentContract, CustomerList, SalesRepresentative, Language } from '../types';
-import { updateCustomerLocation, getLocalCache, reconcileAllLocalWithDatabase, getDeletedRecordIds } from '../lib/postgresClient';
+import {
+  updateCustomerLocation,
+  getLocalCache,
+  reconcileAllLocalWithDatabase,
+  getDeletedRecordIds,
+  RepLocationRecord,
+  postRepLocationToServer,
+  fetchRepLocationsFromServer,
+} from '../lib/postgresClient';
 import { captureDeviceLocation } from '../lib/geolocationHelper';
 import { OfflineTileLayer, precacheMapTilesForLocations } from '../lib/offlineTileLayer';
 import { fetchStreetDrivingRoute } from '../lib/routingHelper';
@@ -173,9 +181,12 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   const mapRotationWrapperRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
+  const repMarkersLayerRef = useRef<L.LayerGroup | null>(null);
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
   const userMarkerRef = useRef<L.Marker | null>(null);
   const watchPositionIdRef = useRef<number | null>(null);
+  const lastRepUploadRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
+  const [repLocations, setRepLocations] = useState<RepLocationRecord[]>(() => getLocalCache<RepLocationRecord>('rep_locations'));
   
   // Navigation & Turn Tracking Refs
   const currentCourseRef = useRef<number>(0);
@@ -192,11 +203,19 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   const hasFittedInitialBoundsRef = useRef<boolean>(false);
   const prevSelectedListIdRef = useRef<string>('all');
 
+  const canViewOtherReps = Boolean(isAdmin || currentRep?.role === 'admin' || currentRep?.role === 'supervisor');
+
   useEffect(() => {
-    if (isOpen) {
-      reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+    if (!isOpen) return;
+    reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+    if (canViewOtherReps) {
+      fetchRepLocationsFromServer().then((locs) => setRepLocations(locs)).catch(() => {});
+      const pollTimer = setInterval(() => {
+        fetchRepLocationsFromServer().then((locs) => setRepLocations(locs)).catch(() => {});
+      }, 25000);
+      return () => clearInterval(pollTimer);
     }
-  }, [isOpen]);
+  }, [isOpen, canViewOtherReps]);
 
   // In-App Route State (عرض المسار على نفس الخريطة)
   const [activeRoute, setActiveRoute] = useState<{
@@ -232,6 +251,25 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     const brng = (Math.atan2(y, x) * 180) / Math.PI;
     return (brng + 360) % 360;
   }, []);
+
+  const uploadCurrentRepLocation = useCallback((lat: number, lng: number, speedVal: number | null) => {
+    if (!currentRep?.id || !lat || !lng || isNaN(lat) || isNaN(lng)) return;
+    const now = Date.now();
+    const prev = lastRepUploadRef.current;
+    if (prev) {
+      const elapsed = now - prev.time;
+      const moved = calculateDistanceMeters(prev.lat, prev.lng, lat, lng);
+      if (elapsed < 15000 && moved < 15) return;
+    }
+    lastRepUploadRef.current = { lat, lng, time: now };
+    postRepLocationToServer({
+      repId: currentRep.id,
+      repName: currentRep.name,
+      latitude: lat,
+      longitude: lng,
+      speed: speedVal,
+    }).catch(() => {});
+  }, [currentRep, calculateDistanceMeters]);
 
   // Helper to extract valid coords from a contract (supports latitude/longitude or lat/lng or customers lookup)
   const getCustomerCoords = useCallback((c: InstallmentContract): { lat: number; lng: number } | null => {
@@ -669,6 +707,9 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
         const markersLayer = L.layerGroup().addTo(map);
         markersLayerRef.current = markersLayer;
 
+        const repMarkersLayer = L.layerGroup().addTo(map);
+        repMarkersLayerRef.current = repMarkersLayer;
+
         const routeLayer = L.layerGroup().addTo(map);
         routeLayerRef.current = routeLayer;
 
@@ -729,6 +770,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
 
       userMarkerRef.current = null;
       markersLayerRef.current = null;
+      repMarkersLayerRef.current = null;
       routeLayerRef.current = null;
 
       if (mapInstanceRef.current) {
@@ -754,9 +796,10 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
           localStorage.setItem('alkarrar_last_user_location', JSON.stringify({ lat: latitude, lng: longitude }));
         } catch (e) {}
         updateUserMarker(latitude, longitude, null);
+        uploadCurrentRepLocation(latitude, longitude, null);
       }
     }).catch(() => {});
-  }, [isOpen, updateUserMarker]);
+  }, [isOpen, updateUserMarker, uploadCurrentRepLocation]);
 
   // Try loading last known location from localStorage on mount
   useEffect(() => {
@@ -888,6 +931,55 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     }
   }, [contractsOnMap, selectedCustomer, selectedListId, createCustomPinIcon, getCustomerCoords]);
 
+  // Display other reps' live server locations on the map (for admin/supervisor) with upright 0° labels
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const repLayer = repMarkersLayerRef.current;
+    if (!isMapValid(map) || !repLayer) return;
+
+    try {
+      repLayer.clearLayers();
+    } catch (e) {
+      return;
+    }
+
+    if (!canViewOtherReps || !repLocations || repLocations.length === 0) return;
+
+    repLocations.forEach((repLoc) => {
+      if (!repLoc.latitude || !repLoc.longitude || isNaN(repLoc.latitude) || isNaN(repLoc.longitude)) return;
+      if (currentRep?.id && repLoc.repId === currentRep.id) return;
+
+      const repIcon = L.divIcon({
+        className: 'custom-customer-pin',
+        html: `
+          <div class="custom-customer-pin-inner relative flex flex-col items-center cursor-pointer" style="transform: rotate(var(--counter-rotate, 0deg)); transform-origin: 50% 97%; will-change: transform;">
+            <div class="px-2.5 py-1 mb-1 bg-indigo-950/95 text-white text-[11px] font-black rounded-xl shadow-xl border border-indigo-400/70 flex items-center gap-1.5 whitespace-nowrap pointer-events-none">
+              <span class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse shrink-0"></span>
+              <span>🚐 ${repLoc.repName || 'مندوب'}</span>
+            </div>
+            <div class="w-8 h-8 rounded-full bg-indigo-600 text-white border-2 border-white shadow-lg flex items-center justify-center font-black text-xs">
+              ${(repLoc.repName || 'م').trim().charAt(0)}
+            </div>
+          </div>
+        `,
+        iconSize: [180, 64],
+        iconAnchor: [90, 62],
+      });
+
+      try {
+        const marker = L.marker([repLoc.latitude, repLoc.longitude], { icon: repIcon, zIndexOffset: 600 }).addTo(repLayer);
+        marker.on('click', () => {
+          const updatedText = repLoc.updatedAt ? new Date(repLoc.updatedAt).toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit' }) : '';
+          showFeedback(
+            isAr
+              ? `📍 المندوب: ${repLoc.repName}${updatedText ? ` (آخر تحديث ${updatedText})` : ''}`
+              : `Rep: ${repLoc.repName}${updatedText ? ` (${updatedText})` : ''}`
+          );
+        });
+      } catch (e) {}
+    });
+  }, [canViewOtherReps, repLocations, currentRep?.id, isAr, isOpen]);
+
   // Start Live Real-Time Navigation Tracking & Heading
   const startLiveTracking = useCallback(async (isAutoStart: boolean = false) => {
     if (watchPositionIdRef.current !== null && typeof navigator !== 'undefined') {
@@ -911,6 +1003,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     lastValidLocationRef.current = { lat: latitude, lng: longitude };
     positionHistoryRef.current = [{ lat: latitude, lng: longitude, time: Date.now() }];
     updateUserMarker(latitude, longitude, null);
+    uploadCurrentRepLocation(latitude, longitude, null);
 
     const map = mapInstanceRef.current;
     if (isMapValid(map) && !isUserManuallyPanningRef.current && !selectedCustomer) {
@@ -960,6 +1053,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
 
             lastValidLocationRef.current = { lat, lng };
             updateUserMarker(lat, lng, speed);
+            uploadCurrentRepLocation(lat, lng, speed);
 
             // Smooth camera follow only when moving
             if (!isUserManuallyPanningRef.current && isMapValid(mapInstanceRef.current)) {
@@ -975,7 +1069,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
         { enableHighAccuracy: true, maximumAge: 1500, timeout: 10000 }
       );
     }
-  }, [applyHeadingUpdate, calculateBearing, calculateDistanceMeters, isAr, selectedCustomer, updateUserMarker]);
+  }, [applyHeadingUpdate, calculateBearing, calculateDistanceMeters, isAr, selectedCustomer, updateUserMarker, uploadCurrentRepLocation]);
 
   // Automatically start live tracking and choose location when modal opens
   useEffect(() => {
@@ -1219,6 +1313,62 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     }
   };
 
+  // Assign or Update Customer Location from current GPS position and sync to server
+  const handleAssignCurrentLocationToCustomer = async (contract: InstallmentContract) => {
+    try {
+      setIsUpdatingLocation(true);
+      let pos = userCoordsRef.current;
+      if (!pos) {
+        const cap = await captureDeviceLocation();
+        if (cap.location) {
+          pos = { lat: cap.location.latitude, lng: cap.location.longitude };
+          userCoordsRef.current = pos;
+          updateUserMarker(pos.lat, pos.lng, null);
+          uploadCurrentRepLocation(pos.lat, pos.lng, null);
+        }
+      }
+      if (!pos) {
+        setIsUpdatingLocation(false);
+        showFeedback(isAr ? 'يرجى تفعيل GPS لتثبيت موقع الزبون' : 'Please enable GPS to set customer location');
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const ok = await updateCustomerLocation(contract.id, pos.lat, pos.lng, '');
+      setIsUpdatingLocation(false);
+      if (ok) {
+        const updatedContract: InstallmentContract = {
+          ...contract,
+          latitude: pos.lat,
+          longitude: pos.lng,
+          locationAddress: '',
+          locationUpdatedAt: nowIso,
+          locationClearedAt: null,
+        };
+        setSelectedCustomer(updatedContract);
+        if (isMapValid(mapInstanceRef.current)) {
+          try {
+            mapInstanceRef.current.flyTo([pos.lat, pos.lng], 17, { duration: 0.9 });
+          } catch (e) {}
+        }
+        showFeedback(
+          isAr
+            ? (navigator.onLine === false
+                ? 'تم تثبيت الموقع محلياً وسيُرفع للسيرفر فور توفر الإنترنت ⏳'
+                : 'تم تثبيت موقع الزبون ومزامنته مع السيرفر ✅')
+            : (navigator.onLine === false
+                ? 'Location saved locally and queued for sync'
+                : 'Customer location saved & synced with server ✅')
+        );
+      } else {
+        showFeedback(isAr ? 'تعذر حفظ موقع الزبون في السيرفر' : 'Failed to save customer location');
+      }
+    } catch (e) {
+      setIsUpdatingLocation(false);
+      showFeedback(isAr ? 'حدث خطأ أثناء تثبيت الموقع' : 'Error saving location');
+    }
+  };
+
   // Fly to customer on map
   const handleFlyToCustomer = (contract: InstallmentContract) => {
     setSelectedCustomer(contract);
@@ -1273,7 +1423,18 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
             {/* Live Sync Button */}
             <button
               type="button"
-              onClick={() => reconcileAllLocalWithDatabase({ force: true }).catch(() => {})}
+              onClick={async () => {
+                try {
+                  await reconcileAllLocalWithDatabase({ force: true });
+                  if (canViewOtherReps) {
+                    const locs = await fetchRepLocationsFromServer();
+                    setRepLocations(locs);
+                  }
+                  showFeedback(isAr ? 'تمت مزامنة المواقع مع السيرفر ✅' : 'Locations synced with server ✅');
+                } catch (e) {
+                  showFeedback(isAr ? 'تعذر تحديث المواقع من السيرفر' : 'Failed to sync locations');
+                }
+              }}
               className="p-2 rounded-2xl bg-slate-800 text-emerald-400 border border-slate-700 hover:bg-slate-700 transition-all cursor-pointer flex items-center justify-center shrink-0 active:scale-95"
               title={isAr ? 'تزامن مباشر مع السيرفر' : 'Live Sync'}
             >
@@ -1580,6 +1741,21 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
                     </button>
                   ) : null}
 
+                  <button
+                    type="button"
+                    onClick={() => handleAssignCurrentLocationToCustomer(selectedCustomer)}
+                    disabled={isUpdatingLocation}
+                    className="py-2.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-xs font-black flex items-center justify-center gap-1.5 transition-colors active:scale-95 cursor-pointer shadow-md"
+                    title={isAr ? 'تثبيت أو تحديث موقع هذا الزبون بإحداثيات موقعك الحالي وحفظه بالسيرفر' : 'Set/update customer location to my current GPS'}
+                  >
+                    <MapPinned className="w-4 h-4" />
+                    <span>
+                      {selectedCustomer.latitude && selectedCustomer.longitude && Number(selectedCustomer.latitude) !== 0
+                        ? (isAr ? 'تحديث بموقعي' : 'Update Pin')
+                        : (isAr ? 'تثبيت موقعي للزبون' : 'Set My GPS')}
+                    </span>
+                  </button>
+
                   {onViewCustomerPayments && (
                     <button
                       type="button"
@@ -1747,9 +1923,19 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
                                 </span>
                               </>
                             ) : (
-                              <span className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-400 text-[10px] font-bold">
-                                {isAr ? 'بدون موقع' : 'No GPS'}
-                              </span>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleAssignCurrentLocationToCustomer(contract);
+                                }}
+                                disabled={isUpdatingLocation}
+                                className="px-2.5 py-1 rounded-xl bg-emerald-600/85 hover:bg-emerald-500 text-white text-[10px] font-black flex items-center gap-1 transition-all active:scale-95 cursor-pointer"
+                                title={isAr ? 'تثبيت موقع الزبون من موقعي الحالي' : 'Set customer GPS to my location'}
+                              >
+                                <MapPinned className="w-3 h-3" />
+                                <span>{isAr ? 'تثبيت هنا' : 'Set Pin'}</span>
+                              </button>
                             )}
                           </div>
                         </div>

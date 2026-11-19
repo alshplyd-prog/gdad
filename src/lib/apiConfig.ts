@@ -178,8 +178,13 @@ export async function fetchWithFallback(
       urlsToTry.push(cleanEndpoint);
     }
   } else {
-    // 1. If in browser / web mode, try relative and origin URLs first
-    if (typeof window !== 'undefined' && window.location.origin && (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://'))) {
+    // 1. If in browser / web mode, prefer same-origin URLs only so cross-origin CORS mirrors don't mask real errors
+    const hasHttpOrigin =
+      typeof window !== 'undefined' &&
+      Boolean(window.location.origin) &&
+      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://'));
+
+    if (hasHttpOrigin) {
       if (!urlsToTry.includes(cleanEndpoint)) {
         urlsToTry.push(cleanEndpoint);
       }
@@ -187,25 +192,28 @@ export async function fetchWithFallback(
       if (!urlsToTry.includes(originUrl)) {
         urlsToTry.push(originUrl);
       }
+      const custom = getCustomServerUrl();
+      if (custom && custom !== window.location.origin) {
+        const customUrl = `${custom}${cleanEndpoint}`;
+        if (!urlsToTry.includes(customUrl)) urlsToTry.push(customUrl);
+      }
     } else {
       if (!urlsToTry.includes(cleanEndpoint)) {
         urlsToTry.push(cleanEndpoint);
       }
-    }
-
-    // 2. Add configured URL and candidate servers
-    if (activeWorkingServer) {
-      const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
-      if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
-    }
-    const primaryUrl = getFullApiUrl(cleanEndpoint);
-    if (!urlsToTry.includes(primaryUrl)) {
-      urlsToTry.push(primaryUrl);
-    }
-    for (const server of CANDIDATE_SERVERS) {
-      const candidateUrl = `${server}${cleanEndpoint}`;
-      if (!urlsToTry.includes(candidateUrl)) {
-        urlsToTry.push(candidateUrl);
+      if (activeWorkingServer) {
+        const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
+        if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
+      }
+      const primaryUrl = getFullApiUrl(cleanEndpoint);
+      if (!urlsToTry.includes(primaryUrl)) {
+        urlsToTry.push(primaryUrl);
+      }
+      for (const server of CANDIDATE_SERVERS) {
+        const candidateUrl = `${server}${cleanEndpoint}`;
+        if (!urlsToTry.includes(candidateUrl)) {
+          urlsToTry.push(candidateUrl);
+        }
       }
     }
   }

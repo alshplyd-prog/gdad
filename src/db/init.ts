@@ -335,8 +335,13 @@ export async function initializeDatabaseSchema() {
           created_by_name TEXT,
           created_by_rep_name TEXT,
           created_by_rep_id TEXT,
+          last_notified_at TEXT,
+          updated_at TEXT,
           created_at TEXT
         );
+
+        ALTER TABLE appointments ADD COLUMN IF NOT EXISTS last_notified_at TEXT;
+        ALTER TABLE appointments ADD COLUMN IF NOT EXISTS updated_at TEXT;
 
         CREATE TABLE IF NOT EXISTS payment_conflicts (
           id TEXT PRIMARY KEY,

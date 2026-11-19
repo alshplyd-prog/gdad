@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { fetchWithFallback } from '../lib/apiConfig';
+import { getLocalCache } from '../lib/postgresClient';
 import {
   Database,
   RefreshCw,
@@ -195,10 +196,6 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
     setLoading(true);
     setError(null);
     try {
-      if (onRefreshApp) {
-        await Promise.resolve(onRefreshApp()).catch(() => {});
-      }
-
       let lastErr: any = null;
       for (let attempt = 0; attempt <= retryCount; attempt++) {
         try {
@@ -283,6 +280,9 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
             }
 
             setData(enriched);
+            if (onRefreshApp) {
+              Promise.resolve(onRefreshApp()).catch(() => {});
+            }
             return;
           } else {
             throw new Error(json?.message || 'فشل جلب الاستعلامات من السيرفر');
@@ -345,6 +345,9 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
       Number(c.latitude) !== 0
   );
   const localLocationsCount = localContractsWithLocation.length;
+  const localRepLocationsCount = getLocalCache<any>('rep_locations').filter(
+    (r) => r && r.latitude != null && r.longitude != null && Number(r.latitude) !== 0
+  ).length;
 
   const localAppointments = appAppointments || [];
   const localAppointmentsCount = localAppointments.length;
@@ -383,8 +386,8 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
 - السيرفر: ${data.inventory.totalQuantity} قطعة | التطبيق: ${localInventoryQuantity} قطعة
 
 8. المواقع الجغرافية (GPS):
-- السيرفر (Hostinger): ${data.locations?.total ?? 0} موقع مثبت
-- التطبيق (محلياً): ${localLocationsCount} موقع مثبت
+- السيرفر (Hostinger): ${data.locations?.total ?? 0} موقع زبون${data.locations?.repLocations ? ` | ${data.locations.repLocations} موقع مندوب` : ''}
+- التطبيق (محلياً): ${localLocationsCount} موقع زبون${localRepLocationsCount ? ` | ${localRepLocationsCount} موقع مندوب` : ''}
 
 9. المواعيد والزيارات المجدولة:
 - السيرفر (Hostinger): ${data.appointments?.total ?? 0} موعد
@@ -893,7 +896,7 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
                             إجمالي المواقع المثبتة: <span className="text-indigo-700 dark:text-indigo-400">{localLocationsCount.toLocaleString('en-US')} موقع</span>
                           </div>
                           <div className="text-[11px] text-slate-500 font-bold mt-0.5">
-                            الزبائن المحددة إحداثياتهم ومواقعهم بالخريطة
+                            الزبائن المحددة مواقعهم بالخريطة{localRepLocationsCount ? ` | مواقع المندوبين: ${localRepLocationsCount}` : ''}
                           </div>
                         </td>
                         <td className="p-3 text-center">

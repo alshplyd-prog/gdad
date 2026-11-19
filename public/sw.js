@@ -325,6 +325,33 @@ async function uploadSingleActionViaRest(action, origins) {
       endpointPath = docId ? `/api/payment-conflicts/${docId}` : '';
       method = 'DELETE';
       break;
+    case 'CREATE_APPOINTMENT':
+    case 'APPOINTMENT_CREATE':
+      endpointPath = '/api/appointments';
+      method = 'POST';
+      break;
+    case 'UPDATE_APPOINTMENT':
+    case 'APPOINTMENT_UPDATE':
+      endpointPath = docId ? `/api/appointments/${docId}` : '/api/appointments';
+      method = 'PUT';
+      break;
+    case 'DELETE_APPOINTMENT':
+    case 'APPOINTMENT_DELETE':
+      endpointPath = docId ? `/api/appointments/${docId}` : '';
+      method = 'DELETE';
+      break;
+    case 'CREATE_CUSTOMER':
+      endpointPath = '/api/customers';
+      method = 'POST';
+      break;
+    case 'UPDATE_CUSTOMER':
+      endpointPath = docId ? `/api/customers/${docId}` : '/api/customers';
+      method = 'PUT';
+      break;
+    case 'DELETE_CUSTOMER':
+      endpointPath = docId ? `/api/customers/${docId}` : '';
+      method = 'DELETE';
+      break;
     default:
       return false;
   }
@@ -734,6 +761,8 @@ async function reconcileDatabaseInBackground() {
       employees: serverData.employees || localSnapshot.employees || [],
       fundTx: serverData.fundTransactions || localSnapshot.fundTx || [],
       empTx: serverData.employeeTransactions || localSnapshot.empTx || [],
+      appointments: serverData.appointments || localSnapshot.appointments || [],
+      repLocations: serverData.repLocations || localSnapshot.repLocations || [],
       deletedIds: Array.from(deletedIds),
       clearedLocationContractIds: Array.from(clearedLocationIds),
       timestamp: Date.now(),

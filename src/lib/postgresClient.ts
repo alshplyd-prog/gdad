@@ -1601,7 +1601,26 @@ function mapRow(tableName: string, r: any): any {
       createdByName: r.created_by_name ?? r.createdByName ?? '',
       createdByRepName: r.created_by_rep_name ?? r.createdByRepName ?? '',
       createdByRepId: r.created_by_rep_id ?? r.createdByRepId ?? '',
+      lastNotifiedAt: r.last_notified_at ?? r.lastNotifiedAt ?? undefined,
+      updatedAt: r.updated_at ?? r.updatedAt ?? undefined,
       createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
+    };
+  }
+
+  if (tableName === 'rep_locations') {
+    return {
+      id: String(r.rep_id ?? r.id ?? ''),
+      repId: String(r.rep_id ?? r.repId ?? r.id ?? ''),
+      repName: r.current_rep_name ?? r.rep_name ?? r.repName ?? 'مندوب',
+      latitude: Number(r.latitude) || 0,
+      longitude: Number(r.longitude) || 0,
+      accuracy: r.accuracy != null ? Number(r.accuracy) : null,
+      speed: r.speed != null ? Number(r.speed) : null,
+      battery: r.battery != null ? Number(r.battery) : null,
+      address: r.address ?? null,
+      repPhone: r.rep_phone ?? r.repPhone ?? '',
+      avatarUrl: r.avatar_url ?? r.avatarUrl ?? '',
+      updatedAt: r.updated_at ?? r.updatedAt ?? new Date().toISOString(),
     };
   }
 
@@ -1831,6 +1850,13 @@ export function toDbRow(tableName: string, data: any): any {
 // Helper for backend REST API PostgreSQL database mutations
 async function saveToPostgres(endpoint: string, method: string = 'POST', data?: any, pendingActionRef?: string | Promise<any>) {
   try {
+    // Wait for pending queue item to register first so removal is guaranteed deterministic
+    let resolvedPendingId: string | null = typeof pendingActionRef === 'string' ? pendingActionRef : null;
+    if (!resolvedPendingId && pendingActionRef && typeof pendingActionRef !== 'string' && typeof pendingActionRef.then === 'function') {
+      const queuedAct = await Promise.resolve(pendingActionRef).catch(() => null);
+      if (queuedAct?.id) resolvedPendingId = String(queuedAct.id);
+    }
+
     // 1. Primary: Server API route call (PostgreSQL database)
     const res = await fetchWithFallback(`/api/${endpoint}`, {
       method,
@@ -1839,41 +1865,33 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
       keepalive: true,
     }, 8000).catch(() => null);
 
-    // 2. Table resolution and verification
-    const rawTable = endpoint.split('/')[0].replace('-', '_');
-    const tableName = rawTable === 'funds' ? 'cash_funds' : rawTable === 'inventory' ? 'inventory_items' : rawTable;
-    const docId = endpoint.split('/')[1] || data?.id;
-    const dbPayload = data ? toDbRow(rawTable, data) : undefined;
-
     let writeSucceeded = false;
     const ct = res?.headers?.get('content-type') || '';
     if (res && res.ok && res.status >= 200 && res.status < 300 && !ct.includes('text/html')) {
       writeSucceeded = true;
     }
 
-    if (res && res.status === 409 && pendingActionRef) {
+    if (res && (res.status === 401 || res.status === 403)) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('alkarrar:auth-401', { detail: { endpoint: `/api/${endpoint}`, status: res.status } }));
+      }
+      return { __error: true, status: res.status };
+    }
+
+    if (res && res.status === 409 && resolvedPendingId) {
       // Anti-replay / idempotent duplicate: clear from queue to prevent endless retries
-      if (typeof pendingActionRef === 'string') {
-        removeFromPendingQueue(pendingActionRef).catch(() => {});
-      } else if (typeof pendingActionRef.then === 'function') {
-        pendingActionRef.then((act) => {
-          if (act?.id) removeFromPendingQueue(act.id).catch(() => {});
-        }).catch(() => {});
-      }
+      removeFromPendingQueue(resolvedPendingId).catch(() => {});
     }
 
-    if (writeSucceeded && pendingActionRef) {
-      if (typeof pendingActionRef === 'string') {
-        removeFromPendingQueue(pendingActionRef).catch(() => {});
-      } else if (typeof pendingActionRef.then === 'function') {
-        pendingActionRef.then((act) => {
-          if (act?.id) removeFromPendingQueue(act.id).catch(() => {});
-        }).catch(() => {});
-      }
+    if (writeSucceeded && resolvedPendingId) {
+      await removeFromPendingQueue(resolvedPendingId).catch(() => {});
     }
 
-    if (res && res.ok) {
-      return await res.json().catch(() => ({}));
+    if (writeSucceeded && res) {
+      return await res.json().catch(() => ({ success: true }));
+    }
+    if (res && !res.ok) {
+      return { __error: true, status: res.status };
     }
   } catch (e) {
     console.warn(`Database write notice for ${endpoint}:`, e);
@@ -2276,6 +2294,10 @@ export async function reconcileAllLocalWithDatabase(options?: {
         if (Array.isArray(data.appointments)) {
           const mappedAppointments = data.appointments.map((r: any) => mapRow('appointments', r));
           setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', mappedAppointments));
+        }
+        if (Array.isArray(data.repLocations)) {
+          const mappedRepLocs = data.repLocations.map((r: any) => mapRow('rep_locations', r));
+          setLocalCache('rep_locations', mappedRepLocs);
         }
 
         recalculateLocalFundBalances(true);
@@ -2898,6 +2920,13 @@ export const subscribeToAppointments = createSubscriber<AppointmentRecord>('appo
 export const addContractToDatabase = async (contract: any, quantityDeducted: number = 1) => {
   if (!contract) return;
   const id = contract.id || generateUniqueId('contract');
+  const hasValidCoords =
+    contract.latitude != null &&
+    contract.longitude != null &&
+    !isNaN(Number(contract.latitude)) &&
+    !isNaN(Number(contract.longitude)) &&
+    Number(contract.latitude) !== 0 &&
+    Number(contract.longitude) !== 0;
   const payload = {
     ...contract,
     id,
@@ -2919,6 +2948,7 @@ export const addContractToDatabase = async (contract: any, quantityDeducted: num
     status: contract.status || 'active',
     totalPaid: Number(contract.totalPaid) || 0,
     repName: contract.repName || '',
+    ...(hasValidCoords ? { locationUpdatedAt: contract.locationUpdatedAt || new Date().toISOString() } : {}),
     createdAt: contract.createdAt || new Date().toISOString(),
   };
 
@@ -4146,6 +4176,10 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
             const mapped = data.appointments.map((r: any) => mapRow('appointments', r));
             setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', mapped));
           }
+          if (Array.isArray(data.repLocations)) {
+            const mappedRepLocs = data.repLocations.map((r: any) => mapRow('rep_locations', r));
+            setLocalCache('rep_locations', mappedRepLocs);
+          }
           recalculateLocalFundBalances(true);
           mirrorLocalSnapshotToIndexedDb(true);
           notifySubscribersRefresh();
@@ -4322,51 +4356,132 @@ export const fetchAppointmentsFromPostgres = async (): Promise<AppointmentRecord
 };
 
 export const saveAppointmentToPostgres = async (appt: any): Promise<AppointmentRecord> => {
+  const nowIso = new Date().toISOString();
   const fullAppt: AppointmentRecord = {
     ...appt,
     id: appt.id || `appt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-    createdAt: appt.createdAt || new Date().toISOString(),
+    createdAt: appt.createdAt || nowIso,
+    updatedAt: appt.updatedAt || nowIso,
   };
 
   unmarkRecordAsDeleted(fullAppt.id);
   updateLocalCacheItem('appointments', fullAppt);
-  mirrorLocalSnapshotToIndexedDb(false);
+  await mirrorLocalSnapshotToIndexedDb(false);
   notifySubscribersRefresh();
 
   const qPromise = addToPendingQueue('APPOINTMENT_CREATE', fullAppt);
   const saveResult = await saveToPostgres('appointments', 'POST', fullAppt, qPromise);
-  if (saveResult?.appointment) {
+  if (saveResult && !saveResult.__error && saveResult.appointment) {
     updateLocalCacheItem('appointments', mapRow('appointments', saveResult.appointment));
+    await mirrorLocalSnapshotToIndexedDb(false);
+    reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
   }
 
-  reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
   return fullAppt;
 };
 
 export const deleteAppointmentFromPostgres = async (id: string): Promise<void> => {
   markRecordAsDeleted(id, 'appointments');
   removeLocalCacheItem('appointments', id);
-  mirrorLocalSnapshotToIndexedDb(false);
+  await mirrorLocalSnapshotToIndexedDb(false);
   notifySubscribersRefresh();
 
   const qPromise = addToPendingQueue('APPOINTMENT_DELETE', { id });
-  await saveToPostgres(`appointments/${id}`, 'DELETE', undefined, qPromise);
-
-  reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+  const delResult = await saveToPostgres(`appointments/${id}`, 'DELETE', undefined, qPromise);
+  if (delResult && !delResult.__error) {
+    reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+  }
 };
 
 export const updateAppointmentInPostgres = async (id: string, updates: any): Promise<void> => {
+  const nowIso = new Date().toISOString();
+  const payloadUpdates = { ...updates, updatedAt: updates?.updatedAt || nowIso };
   const current = getLocalCache<any>('appointments');
   const target = current.find((a) => a.id === id);
-  const updated = target ? { ...target, ...updates } : { id, ...updates };
+  const updated = target ? { ...target, ...payloadUpdates } : { id, ...payloadUpdates };
   updateLocalCacheItem('appointments', updated);
-  mirrorLocalSnapshotToIndexedDb(false);
+  await mirrorLocalSnapshotToIndexedDb(false);
   notifySubscribersRefresh();
 
-  const qPromise = addToPendingQueue('APPOINTMENT_UPDATE', { id, ...updates });
-  await saveToPostgres(`appointments/${id}`, 'PUT', updates, qPromise);
+  const qPromise = addToPendingQueue('APPOINTMENT_UPDATE', updated);
+  const updResult = await saveToPostgres(`appointments/${id}`, 'PUT', payloadUpdates, qPromise);
+  if (updResult && !updResult.__error) {
+    if (updResult.appointment) {
+      updateLocalCacheItem('appointments', mapRow('appointments', updResult.appointment));
+    }
+    reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+  }
+};
 
-  reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+export interface RepLocationRecord {
+  id: string;
+  repId: string;
+  repName: string;
+  latitude: number;
+  longitude: number;
+  accuracy?: number | null;
+  speed?: number | null;
+  battery?: number | null;
+  address?: string | null;
+  repPhone?: string;
+  avatarUrl?: string;
+  updatedAt: string;
+}
+
+export const postRepLocationToServer = async (loc: {
+  repId: string;
+  repName?: string;
+  latitude: number;
+  longitude: number;
+  accuracy?: number | null;
+  speed?: number | null;
+  battery?: number | null;
+  address?: string | null;
+}): Promise<boolean> => {
+  if (!loc?.repId || !loc.latitude || !loc.longitude) return false;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+
+  try {
+    const res = await fetchWithFallback(
+      '/api/reps/location',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(loc),
+        keepalive: true,
+      },
+      6000
+    ).catch(() => null);
+    if (res && res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data?.location) {
+        updateLocalCacheItem('rep_locations', mapRow('rep_locations', data.location));
+      }
+      return true;
+    }
+  } catch (e) {}
+  return false;
+};
+
+export const fetchRepLocationsFromServer = async (): Promise<RepLocationRecord[]> => {
+  const cached = getLocalCache<RepLocationRecord>('rep_locations');
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return cached;
+  }
+  try {
+    const res = await fetchWithFallback('/api/reps/locations', undefined, 5000).catch(() => null);
+    if (res && res.ok) {
+      const rows = await res.json().catch(() => null);
+      if (Array.isArray(rows)) {
+        const mapped = rows
+          .map((r) => mapRow('rep_locations', r))
+          .filter((r) => r.latitude && r.longitude && Number(r.latitude) !== 0);
+        setLocalCache('rep_locations', mapped);
+        return mapped;
+      }
+    }
+  } catch (e) {}
+  return cached;
 };
 
 export const updateCustomerLocation = async (

@@ -216,6 +216,8 @@ function mapAppointmentRow(r: any) {
     createdByName: r.created_by_name || r.createdByName || '',
     createdByRepName: r.created_by_rep_name || r.createdByRepName || '',
     createdByRepId: r.created_by_rep_id || r.createdByRepId || '',
+    lastNotifiedAt: r.last_notified_at || r.lastNotifiedAt || undefined,
+    updatedAt: r.updated_at || r.updatedAt || undefined,
     createdAt: r.created_at || r.createdAt || new Date().toISOString(),
   };
 }
@@ -2218,7 +2220,7 @@ async function startServer() {
       let latVal: number | null = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : (c.lat != null && !isNaN(Number(c.lat)) && Number(c.lat) !== 0 ? Number(c.lat) : null);
       let lngVal: number | null = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : (c.lng != null && !isNaN(Number(c.lng)) && Number(c.lng) !== 0 ? Number(c.lng) : null);
       let locAddrVal: string = c.locationAddress || c.location_address || '';
-      let locUpdatedVal: string | null = c.locationUpdatedAt || c.location_updated_at || null;
+      let locUpdatedVal: string | null = c.locationUpdatedAt || c.location_updated_at || ((latVal != null && lngVal != null) ? new Date().toISOString() : null);
       let locClearedVal: string | null = c.locationClearedAt || c.location_cleared_at || null;
 
       const serverClearState = await getServerClearedLocationState(id, c.customerName);
@@ -2314,15 +2316,61 @@ async function startServer() {
       if (locClearedVal && latVal == null) {
         await clearContractAndCustomerLocations(id, locClearedVal, saved.customerName);
       } else if (latVal != null && lngVal != null) {
+        const effLocTs = locUpdatedVal || new Date().toISOString();
         await unclearContractLocation(id, saved.customerName);
-        await executePg(`
+        const updCustRows = await executePg(`
           UPDATE customers
           SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
               longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
               location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
               location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
           WHERE id = $5 OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') = $6
-        `, [latVal, lngVal, locAddrVal || '', locUpdatedVal || new Date().toISOString(), id, normalizeServerName(saved.customerName)]).catch(() => {});
+          RETURNING id
+        `, [latVal, lngVal, locAddrVal || '', effLocTs, id, normalizeServerName(saved.customerName)]).catch(() => []);
+        if (!updCustRows || updCustRows.length === 0) {
+          const custRowId = c.customerId || id;
+          await executePg(`
+            INSERT INTO customers (id, name, phone, address, list_id, list_name, notes, total_purchases, total_paid, remaining_balance, status, latitude, longitude, location_address, location_updated_at, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            ON CONFLICT (id) DO UPDATE SET
+              latitude = COALESCE(NULLIF(EXCLUDED.latitude, 0), customers.latitude),
+              longitude = COALESCE(NULLIF(EXCLUDED.longitude, 0), customers.longitude),
+              location_address = COALESCE(NULLIF(EXCLUDED.location_address, ''), customers.location_address),
+              location_updated_at = COALESCE(EXCLUDED.location_updated_at, customers.location_updated_at),
+              location_cleared_at = NULL
+          `, [
+            custRowId,
+            saved.customerName,
+            saved.customerPhone,
+            saved.customerAddress,
+            saved.listId,
+            saved.listName,
+            saved.notes,
+            saved.totalPrice,
+            saved.totalPaid,
+            saved.remainingBalance,
+            saved.status,
+            latVal,
+            lngVal,
+            locAddrVal || '',
+            effLocTs,
+            saved.createdAt
+          ]).catch(() => {});
+          fileDb.upsert("customers", {
+            id: custRowId,
+            name: saved.customerName,
+            phone: saved.customerPhone,
+            address: saved.customerAddress,
+            listId: saved.listId,
+            listName: saved.listName,
+            latitude: latVal,
+            longitude: lngVal,
+            locationAddress: locAddrVal || '',
+            locationUpdatedAt: effLocTs,
+            locationClearedAt: null,
+            createdAt: saved.createdAt
+          });
+        }
       }
       console.log(`[POST /api/contracts] Inserted ${id} into PostgreSQL successfully.`);
 
@@ -2603,12 +2651,58 @@ async function startServer() {
               [id]
             ).catch(() => {});
 
-            await executePg(`
+            const updCust = await executePg(`
               UPDATE customers
               SET latitude = $1, longitude = $2, location_address = $3, location_updated_at = $4, location_cleared_at = NULL
               WHERE id IN (SELECT customer_id FROM sales WHERE id = $5)
                  OR REGEXP_REPLACE(TRIM(LOWER(name)), '\\s+', ' ', 'g') IN (SELECT REGEXP_REPLACE(TRIM(LOWER(customer_name)), '\\s+', ' ', 'g') FROM sales WHERE id = $5)
-            `, [newLat, newLng, newLocAddress, newLocUpdated, id]).catch(() => {});
+                 OR id = $5
+              RETURNING id
+            `, [newLat, newLng, newLocAddress, newLocUpdated, id]).catch(() => []);
+
+            if (!updCust || updCust.length === 0) {
+              const saleRow = (await executePg(`SELECT * FROM sales WHERE id = $1 LIMIT 1`, [id]).catch(() => []))?.[0]
+                || (fileDb.get<any>("contracts") || []).find((c: any) => c.id === id);
+              if (saleRow && (saleRow.customer_name || saleRow.customerName)) {
+                const custId = saleRow.customer_id || saleRow.customerId || id;
+                const cName = saleRow.customer_name || saleRow.customerName || '';
+                await executePg(`
+                  INSERT INTO customers (id, name, phone, address, list_id, list_name, latitude, longitude, location_address, location_updated_at, created_at)
+                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                  ON CONFLICT (id) DO UPDATE SET
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    location_address = EXCLUDED.location_address,
+                    location_updated_at = EXCLUDED.location_updated_at,
+                    location_cleared_at = NULL
+                `, [
+                  custId,
+                  cName,
+                  saleRow.customer_phone || saleRow.customerPhone || '',
+                  saleRow.customer_address || saleRow.customerAddress || '',
+                  saleRow.list_id || saleRow.listId || null,
+                  saleRow.list_name || saleRow.listName || null,
+                  newLat,
+                  newLng,
+                  newLocAddress || '',
+                  newLocUpdated,
+                  saleRow.created_at || saleRow.createdAt || new Date().toISOString()
+                ]).catch(() => {});
+                fileDb.upsert("customers", {
+                  id: custId,
+                  name: cName,
+                  phone: saleRow.customer_phone || saleRow.customerPhone || '',
+                  address: saleRow.customer_address || saleRow.customerAddress || '',
+                  listId: saleRow.list_id || saleRow.listId || null,
+                  listName: saleRow.list_name || saleRow.listName || null,
+                  latitude: newLat,
+                  longitude: newLng,
+                  locationAddress: newLocAddress || '',
+                  locationUpdatedAt: newLocUpdated,
+                  locationClearedAt: null
+                });
+              }
+            }
 
             const allCusts = fileDb.get<any>("customers") || [];
             const matchedSale = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === id);
@@ -2623,7 +2717,9 @@ async function startServer() {
                 allCusts[i].latitude = newLat;
                 allCusts[i].longitude = newLng;
                 allCusts[i].location_address = newLocAddress;
+                allCusts[i].locationAddress = newLocAddress || '';
                 allCusts[i].location_updated_at = newLocUpdated;
+                allCusts[i].locationUpdatedAt = newLocUpdated;
                 allCusts[i].location_cleared_at = null;
                 allCusts[i].locationClearedAt = null;
                 custChanged = true;
@@ -3838,9 +3934,50 @@ async function startServer() {
       const remainingBalance = Number(b.remainingBalance ?? b.remaining_balance) || 0;
       const status = b.status || 'active';
 
+      const isClearingLoc =
+        b.locationCleared === true ||
+        ((b.latitude !== undefined || b.longitude !== undefined) &&
+          (b.latitude == null || b.longitude == null || Number(b.latitude) === 0 || Number(b.longitude) === 0));
+      let latVal: number | null = isClearingLoc ? null : (b.latitude != null && b.latitude !== 0 && !isNaN(Number(b.latitude)) ? Number(b.latitude) : null);
+      let lngVal: number | null = isClearingLoc ? null : (b.longitude != null && b.longitude !== 0 && !isNaN(Number(b.longitude)) ? Number(b.longitude) : null);
+      let locAddrVal: string | null = isClearingLoc ? null : (b.locationAddress ?? b.location_address ?? null);
+      let locUpdVal: string | null = isClearingLoc ? null : (b.locationUpdatedAt ?? b.location_updated_at ?? (latVal != null && lngVal != null ? new Date().toISOString() : null));
+      let locClearVal: string | null = isClearingLoc ? (b.locationClearedAt || b.location_cleared_at || new Date().toISOString()) : null;
+
+      if (!isClearingLoc && latVal != null && lngVal != null) {
+        const clearState = await getServerClearedLocationState(id, name);
+        if (clearState.cleared && clearState.clearedAt && (!locUpdVal || String(locUpdVal) <= String(clearState.clearedAt))) {
+          latVal = null;
+          lngVal = null;
+          locAddrVal = null;
+          locUpdVal = null;
+          locClearVal = clearState.clearedAt;
+        }
+      }
+
+      const savedCustomer = {
+        id,
+        name,
+        phone,
+        address,
+        listId,
+        listName,
+        notes,
+        totalPurchases,
+        totalPaid,
+        remainingBalance,
+        status,
+        latitude: latVal,
+        longitude: lngVal,
+        locationAddress: locAddrVal || '',
+        locationUpdatedAt: locUpdVal,
+        locationClearedAt: locClearVal,
+      };
+      fileDb.upsert("customers", savedCustomer);
+
       await executePg(`
-        INSERT INTO customers (id, name, phone, address, list_id, list_name, notes, total_purchases, total_paid, remaining_balance, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO customers (id, name, phone, address, list_id, list_name, notes, total_purchases, total_paid, remaining_balance, status, latitude, longitude, location_address, location_updated_at, location_cleared_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT (id) DO UPDATE SET
           name = EXCLUDED.name,
           phone = EXCLUDED.phone,
@@ -3851,10 +3988,16 @@ async function startServer() {
           total_purchases = EXCLUDED.total_purchases,
           total_paid = EXCLUDED.total_paid,
           remaining_balance = EXCLUDED.remaining_balance,
-          status = EXCLUDED.status
-      `, [id, name, phone, address, listId, listName, notes, totalPurchases, totalPaid, remainingBalance, status]).catch(() => {});
+          status = EXCLUDED.status,
+          latitude = CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), customers.latitude) END,
+          longitude = CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), customers.longitude) END,
+          location_address = CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), customers.location_address) END,
+          location_updated_at = CASE WHEN EXCLUDED.location_cleared_at IS NOT NULL THEN NULL ELSE COALESCE(EXCLUDED.location_updated_at, customers.location_updated_at) END,
+          location_cleared_at = COALESCE(EXCLUDED.location_cleared_at, CASE WHEN EXCLUDED.latitude IS NOT NULL AND EXCLUDED.latitude != 0 THEN NULL ELSE customers.location_cleared_at END)
+      `, [id, name, phone, address, listId, listName, notes, totalPurchases, totalPaid, remainingBalance, status, latVal, lngVal, locAddrVal, locUpdVal, locClearVal]).catch(() => {});
 
-      res.json({ success: true, customer: { id, name, phone, address, listId, listName, notes, totalPurchases, totalPaid, remainingBalance, status } });
+      bumpSyncVersion();
+      res.json({ success: true, customer: savedCustomer });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -5123,11 +5266,15 @@ async function startServer() {
     try {
       const appt = req.body || {};
       const id = appt.id || `appt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      const cAt = appt.createdAt || new Date().toISOString();
+      const cAt = appt.createdAt || appt.created_at || new Date().toISOString();
+      const uAt = appt.updatedAt || appt.updated_at || cAt;
+      const lNotifAt = appt.lastNotifiedAt || appt.last_notified_at || null;
       const saved = fileDb.upsert("appointments", {
         ...appt,
         id,
         createdAt: cAt,
+        updatedAt: uAt,
+        ...(lNotifAt ? { lastNotifiedAt: lNotifAt } : {}),
       });
 
       if (isPgConfigured()) {
@@ -5138,31 +5285,33 @@ async function startServer() {
               list_id, list_name, appointment_type, recurring_day, recurring_day_name,
               recurring_day_of_month, recurring_month_day_name, appointment_date,
               appointment_time, due_date, due_time, title, notes, note, status,
-              created_by_name, created_by_rep_name, created_by_rep_id, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+              created_by_name, created_by_rep_name, created_by_rep_id, last_notified_at, updated_at, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
             ON CONFLICT (id) DO UPDATE SET
-              contract_id = EXCLUDED.contract_id,
-              customer_name = EXCLUDED.customer_name,
-              customer_phone = EXCLUDED.customer_phone,
-              customer_address = EXCLUDED.customer_address,
-              list_id = EXCLUDED.list_id,
-              list_name = EXCLUDED.list_name,
-              appointment_type = EXCLUDED.appointment_type,
-              recurring_day = EXCLUDED.recurring_day,
-              recurring_day_name = EXCLUDED.recurring_day_name,
-              recurring_day_of_month = EXCLUDED.recurring_day_of_month,
-              recurring_month_day_name = EXCLUDED.recurring_month_day_name,
-              appointment_date = EXCLUDED.appointment_date,
-              appointment_time = EXCLUDED.appointment_time,
-              due_date = EXCLUDED.due_date,
-              due_time = EXCLUDED.due_time,
-              title = EXCLUDED.title,
-              notes = EXCLUDED.notes,
-              note = EXCLUDED.note,
-              status = EXCLUDED.status,
-              created_by_name = EXCLUDED.created_by_name,
-              created_by_rep_name = EXCLUDED.created_by_rep_name,
-              created_by_rep_id = EXCLUDED.created_by_rep_id
+              contract_id = COALESCE(EXCLUDED.contract_id, appointments.contract_id),
+              customer_name = COALESCE(NULLIF(EXCLUDED.customer_name, ''), appointments.customer_name),
+              customer_phone = COALESCE(NULLIF(EXCLUDED.customer_phone, ''), appointments.customer_phone),
+              customer_address = COALESCE(NULLIF(EXCLUDED.customer_address, ''), appointments.customer_address),
+              list_id = COALESCE(EXCLUDED.list_id, appointments.list_id),
+              list_name = COALESCE(NULLIF(EXCLUDED.list_name, ''), appointments.list_name),
+              appointment_type = COALESCE(NULLIF(EXCLUDED.appointment_type, ''), appointments.appointment_type),
+              recurring_day = COALESCE(EXCLUDED.recurring_day, appointments.recurring_day),
+              recurring_day_name = COALESCE(NULLIF(EXCLUDED.recurring_day_name, ''), appointments.recurring_day_name),
+              recurring_day_of_month = COALESCE(EXCLUDED.recurring_day_of_month, appointments.recurring_day_of_month),
+              recurring_month_day_name = COALESCE(NULLIF(EXCLUDED.recurring_month_day_name, ''), appointments.recurring_month_day_name),
+              appointment_date = COALESCE(NULLIF(EXCLUDED.appointment_date, ''), appointments.appointment_date),
+              appointment_time = COALESCE(NULLIF(EXCLUDED.appointment_time, ''), appointments.appointment_time),
+              due_date = COALESCE(NULLIF(EXCLUDED.due_date, ''), appointments.due_date),
+              due_time = COALESCE(NULLIF(EXCLUDED.due_time, ''), appointments.due_time),
+              title = COALESCE(NULLIF(EXCLUDED.title, ''), appointments.title),
+              notes = COALESCE(NULLIF(EXCLUDED.notes, ''), appointments.notes),
+              note = COALESCE(NULLIF(EXCLUDED.note, ''), appointments.note),
+              status = COALESCE(NULLIF(EXCLUDED.status, ''), appointments.status),
+              created_by_name = COALESCE(NULLIF(EXCLUDED.created_by_name, ''), appointments.created_by_name),
+              created_by_rep_name = COALESCE(NULLIF(EXCLUDED.created_by_rep_name, ''), appointments.created_by_rep_name),
+              created_by_rep_id = COALESCE(NULLIF(EXCLUDED.created_by_rep_id, ''), appointments.created_by_rep_id),
+              last_notified_at = COALESCE(EXCLUDED.last_notified_at, appointments.last_notified_at),
+              updated_at = COALESCE(EXCLUDED.updated_at, appointments.updated_at)
           `;
           const vals = [
             id,
@@ -5188,6 +5337,8 @@ async function startServer() {
             appt.createdByName || appt.created_by_name || '',
             appt.createdByRepName || appt.created_by_rep_name || '',
             appt.createdByRepId || appt.created_by_rep_id || '',
+            lNotifAt,
+            uAt,
             cAt
           ];
           await executePg(query, vals);
@@ -5215,7 +5366,11 @@ async function startServer() {
   app.put("/api/appointments/:id", requireAuth, verifyHmacRequest, async (req, res) => {
     try {
       const { id } = req.params;
-      const updates = req.body || {};
+      const updates = { ...(req.body || {}) };
+      const nowIso = new Date().toISOString();
+      if (!updates.updatedAt && !updates.updated_at) {
+        updates.updatedAt = nowIso;
+      }
       const updated = fileDb.update("appointments", id, updates);
 
       if (isPgConfigured()) {
@@ -5255,6 +5410,16 @@ async function startServer() {
             notes: 'notes',
             note: 'note',
             status: 'status',
+            createdByName: 'created_by_name',
+            created_by_name: 'created_by_name',
+            createdByRepName: 'created_by_rep_name',
+            created_by_rep_name: 'created_by_rep_name',
+            createdByRepId: 'created_by_rep_id',
+            created_by_rep_id: 'created_by_rep_id',
+            lastNotifiedAt: 'last_notified_at',
+            last_notified_at: 'last_notified_at',
+            updatedAt: 'updated_at',
+            updated_at: 'updated_at',
           };
 
           const setClauses: string[] = [];
@@ -5274,7 +5439,57 @@ async function startServer() {
 
           if (setClauses.length > 0) {
             values.push(id);
-            await executePg(`UPDATE appointments SET ${setClauses.join(', ')} WHERE id = $${idx}`, values);
+            const updatedRows = await executePg(
+              `UPDATE appointments SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING id`,
+              values
+            );
+            // If row didn't exist in PG yet (e.g. synced from offline/fileDb), insert the merged appointment
+            if (!updatedRows || updatedRows.length === 0) {
+              const mergedAppt: any = {
+                ...(updated && typeof updated === 'object' ? (updated as Record<string, any>) : {}),
+                ...(updates && typeof updates === 'object' ? (updates as Record<string, any>) : {}),
+                id,
+              };
+              const cAt = mergedAppt.createdAt || mergedAppt.created_at || nowIso;
+              await executePg(
+                `INSERT INTO appointments (
+                  id, contract_id, customer_name, customer_phone, customer_address,
+                  list_id, list_name, appointment_type, recurring_day, recurring_day_name,
+                  recurring_day_of_month, recurring_month_day_name, appointment_date,
+                  appointment_time, due_date, due_time, title, notes, note, status,
+                  created_by_name, created_by_rep_name, created_by_rep_id, last_notified_at, updated_at, created_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+                ON CONFLICT (id) DO NOTHING`,
+                [
+                  id,
+                  mergedAppt.contractId || mergedAppt.contract_id || null,
+                  mergedAppt.customerName || mergedAppt.customer_name || '',
+                  mergedAppt.customerPhone || mergedAppt.customer_phone || '',
+                  mergedAppt.customerAddress || mergedAppt.customer_address || '',
+                  mergedAppt.listId || mergedAppt.list_id || null,
+                  mergedAppt.listName || mergedAppt.list_name || '',
+                  mergedAppt.appointmentType || mergedAppt.appointment_type || 'specific_date',
+                  mergedAppt.recurringDay != null ? Number(mergedAppt.recurringDay) : null,
+                  mergedAppt.recurringDayName || mergedAppt.recurring_day_name || '',
+                  mergedAppt.recurringDayOfMonth != null ? Number(mergedAppt.recurringDayOfMonth) : null,
+                  mergedAppt.recurringMonthDayName || mergedAppt.recurring_month_day_name || '',
+                  mergedAppt.appointmentDate || mergedAppt.appointment_date || '',
+                  mergedAppt.appointmentTime || mergedAppt.appointment_time || '',
+                  mergedAppt.dueDate || mergedAppt.due_date || '',
+                  mergedAppt.dueTime || mergedAppt.due_time || '',
+                  mergedAppt.title || '',
+                  mergedAppt.notes || mergedAppt.note || '',
+                  mergedAppt.note || mergedAppt.notes || '',
+                  mergedAppt.status || 'pending',
+                  mergedAppt.createdByName || mergedAppt.created_by_name || '',
+                  mergedAppt.createdByRepName || mergedAppt.created_by_rep_name || '',
+                  mergedAppt.createdByRepId || mergedAppt.created_by_rep_id || '',
+                  mergedAppt.lastNotifiedAt || mergedAppt.last_notified_at || null,
+                  nowIso,
+                  cAt,
+                ]
+              ).catch(() => {});
+            }
           }
         } catch (pgErr) {
           console.error("PostgreSQL update appointment error:", pgErr);
@@ -5289,9 +5504,29 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/appointments/:id", requirePermission('canDelete'), verifyHmacRequest, async (req, res) => {
+  app.delete("/api/appointments/:id", requireAuth, verifyHmacRequest, async (req, res) => {
     try {
       const { id } = req.params;
+      const authUser = req.authUser;
+      const hasPrivilege = authUser?.role === 'admin' || authUser?.role === 'supervisor' || authUser?.canDelete;
+
+      if (!hasPrivilege) {
+        let existing: any = (fileDb.get<any>("appointments") || []).find((a: any) => a?.id === id);
+        if (!existing && isPgConfigured()) {
+          const rows = await executePg("SELECT created_by_rep_id, created_by_rep_name, created_by_name FROM appointments WHERE id = $1 LIMIT 1", [id]).catch(() => []);
+          if (rows && rows.length > 0) existing = mapAppointmentRow(rows[0]);
+        }
+        const isOwner =
+          existing &&
+          ((existing.createdByRepId && authUser?.repId && existing.createdByRepId === authUser.repId) ||
+            (authUser?.repName &&
+              (normalizeServerName(existing.createdByRepName) === normalizeServerName(authUser.repName) ||
+                normalizeServerName(existing.createdByName) === normalizeServerName(authUser.repName))));
+        if (!isOwner) {
+          return res.status(403).json({ error: 'لا تملك صلاحية حذف هذا الموعد' });
+        }
+      }
+
       fileDb.delete("appointments", id);
 
       if (isPgConfigured()) {
@@ -5450,8 +5685,6 @@ async function startServer() {
   app.get("/api/reports/totals", async (req, res) => {
     try {
       if (isPgConfigured()) {
-        await syncContractBalancesInPgAndFileDb().catch(() => {});
-        await syncCustomersTableInPg().catch(() => {});
         const todayStr = new Date().toISOString().split('T')[0];
         const monthPrefix = todayStr.substring(0, 7);
         const queryErrors: Record<string, string> = {};
@@ -5881,6 +6114,10 @@ async function startServer() {
           let locUpAt = payload.locationUpdatedAt ?? payload.location_updated_at ?? null;
           let locClearedAt = payload.locationClearedAt ?? payload.location_cleared_at ?? null;
 
+          if (lat != null && lng != null && !locUpAt && !locClearedAt && payload.locationCleared !== true) {
+            locUpAt = upAt || new Date().toISOString();
+          }
+
           if (isPgConfigured()) {
             const clearState = await getServerClearedLocationState(payload.id, cName);
             const payloadExplicitlyCleared = payload.locationCleared === true || Boolean(locClearedAt && (!locUpAt || locClearedAt >= locUpAt));
@@ -5971,14 +6208,44 @@ async function startServer() {
           if (locClearedAt && (lat == null || lng == null)) {
             await clearContractAndCustomerLocations(payload.id, locClearedAt, cName);
           } else if (lat != null && lng != null && !isNaN(Number(lat)) && !isNaN(Number(lng)) && Number(lat) !== 0 && Number(lng) !== 0) {
-            await executePg(`
+            const effectiveLocTs = locUpAt || new Date().toISOString();
+            const updatedCust = await executePg(`
               UPDATE customers
               SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
                   longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
                   location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
                   location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
               WHERE id = $5 OR TRIM(LOWER(name)) = TRIM(LOWER($6))
-            `, [lat, lng, locAddr || '', locUpAt || new Date().toISOString(), payload.id, cName]).catch(() => {});
+              RETURNING id
+            `, [lat, lng, locAddr || '', effectiveLocTs, payload.id, cName]).catch(() => []);
+            if (!updatedCust || updatedCust.length === 0) {
+              await executePg(`
+                INSERT INTO customers (id, name, phone, address, latitude, longitude, location_address, location_updated_at, list_id, list_name, total_debt, total_paid, remaining_balance, daily_installment, created_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                ON CONFLICT (id) DO UPDATE SET
+                  latitude = COALESCE(NULLIF(customers.latitude, 0), EXCLUDED.latitude),
+                  longitude = COALESCE(NULLIF(customers.longitude, 0), EXCLUDED.longitude),
+                  location_address = COALESCE(NULLIF(customers.location_address, ''), EXCLUDED.location_address),
+                  location_updated_at = COALESCE(customers.location_updated_at, EXCLUDED.location_updated_at)
+              `, [payload.id, cName, cPhone, cAddress, lat, lng, locAddr || '', effectiveLocTs, lId, lName, tPrice, tPaid, remBal, dInst, cAt]).catch(() => {});
+            }
+            fileDb.upsert("customers", {
+              id: payload.id,
+              name: cName,
+              phone: cPhone,
+              address: cAddress,
+              latitude: lat,
+              longitude: lng,
+              locationAddress: locAddr || '',
+              locationUpdatedAt: effectiveLocTs,
+              listId: lId,
+              listName: lName,
+              totalDebt: tPrice,
+              totalPaid: tPaid,
+              remainingBalance: remBal,
+              dailyInstallment: dInst,
+              createdAt: cAt,
+            });
           }
           return true;
         }
@@ -6254,6 +6521,114 @@ async function startServer() {
             }
           }
           await recalculateAllFundBalancesInPg().catch(() => {});
+          bumpSyncVersion();
+          return true;
+        }
+
+        case 'CREATE_CUSTOMER':
+        case 'UPDATE_CUSTOMER': {
+          if (!payload?.id) return true;
+          const id = String(payload.id);
+          const isClearingLoc =
+            payload.locationCleared === true ||
+            ((payload.latitude !== undefined || payload.longitude !== undefined) &&
+              (payload.latitude == null || payload.longitude == null || Number(payload.latitude) === 0 || Number(payload.longitude) === 0));
+          let latVal: number | null | undefined = isClearingLoc
+            ? null
+            : (payload.latitude !== undefined && payload.latitude != null && payload.latitude !== 0 && !isNaN(Number(payload.latitude))
+                ? Number(payload.latitude)
+                : undefined);
+          let lngVal: number | null | undefined = isClearingLoc
+            ? null
+            : (payload.longitude !== undefined && payload.longitude != null && payload.longitude !== 0 && !isNaN(Number(payload.longitude))
+                ? Number(payload.longitude)
+                : undefined);
+          let locAddrVal: string | null | undefined = isClearingLoc ? null : (payload.locationAddress ?? payload.location_address);
+          let locUpdVal: string | null | undefined = isClearingLoc
+            ? null
+            : (payload.locationUpdatedAt ?? payload.location_updated_at ?? (latVal != null ? new Date().toISOString() : undefined));
+          const clearIso = isClearingLoc ? (payload.locationClearedAt || payload.location_cleared_at || new Date().toISOString()) : null;
+
+          if (!isClearingLoc && latVal != null && lngVal != null) {
+            const clearState = await getServerClearedLocationState(id, payload.name || payload.customerName);
+            const incomingUpd = payload.locationUpdatedAt ?? payload.location_updated_at ?? null;
+            if (clearState.cleared && clearState.clearedAt && (!incomingUpd || String(incomingUpd) <= String(clearState.clearedAt))) {
+              latVal = undefined;
+              lngVal = undefined;
+              locAddrVal = undefined;
+              locUpdVal = undefined;
+            }
+          }
+
+          let existing = (fileDb.get<any>("customers") || []).find((c: any) => c.id === id);
+          if (!existing && isPgConfigured()) {
+            const rows = await executePg("SELECT * FROM customers WHERE id = $1 LIMIT 1", [id]).catch(() => []);
+            if (rows && rows.length > 0) existing = mapCustomerRow(rows[0]);
+          }
+          const merged = { ...(existing || {}), ...payload, id };
+          const cName = merged.name || merged.customerName || '';
+          const cPhone = merged.phone || merged.customerPhone || '';
+          const cAddr = merged.address || merged.customerAddress || '';
+          fileDb.upsert("customers", {
+            ...merged,
+            name: cName,
+            phone: cPhone,
+            address: cAddr,
+            ...(isClearingLoc
+              ? { latitude: null, longitude: null, locationAddress: '', locationUpdatedAt: null, locationClearedAt: clearIso }
+              : latVal != null && lngVal != null
+                ? { latitude: latVal, longitude: lngVal, locationAddress: locAddrVal || '', locationUpdatedAt: locUpdVal, locationClearedAt: null }
+                : {}),
+          });
+
+          if (isPgConfigured()) {
+            await executePg(
+              `INSERT INTO customers (id, name, phone, address, list_id, list_name, notes, status, latitude, longitude, location_address, location_updated_at, location_cleared_at, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+               ON CONFLICT (id) DO UPDATE SET
+                 name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+                 phone = COALESCE(EXCLUDED.phone, customers.phone),
+                 address = COALESCE(EXCLUDED.address, customers.address),
+                 list_id = COALESCE(EXCLUDED.list_id, customers.list_id),
+                 list_name = COALESCE(EXCLUDED.list_name, customers.list_name),
+                 notes = COALESCE(EXCLUDED.notes, customers.notes),
+                 status = COALESCE(EXCLUDED.status, customers.status),
+                 latitude = CASE WHEN $15::boolean THEN EXCLUDED.latitude ELSE customers.latitude END,
+                 longitude = CASE WHEN $15::boolean THEN EXCLUDED.longitude ELSE customers.longitude END,
+                 location_address = CASE WHEN $16::boolean THEN EXCLUDED.location_address ELSE COALESCE(EXCLUDED.location_address, customers.location_address) END,
+                 location_updated_at = CASE WHEN $16::boolean THEN EXCLUDED.location_updated_at ELSE COALESCE(EXCLUDED.location_updated_at, customers.location_updated_at) END,
+                 location_cleared_at = CASE WHEN $16::boolean THEN EXCLUDED.location_cleared_at ELSE CASE WHEN EXCLUDED.latitude IS NOT NULL THEN NULL ELSE customers.location_cleared_at END END`,
+              [
+                id,
+                cName,
+                cPhone,
+                cAddr,
+                merged.listId ?? merged.list_id ?? null,
+                merged.listName ?? merged.list_name ?? null,
+                merged.notes ?? '',
+                merged.status ?? 'active',
+                latVal ?? null,
+                lngVal ?? null,
+                locAddrVal ?? null,
+                locUpdVal ?? null,
+                clearIso,
+                merged.createdAt || merged.created_at || new Date().toISOString(),
+                isClearingLoc || (latVal !== undefined && lngVal !== undefined),
+                isClearingLoc,
+              ]
+            ).catch(() => {});
+
+            if (isClearingLoc) {
+              await clearContractAndCustomerLocations(id, clearIso!, cName);
+            } else if (latVal != null && lngVal != null) {
+              await unclearContractLocation(id, cName);
+              await executePg(
+                `UPDATE sales SET latitude = $1, longitude = $2, location_address = COALESCE($3, location_address), location_updated_at = $4, location_cleared_at = NULL
+                 WHERE customer_id = $5 OR id = $5 OR ($6 != '' AND ${pgNormColSql('customer_name')} = $6)`,
+                [latVal, lngVal, locAddrVal ?? null, locUpdVal || new Date().toISOString(), id, normalizeServerName(cName)]
+              ).catch(() => {});
+            }
+          }
           bumpSyncVersion();
           return true;
         }
@@ -7075,11 +7450,21 @@ async function startServer() {
         case 'APPOINTMENT_UPDATE': {
           if (!payload?.id) return true;
           const id = payload.id;
-          const cAt = payload.createdAt || payload.created_at || new Date().toISOString();
+          let existing = (fileDb.get<any>("appointments") || []).find((a: any) => a?.id === id);
+          if (!existing && isPgConfigured()) {
+            const rows = await executePg("SELECT * FROM appointments WHERE id = $1 LIMIT 1", [id]).catch(() => []);
+            if (rows && rows.length > 0) existing = mapAppointmentRow(rows[0]);
+          }
+          const merged = existing ? { ...existing, ...payload, id } : { ...payload, id };
+          const cAt = merged.createdAt || merged.created_at || new Date().toISOString();
+          const uAt = merged.updatedAt || merged.updated_at || new Date().toISOString();
+          const lNotifAt = merged.lastNotifiedAt || merged.last_notified_at || null;
           const apptObj = {
-            ...payload,
+            ...merged,
             id,
-            createdAt: cAt
+            createdAt: cAt,
+            updatedAt: uAt,
+            ...(lNotifAt ? { lastNotifiedAt: lNotifAt } : {}),
           };
           fileDb.upsert("appointments", apptObj);
 
@@ -7089,56 +7474,60 @@ async function startServer() {
               list_id, list_name, appointment_type, recurring_day, recurring_day_name,
               recurring_day_of_month, recurring_month_day_name, appointment_date,
               appointment_time, due_date, due_time, title, notes, note, status,
-              created_by_name, created_by_rep_name, created_by_rep_id, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+              created_by_name, created_by_rep_name, created_by_rep_id, last_notified_at, updated_at, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
             ON CONFLICT (id) DO UPDATE SET
-              contract_id = EXCLUDED.contract_id,
-              customer_name = EXCLUDED.customer_name,
-              customer_phone = EXCLUDED.customer_phone,
-              customer_address = EXCLUDED.customer_address,
-              list_id = EXCLUDED.list_id,
-              list_name = EXCLUDED.list_name,
-              appointment_type = EXCLUDED.appointment_type,
-              recurring_day = EXCLUDED.recurring_day,
-              recurring_day_name = EXCLUDED.recurring_day_name,
-              recurring_day_of_month = EXCLUDED.recurring_day_of_month,
-              recurring_month_day_name = EXCLUDED.recurring_month_day_name,
-              appointment_date = EXCLUDED.appointment_date,
-              appointment_time = EXCLUDED.appointment_time,
-              due_date = EXCLUDED.due_date,
-              due_time = EXCLUDED.due_time,
-              title = EXCLUDED.title,
-              notes = EXCLUDED.notes,
-              note = EXCLUDED.note,
-              status = EXCLUDED.status,
-              created_by_name = EXCLUDED.created_by_name,
-              created_by_rep_name = EXCLUDED.created_by_rep_name,
-              created_by_rep_id = EXCLUDED.created_by_rep_id
+              contract_id = COALESCE(EXCLUDED.contract_id, appointments.contract_id),
+              customer_name = COALESCE(NULLIF(EXCLUDED.customer_name, ''), appointments.customer_name),
+              customer_phone = COALESCE(NULLIF(EXCLUDED.customer_phone, ''), appointments.customer_phone),
+              customer_address = COALESCE(NULLIF(EXCLUDED.customer_address, ''), appointments.customer_address),
+              list_id = COALESCE(EXCLUDED.list_id, appointments.list_id),
+              list_name = COALESCE(NULLIF(EXCLUDED.list_name, ''), appointments.list_name),
+              appointment_type = COALESCE(NULLIF(EXCLUDED.appointment_type, ''), appointments.appointment_type),
+              recurring_day = COALESCE(EXCLUDED.recurring_day, appointments.recurring_day),
+              recurring_day_name = COALESCE(NULLIF(EXCLUDED.recurring_day_name, ''), appointments.recurring_day_name),
+              recurring_day_of_month = COALESCE(EXCLUDED.recurring_day_of_month, appointments.recurring_day_of_month),
+              recurring_month_day_name = COALESCE(NULLIF(EXCLUDED.recurring_month_day_name, ''), appointments.recurring_month_day_name),
+              appointment_date = COALESCE(NULLIF(EXCLUDED.appointment_date, ''), appointments.appointment_date),
+              appointment_time = COALESCE(NULLIF(EXCLUDED.appointment_time, ''), appointments.appointment_time),
+              due_date = COALESCE(NULLIF(EXCLUDED.due_date, ''), appointments.due_date),
+              due_time = COALESCE(NULLIF(EXCLUDED.due_time, ''), appointments.due_time),
+              title = COALESCE(NULLIF(EXCLUDED.title, ''), appointments.title),
+              notes = COALESCE(NULLIF(EXCLUDED.notes, ''), appointments.notes),
+              note = COALESCE(NULLIF(EXCLUDED.note, ''), appointments.note),
+              status = COALESCE(NULLIF(EXCLUDED.status, ''), appointments.status),
+              created_by_name = COALESCE(NULLIF(EXCLUDED.created_by_name, ''), appointments.created_by_name),
+              created_by_rep_name = COALESCE(NULLIF(EXCLUDED.created_by_rep_name, ''), appointments.created_by_rep_name),
+              created_by_rep_id = COALESCE(NULLIF(EXCLUDED.created_by_rep_id, ''), appointments.created_by_rep_id),
+              last_notified_at = COALESCE(EXCLUDED.last_notified_at, appointments.last_notified_at),
+              updated_at = COALESCE(EXCLUDED.updated_at, appointments.updated_at)
           `;
           const vals = [
             id,
-            payload.contractId || payload.contract_id || null,
-            payload.customerName || payload.customer_name || '',
-            payload.customerPhone || payload.customer_phone || '',
-            payload.customerAddress || payload.customer_address || '',
-            payload.listId || payload.list_id || null,
-            payload.listName || payload.list_name || '',
-            payload.appointmentType || payload.appointment_type || 'specific_date',
-            payload.recurringDay != null ? Number(payload.recurringDay) : (payload.recurring_day != null ? Number(payload.recurring_day) : null),
-            payload.recurringDayName || payload.recurring_day_name || '',
-            payload.recurringDayOfMonth != null ? Number(payload.recurringDayOfMonth) : (payload.recurring_day_of_month != null ? Number(payload.recurring_day_of_month) : null),
-            payload.recurringMonthDayName || payload.recurring_month_day_name || '',
-            payload.appointmentDate || payload.appointment_date || '',
-            payload.appointmentTime || payload.appointment_time || '',
-            payload.dueDate || payload.due_date || '',
-            payload.dueTime || payload.due_time || '',
-            payload.title || '',
-            payload.notes || payload.note || '',
-            payload.note || payload.notes || '',
-            payload.status || 'pending',
-            payload.createdByName || payload.created_by_name || '',
-            payload.createdByRepName || payload.created_by_rep_name || '',
-            payload.createdByRepId || payload.created_by_rep_id || '',
+            merged.contractId || merged.contract_id || null,
+            merged.customerName || merged.customer_name || '',
+            merged.customerPhone || merged.customer_phone || '',
+            merged.customerAddress || merged.customer_address || '',
+            merged.listId || merged.list_id || null,
+            merged.listName || merged.list_name || '',
+            merged.appointmentType || merged.appointment_type || 'specific_date',
+            merged.recurringDay != null ? Number(merged.recurringDay) : (merged.recurring_day != null ? Number(merged.recurring_day) : null),
+            merged.recurringDayName || merged.recurring_day_name || '',
+            merged.recurringDayOfMonth != null ? Number(merged.recurringDayOfMonth) : (merged.recurring_day_of_month != null ? Number(merged.recurring_day_of_month) : null),
+            merged.recurringMonthDayName || merged.recurring_month_day_name || '',
+            merged.appointmentDate || merged.appointment_date || '',
+            merged.appointmentTime || merged.appointment_time || '',
+            merged.dueDate || merged.due_date || '',
+            merged.dueTime || merged.due_time || '',
+            merged.title || '',
+            merged.notes || merged.note || '',
+            merged.note || merged.notes || '',
+            merged.status || 'pending',
+            merged.createdByName || merged.created_by_name || '',
+            merged.createdByRepName || merged.created_by_rep_name || '',
+            merged.createdByRepId || merged.created_by_rep_id || '',
+            lNotifAt,
+            uAt,
             cAt
           ];
           await executePg(query, vals).catch((err) => console.warn("Error inserting appointment in sync:", err));
@@ -7218,6 +7607,7 @@ async function startServer() {
           employeeTxRows,
           conflictsRows,
           appointmentsRows,
+          repLocationsRows,
           deletedRows,
         ] = await Promise.all([
           executePg(`
@@ -7302,6 +7692,12 @@ async function startServer() {
             SELECT * FROM appointments 
             WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = appointments.id AND (dr.table_name = 'appointments' OR dr.table_name = 'unknown'))
             ORDER BY created_at DESC
+          `).catch(() => []),
+          executePg(`
+            SELECT rl.*, r.name as current_rep_name, r.phone as rep_phone, r.avatar_url
+            FROM rep_locations rl
+            LEFT JOIN reps r ON r.id = rl.rep_id
+            ORDER BY rl.updated_at DESC
           `).catch(() => []),
           executePg(`SELECT record_id, table_name FROM deleted_records ORDER BY deleted_at DESC LIMIT 5000`).catch(() => []),
         ]);
@@ -7429,6 +7825,7 @@ async function startServer() {
           employeeTransactions,
           paymentConflicts,
           appointments,
+          repLocations: repLocationsRows || [],
           deletedRecordIds,
           clearedLocationContractIds: Array.from(clearedLocationSet),
         });
@@ -7450,6 +7847,7 @@ async function startServer() {
         employeeTransactions: fileDb.get("employee_transactions") || [],
         paymentConflicts: fileDb.get("payment_conflicts") || [],
         appointments: fileDb.get("appointments") || [],
+        repLocations: fileDb.get("rep_locations") || [],
         deletedRecordIds: [],
       });
     } catch (err: any) {
@@ -7488,14 +7886,31 @@ async function startServer() {
 
       for (const act of actions) {
         const targetId = act?.payload?.id || (typeof act?.payload === 'string' ? act?.payload : null);
-        const isDelete = act?.type?.startsWith('DELETE_');
+        const isDelete = act?.type?.startsWith('DELETE_') || act?.type?.endsWith('_DELETE');
+        const isApptDelete = act?.type === 'DELETE_APPOINTMENT' || act?.type === 'APPOINTMENT_DELETE';
 
         // Enforce RBAC for destructive batch actions
         if (isDelete && req.authUser?.role !== 'admin') {
           if (act?.type === 'DELETE_FUND' || act?.type === 'DELETE_REP' || act?.type === 'DELETE_EMPLOYEE' || act?.type === 'DELETE_CUSTOMER_LIST') {
             continue;
           }
-          if (!req.authUser?.canDelete) {
+          if (isApptDelete) {
+            const hasPriv = req.authUser?.role === 'supervisor' || req.authUser?.canDelete;
+            if (!hasPriv && targetId) {
+              let existingAppt: any = (fileDb.get<any>("appointments") || []).find((a: any) => a?.id === targetId);
+              if (!existingAppt && isPgConfigured()) {
+                const rows = await executePg("SELECT created_by_rep_id, created_by_rep_name, created_by_name FROM appointments WHERE id = $1 LIMIT 1", [targetId]).catch(() => []);
+                if (rows && rows.length > 0) existingAppt = mapAppointmentRow(rows[0]);
+              }
+              const isOwner =
+                existingAppt &&
+                ((existingAppt.createdByRepId && req.authUser?.repId && existingAppt.createdByRepId === req.authUser.repId) ||
+                  (req.authUser?.repName &&
+                    (normalizeServerName(existingAppt.createdByRepName) === normalizeServerName(req.authUser.repName) ||
+                      normalizeServerName(existingAppt.createdByName) === normalizeServerName(req.authUser.repName))));
+              if (!isOwner) continue;
+            }
+          } else if (!req.authUser?.canDelete) {
             continue;
           }
         }

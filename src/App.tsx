@@ -424,7 +424,6 @@ export default function App() {
       );
 
       setToastMessage(isAr ? 'تم حفظ الموعد بنجاح' : 'Appointment saved successfully');
-      loadAppointments();
     } catch (e) {
       console.error('Error saving appointment:', e);
     }
@@ -435,7 +434,6 @@ export default function App() {
       await deleteAppointmentFromPostgres(id);
       setAppointments((prev) => prev.filter((a) => a.id !== id));
       setToastMessage(isAr ? 'تم حذف الموعد' : 'Appointment deleted');
-      loadAppointments();
     } catch (e) {
       console.error('Error deleting appointment:', e);
     }
@@ -447,7 +445,6 @@ export default function App() {
       setAppointments((prev) =>
         prev.map((a) => (a.id === id ? { ...a, ...updates } : a))
       );
-      loadAppointments();
     } catch (e) {
       console.error('Error updating appointment:', e);
     }
@@ -1328,8 +1325,26 @@ export default function App() {
       if (!isPinUnlocked || !currentRepRef.current) return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
-      const session = getAuthSession();
-      if (!session?.token || session.offlinePendingExchange || session.token === 'offline_pending') return;
+      let session = getAuthSession();
+      if (!session?.token || session.offlinePendingExchange || session.token === 'offline_pending') {
+        const exchanged = await retryPendingJwtExchangeNow().catch(() => false);
+        session = getAuthSession();
+        if (!exchanged && (!session?.token || session.offlinePendingExchange || session.token === 'offline_pending')) {
+          if (!cancelled) {
+            clearAuthSession();
+            try {
+              localStorage.removeItem('sami_app_pin_unlocked');
+              sessionStorage.removeItem('sami_app_pin_unlocked');
+            } catch (e) {}
+            setIsPinUnlocked(false);
+            setCurrentRep(null);
+            showToast(
+              isAr ? 'يرجى إدخال الرمز السري لتفعيل المزامنة مع السيرفر' : 'Please enter your PIN to activate server sync'
+            );
+          }
+          return;
+        }
+      }
       try {
         const res = await fetchWithFallback(
           '/api/auth/verify',
