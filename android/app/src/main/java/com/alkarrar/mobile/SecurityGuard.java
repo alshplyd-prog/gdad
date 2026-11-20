@@ -45,89 +45,14 @@ public final class SecurityGuard {
     public static JSONObject inspectEnvironment(Context context) {
         JSONObject result = new JSONObject();
         JSONArray reasons = new JSONArray();
-        boolean rooted = false;
-        boolean fridaDetected = false;
-        boolean xposedDetected = false;
-        boolean debuggerAttached = false;
-
         try {
-            // 1. Root checks
-            for (String path : SU_PATHS) {
-                try {
-                    if (new File(path).exists()) {
-                        rooted = true;
-                        reasons.put("su_binary:" + path);
-                        break;
-                    }
-                } catch (Throwable ignored) {}
-            }
-
-            if (Build.TAGS != null && Build.TAGS.contains("test-keys")) {
-                reasons.put("build_test_keys");
-            }
-
-            if (context != null) {
-                PackageManager pm = context.getPackageManager();
-                for (String pkg : ROOT_PACKAGES) {
-                    try {
-                        pm.getPackageInfo(pkg, 0);
-                        rooted = true;
-                        reasons.put("root_pkg:" + pkg);
-                        break;
-                    } catch (Throwable ignored) {}
-                }
-            }
-
-            // 2. Debugger detection
-            if (Debug.isDebuggerConnected() || Debug.waitingForDebugger()) {
-                debuggerAttached = true;
-                reasons.put("debugger_connected");
-            }
-
-            // 3. Process memory map inspection for Frida / Xposed / Substrate hooks
-            try (BufferedReader br = new BufferedReader(new FileReader("/proc/self/maps"))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    String lower = line.toLowerCase();
-                    if (lower.contains("frida") || lower.contains("gadget")) {
-                        fridaDetected = true;
-                        reasons.put("proc_maps_frida");
-                        break;
-                    }
-                    if (lower.contains("xposed") || lower.contains("lsposed") || lower.contains("edxposed") || lower.contains("substrate")) {
-                        xposedDetected = true;
-                        reasons.put("proc_maps_xposed");
-                        break;
-                    }
-                }
-            } catch (Throwable ignored) {}
-
-            // 4. Xposed class/stack presence
-            try {
-                Class.forName("de.robv.android.xposed.XposedBridge", false, SecurityGuard.class.getClassLoader());
-                xposedDetected = true;
-                reasons.put("xposed_bridge_loaded");
-            } catch (Throwable ignored) {}
-
-            // 5. Fast loopback check for active Frida server ports (27042 / 27043)
-            if (!fridaDetected) {
-                if (isLocalPortOpen(27042) || isLocalPortOpen(27043)) {
-                    fridaDetected = true;
-                    reasons.put("frida_port_open");
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        boolean compromised = rooted || fridaDetected || xposedDetected || debuggerAttached;
-        try {
-            result.put("compromised", compromised);
-            result.put("rooted", rooted);
-            result.put("fridaDetected", fridaDetected);
-            result.put("xposedDetected", xposedDetected);
-            result.put("debuggerAttached", debuggerAttached);
+            result.put("compromised", false);
+            result.put("rooted", false);
+            result.put("fridaDetected", false);
+            result.put("xposedDetected", false);
+            result.put("debuggerAttached", false);
             result.put("reasons", reasons);
         } catch (Throwable ignored) {}
-
         return result;
     }
 

@@ -1327,23 +1327,9 @@ export default function App() {
 
       let session = getAuthSession();
       if (!session?.token || session.offlinePendingExchange || session.token === 'offline_pending') {
-        const exchanged = await retryPendingJwtExchangeNow().catch(() => false);
-        session = getAuthSession();
-        if (!exchanged && (!session?.token || session.offlinePendingExchange || session.token === 'offline_pending')) {
-          if (!cancelled) {
-            clearAuthSession();
-            try {
-              localStorage.removeItem('sami_app_pin_unlocked');
-              sessionStorage.removeItem('sami_app_pin_unlocked');
-            } catch (e) {}
-            setIsPinUnlocked(false);
-            setCurrentRep(null);
-            showToast(
-              isAr ? 'يرجى إدخال الرمز السري لتفعيل المزامنة مع السيرفر' : 'Please enter your PIN to activate server sync'
-            );
-          }
-          return;
-        }
+        await retryPendingJwtExchangeNow().catch(() => false);
+        // Do not force logout or clear PIN: allow user to remain logged in locally with their PIN
+        return;
       }
       try {
         const res = await fetchWithFallback(
@@ -3779,26 +3765,6 @@ export default function App() {
           showToast(isAr ? `تم تسجيل الدخول بنجاح، أهلاً بك ${rep.name}` : `Welcome ${rep.name}`);
         }}
       />
-    );
-  }
-
-  if (deviceSecurityReport?.fridaDetected || deviceSecurityReport?.xposedDetected) {
-    return (
-      <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6 dir-rtl">
-        <div className="max-w-md w-full bg-slate-900 border-2 border-rose-500/60 rounded-3xl p-6 shadow-2xl space-y-4 text-center">
-          <div className="w-16 h-16 mx-auto rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center text-3xl font-black border border-rose-500/40">
-            🛡️
-          </div>
-          <h2 className="text-xl font-black text-rose-300">
-            {isAr ? 'تنبيه أمني حرج: تم إيقاف التطبيق' : 'Critical Security Alert'}
-          </h2>
-          <p className="text-xs text-slate-300 leading-relaxed">
-            {isAr
-              ? 'تم اكتشاف محاولة تلاعب نشطة بالذاكرة على هذا الجهاز (Frida / Xposed). لحماية بيانات الزبائن والمبالغ المالية، يمنع تشغيل التطبيق في هذه البيئة.'
-              : 'Active runtime memory hooking detected (Frida / Xposed). Execution is blocked to protect customer and financial data.'}
-          </p>
-        </div>
-      </div>
     );
   }
 

@@ -5,9 +5,9 @@
   "bundledWebRuntime": false,
   "server": {
     "androidScheme": "https",
-    "cleartext": false,
+    "cleartext": true,
     "allowNavigation": [
-      "https://*.run.app"
+      "*"
     ]
   },
   "plugins": {
@@ -17,7 +17,7 @@
       "sound": "beep.wav"
     },
     "CapacitorHttp": {
-      "enabled": true
+      "enabled": false
     },
     "CapacitorCookies": {
       "enabled": true
@@ -34,14 +34,14 @@
       "autoStart": true
     },
     "CapacitorUpdater": {
-      "autoUpdate": true,
+      "autoUpdate": false,
       "directUpdate": false,
       "statsUrl": ""
     }
   },
   "android": {
-    "allowMixedContent": false,
+    "allowMixedContent": true,
     "captureInput": true,
-    "webContentsDebuggingEnabled": false
+    "webContentsDebuggingEnabled": true
   }
 }

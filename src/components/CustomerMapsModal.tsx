@@ -82,11 +82,12 @@ const LocationSearchBar: React.FC<LocationSearchBarProps> = React.memo(({
 }) => {
   const [localText, setLocalText] = useState(value);
   const isComposingRef = useRef(false);
+  const isFocusedRef = useRef(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Sync with external clear
+  // Sync only on external programmatic clear when user is not focused/typing
   useEffect(() => {
-    if (value !== localText && !isComposingRef.current) {
+    if (!isFocusedRef.current && !isComposingRef.current && value !== localText) {
       setLocalText(value);
     }
   }, [value]);
@@ -129,6 +130,15 @@ const LocationSearchBar: React.FC<LocationSearchBarProps> = React.memo(({
       <input
         type="text"
         value={localText}
+        onFocus={() => {
+          isFocusedRef.current = true;
+        }}
+        onBlur={() => {
+          isFocusedRef.current = false;
+        }}
+        onTouchStart={() => {
+          isFocusedRef.current = true;
+        }}
         onChange={handleChange}
         onCompositionStart={handleCompositionStart}
         onCompositionEnd={handleCompositionEnd}
@@ -504,22 +514,32 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     } catch (e) {}
   }, []);
 
-  // Apply CSS custom properties directly on mapViewportRef (0 React re-renders):
+  // Apply rotation directly to mapRotationWrapperRef and CSS variables (0 React re-renders):
   // - Heading-Up (default): map rotates by -headingDeg, pins & user root counter-rotate by +headingDeg => pins & user arrow stay 0deg UP!
   // - North-Up (optional toggle): map stays 0deg, pins stay 0deg, user arrow rotates to +headingDeg.
   const syncRotationCssVars = useCallback((headingDeg: number) => {
     const viewportEl = mapViewportRef.current;
-    if (viewportEl) {
-      if (isHeadingUpRef.current) {
-        viewportEl.style.setProperty('--map-rot', `${-headingDeg}deg`);
-        viewportEl.style.setProperty('--counter-rotate', `${headingDeg}deg`);
-        viewportEl.style.setProperty('--user-arrow-rel-rot', '0deg');
-      } else {
-        viewportEl.style.setProperty('--map-rot', '0deg');
-        viewportEl.style.setProperty('--counter-rotate', '0deg');
-        viewportEl.style.setProperty('--user-arrow-rel-rot', `${headingDeg}deg`);
-      }
+    const wrapperEl = mapRotationWrapperRef.current;
+    const isHeading = isHeadingUpRef.current;
+    const mapRotDeg = isHeading ? -headingDeg : 0;
+    const counterRotDeg = isHeading ? headingDeg : 0;
+    const arrowRelDeg = isHeading ? 0 : headingDeg;
+
+    if (wrapperEl) {
+      wrapperEl.style.transform = `translate(-50%, -50%) rotate(${mapRotDeg}deg)`;
     }
+
+    if (viewportEl) {
+      viewportEl.style.setProperty('--map-rot', `${mapRotDeg}deg`);
+      viewportEl.style.setProperty('--counter-rotate', `${counterRotDeg}deg`);
+      viewportEl.style.setProperty('--user-arrow-rel-rot', `${arrowRelDeg}deg`);
+    }
+
+    if (typeof document !== 'undefined') {
+      document.documentElement.style.setProperty('--counter-rotate', `${counterRotDeg}deg`);
+      document.documentElement.style.setProperty('--user-arrow-rel-rot', `${arrowRelDeg}deg`);
+    }
+
     if (headingDegreeTextRef.current) {
       headingDegreeTextRef.current.textContent = `${headingDeg}°`;
     }

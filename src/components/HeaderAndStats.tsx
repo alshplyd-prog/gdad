@@ -1313,6 +1313,9 @@ export const HeaderAndStats: React.FC<HeaderAndStatsProps> = ({
                 onFocus={() => {
                   isSearchFocusedRef.current = true;
                 }}
+                onTouchStart={() => {
+                  isSearchFocusedRef.current = true;
+                }}
                 onBlur={() => {
                   isSearchFocusedRef.current = false;
                 }}

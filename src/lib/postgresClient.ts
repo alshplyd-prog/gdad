@@ -868,8 +868,11 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
   return contractsList.map((c) => {
     const cClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? null;
     const cUpdatedAt = c.locationUpdatedAt ?? c.location_updated_at ?? null;
+    const cNameNorm = normName(c.customerName || '');
     const isContractCleared = Boolean(
       (c.id && deletedSet.has(`loc_clear_${c.id}`)) ||
+      (c.customerId && deletedSet.has(`loc_clear_${c.customerId}`)) ||
+      (cNameNorm && deletedSet.has(`loc_clear_name_${cNameNorm}`)) ||
       (cClearedAt && (!cUpdatedAt || String(cClearedAt) >= String(cUpdatedAt)))
     );
 
@@ -890,15 +893,16 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
     let locUpdated = cUpdatedAt;
 
     if (lat == null || isNaN(Number(lat)) || Number(lat) === 0) {
-      const cNameNorm = normName(c.customerName || '');
       const matchedCust = (c.customerId && custMap.get(String(c.customerId).trim())) ||
                           (cNameNorm && custMap.get(cNameNorm)) ||
                           (c.id && custMap.get(String(c.id).trim()));
       if (matchedCust) {
         const custClearedAt = matchedCust.locationClearedAt ?? matchedCust.location_cleared_at ?? null;
         const custUpdatedAt = matchedCust.locationUpdatedAt ?? matchedCust.location_updated_at ?? null;
+        const matchedCustNameNorm = normName(matchedCust.name || matchedCust.customerName || '');
         const isCustCleared = Boolean(
           (matchedCust.id && deletedSet.has(`loc_clear_${matchedCust.id}`)) ||
+          (matchedCustNameNorm && deletedSet.has(`loc_clear_name_${matchedCustNameNorm}`)) ||
           (custClearedAt && (!custUpdatedAt || String(custClearedAt) >= String(custUpdatedAt)))
         );
         if (!isCustCleared) {

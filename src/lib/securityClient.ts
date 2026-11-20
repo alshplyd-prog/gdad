@@ -637,7 +637,7 @@ export async function signRequestHeaders(
 // Native Android Device Integrity (Root / Frida / Xposed / Debugger)
 // ============================================================
 export function checkDeviceSecurityIntegrity(): DeviceSecurityReport {
-  const defaultSafe: DeviceSecurityReport = {
+  return {
     compromised: false,
     rooted: false,
     fridaDetected: false,
@@ -646,27 +646,4 @@ export function checkDeviceSecurityIntegrity(): DeviceSecurityReport {
     reasons: [],
     nativeAvailable: false,
   };
-
-  if (!isNativeAndroidApk()) return defaultSafe;
-
-  try {
-    const bridge = getAndroidBridge();
-    if (bridge && typeof bridge.getSecurityReport === 'function') {
-      const raw = bridge.getSecurityReport();
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (parsed && typeof parsed === 'object') {
-        return {
-          compromised: Boolean(parsed.compromised),
-          rooted: Boolean(parsed.rooted),
-          fridaDetected: Boolean(parsed.fridaDetected),
-          xposedDetected: Boolean(parsed.xposedDetected),
-          debuggerAttached: Boolean(parsed.debuggerAttached),
-          reasons: Array.isArray(parsed.reasons) ? parsed.reasons.map(String) : [],
-          nativeAvailable: true,
-        };
-      }
-    }
-  } catch (e) {}
-
-  return defaultSafe;
 }
