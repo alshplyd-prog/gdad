@@ -123,6 +123,8 @@ export async function initializeDatabaseSchema() {
         DO $$ BEGIN
           ALTER TABLE customer_lists ALTER COLUMN fund_id DROP NOT NULL;
         EXCEPTION WHEN others THEN NULL; END $$;
+        ALTER TABLE customer_lists ADD COLUMN IF NOT EXISTS order_index INTEGER DEFAULT 0;
+        ALTER TABLE customer_lists ADD COLUMN IF NOT EXISTS receipt_template TEXT DEFAULT 'template_1';
 
         CREATE TABLE IF NOT EXISTS cash_funds (
           id TEXT PRIMARY KEY,
@@ -245,6 +247,9 @@ export async function initializeDatabaseSchema() {
           rep_name TEXT,
           created_at TEXT NOT NULL
         );
+        ALTER TABLE fund_transactions ADD COLUMN IF NOT EXISTS target_fund_id TEXT;
+        ALTER TABLE fund_transactions ADD COLUMN IF NOT EXISTS note TEXT;
+        ALTER TABLE fund_transactions ADD COLUMN IF NOT EXISTS description TEXT;
 
         CREATE TABLE IF NOT EXISTS employees (
           id TEXT PRIMARY KEY,
@@ -259,6 +264,12 @@ export async function initializeDatabaseSchema() {
           rep_id TEXT,
           created_at TEXT
         );
+        ALTER TABLE employees ADD COLUMN IF NOT EXISTS job_title TEXT;
+        ALTER TABLE employees ADD COLUMN IF NOT EXISTS position TEXT;
+        ALTER TABLE employees ADD COLUMN IF NOT EXISTS debt_balance DOUBLE PRECISION DEFAULT 0;
+        ALTER TABLE employees ADD COLUMN IF NOT EXISTS total_debt DOUBLE PRECISION DEFAULT 0;
+        ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_rep BOOLEAN DEFAULT FALSE;
+        ALTER TABLE employees ADD COLUMN IF NOT EXISTS rep_id TEXT;
 
         CREATE TABLE IF NOT EXISTS employee_transactions (
           id TEXT PRIMARY KEY,
@@ -273,6 +284,9 @@ export async function initializeDatabaseSchema() {
           employee_name TEXT,
           created_at TEXT NOT NULL
         );
+        ALTER TABLE employee_transactions ADD COLUMN IF NOT EXISTS notes TEXT;
+        ALTER TABLE employee_transactions ADD COLUMN IF NOT EXISTS note TEXT;
+        ALTER TABLE employee_transactions ADD COLUMN IF NOT EXISTS date TEXT;
         ALTER TABLE employee_transactions ADD COLUMN IF NOT EXISTS employee_name TEXT;
 
         CREATE TABLE IF NOT EXISTS reps (
@@ -815,82 +829,422 @@ async function migrateFileDbToPostgres(client: any) {
   const dataDir = path.join(process.cwd(), 'data');
   if (!fs.existsSync(dataDir)) return;
 
-  const readJson = (filename: string) => {
+  const readJson = (filename: string): any[] => {
     try {
       const p = path.join(dataDir, filename);
       if (fs.existsSync(p)) {
-        return JSON.parse(fs.readFileSync(p, 'utf-8')) || [];
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        return Array.isArray(parsed) ? parsed : [];
       }
-    } catch (e) {
+    } catch {
       // ignore
     }
     return [];
   };
 
-  // 1. Contracts / Customers (Empty by default - contracts only added by user)
-  // No test or dummy contracts are migrated or seeded
-
-  // 2. Customer Lists
   const customerLists = readJson('customer_lists.json');
-  for (const l of customerLists) {
-    if (!l.id) continue;
-    await client.query(
-      `INSERT INTO customer_lists (id, name, fund_id, description, created_at)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, fund_id = EXCLUDED.fund_id`,
-      [l.id, l.name || '', l.fundId || null, l.description || '', l.createdAt || new Date().toISOString()]
-    );
-  }
-
-  // 3. Inventory Items
   const inventoryItems = readJson('inventory_items.json');
-  for (const item of inventoryItems) {
-    if (!item.id) continue;
-    const vals = [
-      item.id,
-      item.name || '',
-      Number(item.price ?? item.sellingPrice) || 0,
-      Number(item.purchasePrice) || 0,
-      Number(item.quantity) || 0,
-      Number(item.dailyInstallment) || 0,
-      item.category || ''
-    ];
-    await client.query(
-      `INSERT INTO inventory_items (id, name, price, purchase_price, quantity, daily_installment, category)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price, quantity=EXCLUDED.quantity`,
-      vals
-    );
-  }
-
-  // 4. Cash Funds
   const cashFunds = readJson('cash_funds.json');
-  for (const f of cashFunds) {
-    if (!f.id) continue;
-    const vals = [f.id, f.name || '', Number(f.balance) || 0, f.description || ''];
-    await client.query(
-      `INSERT INTO cash_funds (id, name, balance, description) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance, name = EXCLUDED.name`,
-      vals
-    );
-  }
-
-  // 5. Sales Representatives
   const reps = readJson('reps.json');
-  for (const r of reps) {
-    if (!r.id) continue;
-    const allowed = Array.isArray(r.allowedListIds) ? JSON.stringify(r.allowedListIds) : JSON.stringify(['all']);
-    const vals = [r.id, r.name || '', r.phone || '', r.code || '', r.role || 'rep', r.canEdit !== false, Boolean(r.canDelete), r.canMoveCustomer !== false, r.canSell !== false, allowed];
-    await client.query(
-      `INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, phone = EXCLUDED.phone, code = EXCLUDED.code`,
-      vals
-    );
+  const employees = readJson('employees.json');
+  const employeeTransactions = readJson('employee_transactions.json');
+  const appointments = readJson('appointments.json');
+  const paymentConflicts = readJson('payment_conflicts.json');
+  const fundTransactions = readJson('fund_transactions.json');
+  const payments = readJson('payments.json');
+  const contracts = readJson('contracts.json');
+  const deletedRecords = readJson('deleted_records.json');
+
+  const hasAuthoritativeFileData =
+    contracts.length > 0 ||
+    payments.length > 0 ||
+    fundTransactions.length > 0 ||
+    cashFunds.length > 0 ||
+    reps.length > 0;
+
+  if (!hasAuthoritativeFileData) {
+    return;
   }
 
-  // 6. Payments (Empty by default - payments only created upon real installment collection)
-  // No test or dummy payments are migrated or seeded
+  await client.query('BEGIN');
+  try {
+    await client.query(`SELECT pg_advisory_xact_lock(987654321)`);
+    await client.query(`SELECT set_config('app.current_role', 'system', true)`);
 
-  console.log('Migrated all local FileDB records into PostgreSQL successfully.');
+    // Re-check inside lock so concurrent startups never duplicate or truncate twice
+    const alreadyDone = await client.query(`SELECT value FROM system_settings WHERE key = 'schema_init_completed' LIMIT 1`);
+    if (alreadyDone.rows.length > 0) {
+      await client.query('COMMIT');
+      return;
+    }
+
+    // Clear stale prototype seed records before loading the authoritative FileDB dataset
+    await client.query(`
+      TRUNCATE TABLE
+        sales,
+        payments,
+        fund_transactions,
+        cash_funds,
+        customer_lists,
+        inventory_items,
+        reps,
+        employees,
+        employee_transactions,
+        appointments,
+        payment_conflicts,
+        customers
+      CASCADE
+    `);
+
+    for (const l of customerLists) {
+      if (!l?.id) continue;
+      await client.query(
+        `INSERT INTO customer_lists (id, name, fund_id, description, order_index, receipt_template, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           fund_id = EXCLUDED.fund_id,
+           description = EXCLUDED.description,
+           order_index = EXCLUDED.order_index,
+           receipt_template = EXCLUDED.receipt_template`,
+        [
+          String(l.id),
+          l.name || '',
+          l.fundId || null,
+          l.description || '',
+          Number(l.orderIndex ?? l.order_index ?? 0) || 0,
+          l.receiptTemplate || l.receipt_template || 'template_1',
+          l.createdAt || new Date().toISOString(),
+        ]
+      );
+    }
+
+    for (const item of inventoryItems) {
+      if (!item?.id) continue;
+      await client.query(
+        `INSERT INTO inventory_items (id, name, price, purchase_price, quantity, daily_installment, category)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           price = EXCLUDED.price,
+           purchase_price = EXCLUDED.purchase_price,
+           quantity = EXCLUDED.quantity,
+           daily_installment = EXCLUDED.daily_installment,
+           category = EXCLUDED.category`,
+        [
+          String(item.id),
+          item.name || '',
+          Number(item.price ?? item.sellingPrice) || 0,
+          Number(item.purchasePrice) || 0,
+          Number(item.quantity) || 0,
+          Number(item.dailyInstallment) || 0,
+          item.category || '',
+        ]
+      );
+    }
+
+    for (const f of cashFunds) {
+      if (!f?.id) continue;
+      await client.query(
+        `INSERT INTO cash_funds (id, name, balance, description, order_index)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (id) DO UPDATE SET
+           balance = EXCLUDED.balance,
+           name = EXCLUDED.name,
+           description = EXCLUDED.description,
+           order_index = EXCLUDED.order_index`,
+        [
+          String(f.id),
+          f.name || '',
+          Number(f.balance) || 0,
+          f.description || '',
+          Number(f.orderIndex ?? f.order_index ?? 0) || 0,
+        ]
+      );
+    }
+
+    for (const r of reps) {
+      if (!r?.id) continue;
+      const allowed = Array.isArray(r.allowedListIds)
+        ? JSON.stringify(r.allowedListIds)
+        : (typeof r.allowedListIds === 'string' ? r.allowedListIds : JSON.stringify(['all']));
+      await client.query(
+        `INSERT INTO reps (id, name, phone, code, pin_version, offline_verifier, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids, avatar_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           phone = EXCLUDED.phone,
+           code = EXCLUDED.code,
+           pin_version = COALESCE(EXCLUDED.pin_version, reps.pin_version),
+           offline_verifier = COALESCE(EXCLUDED.offline_verifier, reps.offline_verifier),
+           role = EXCLUDED.role,
+           can_edit = EXCLUDED.can_edit,
+           can_delete = EXCLUDED.can_delete,
+           can_move_customer = EXCLUDED.can_move_customer,
+           can_sell = EXCLUDED.can_sell,
+           allowed_list_ids = EXCLUDED.allowed_list_ids,
+           avatar_url = COALESCE(EXCLUDED.avatar_url, reps.avatar_url)`,
+        [
+          String(r.id),
+          r.name || '',
+          r.phone || '',
+          r.code || '',
+          r.pinVersion || r.pin_version || null,
+          r.offlineVerifier || r.offline_verifier || null,
+          r.role || 'rep',
+          r.canEdit !== false,
+          Boolean(r.canDelete),
+          r.canMoveCustomer !== false,
+          r.canSell !== false,
+          allowed,
+          r.avatarUrl || r.avatar_url || null,
+        ]
+      );
+    }
+
+    for (const emp of employees) {
+      if (!emp?.id) continue;
+      await client.query(
+        `INSERT INTO employees (id, name, phone, job_title, position, salary, debt_balance, total_debt, is_rep, rep_id, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           phone = EXCLUDED.phone,
+           job_title = EXCLUDED.job_title,
+           position = EXCLUDED.position,
+           salary = EXCLUDED.salary,
+           debt_balance = EXCLUDED.debt_balance,
+           total_debt = EXCLUDED.total_debt`,
+        [
+          String(emp.id),
+          emp.name || '',
+          emp.phone || '',
+          emp.jobTitle || emp.job_title || '',
+          emp.position || '',
+          Number(emp.salary) || 0,
+          Number(emp.debtBalance ?? emp.debt_balance) || 0,
+          Number(emp.totalDebt ?? emp.total_debt) || 0,
+          Boolean(emp.isRep ?? emp.is_rep),
+          emp.repId || emp.rep_id || null,
+          emp.createdAt || emp.created_at || new Date().toISOString(),
+        ]
+      );
+    }
+
+    for (const tx of employeeTransactions) {
+      if (!tx?.id) continue;
+      await client.query(
+        `INSERT INTO employee_transactions (id, employee_id, fund_id, type, amount, notes, note, date, rep_name, employee_name, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          String(tx.id),
+          String(tx.employeeId || tx.employee_id || ''),
+          String(tx.fundId || tx.fund_id || ''),
+          tx.type || 'advance',
+          Number(tx.amount) || 0,
+          tx.notes || '',
+          tx.note || tx.notes || '',
+          tx.date || '',
+          tx.repName || tx.rep_name || '',
+          tx.employeeName || tx.employee_name || '',
+          tx.createdAt || tx.created_at || new Date().toISOString(),
+        ]
+      );
+    }
+
+    for (const a of appointments) {
+      if (!a?.id) continue;
+      await client.query(
+        `INSERT INTO appointments (id, contract_id, customer_name, customer_phone, customer_address, list_id, list_name, appointment_type, recurring_day, recurring_day_name, recurring_day_of_month, recurring_month_day_name, appointment_date, appointment_time, due_date, due_time, title, notes, note, status, created_by_name, created_by_rep_name, created_by_rep_id, last_notified_at, updated_at, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          String(a.id),
+          a.contractId || a.contract_id || null,
+          a.customerName || a.customer_name || '',
+          a.customerPhone || a.customer_phone || '',
+          a.customerAddress || a.customer_address || '',
+          a.listId || a.list_id || null,
+          a.listName || a.list_name || null,
+          a.appointmentType || a.appointment_type || 'specific_date',
+          a.recurringDay ?? a.recurring_day ?? null,
+          a.recurringDayName || a.recurring_day_name || null,
+          a.recurringDayOfMonth ?? a.recurring_day_of_month ?? null,
+          a.recurringMonthDayName || a.recurring_month_day_name || null,
+          a.appointmentDate || a.appointment_date || null,
+          a.appointmentTime || a.appointment_time || null,
+          a.dueDate || a.due_date || null,
+          a.dueTime || a.due_time || null,
+          a.title || '',
+          a.notes || '',
+          a.note || a.notes || '',
+          a.status || 'pending',
+          a.createdByName || a.created_by_name || '',
+          a.createdByRepName || a.created_by_rep_name || '',
+          a.createdByRepId || a.created_by_rep_id || '',
+          a.lastNotifiedAt || a.last_notified_at || null,
+          a.updatedAt || a.updated_at || null,
+          a.createdAt || a.created_at || new Date().toISOString(),
+        ]
+      );
+    }
+
+    for (const pc of paymentConflicts) {
+      if (!pc?.id) continue;
+      await client.query(
+        `INSERT INTO payment_conflicts (id, contract_id, customer_name, attempted_amount, actual_remaining_balance, excess_amount, rep_name, note, payment_date, created_at, status, resolved_by, resolved_at, resolution_note, accepted_amount)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          String(pc.id),
+          pc.contractId || pc.contract_id || null,
+          pc.customerName || pc.customer_name || '',
+          Number(pc.attemptedAmount ?? pc.attempted_amount) || 0,
+          Number(pc.actualRemainingBalance ?? pc.actual_remaining_balance) || 0,
+          Number(pc.excessAmount ?? pc.excess_amount) || 0,
+          pc.repName || pc.rep_name || '',
+          pc.note || '',
+          pc.paymentDate || pc.payment_date || '',
+          pc.createdAt || pc.created_at || new Date().toISOString(),
+          pc.status || 'pending_review',
+          pc.resolvedBy || pc.resolved_by || null,
+          pc.resolvedAt || pc.resolved_at || null,
+          pc.resolutionNote || pc.resolution_note || null,
+          Number(pc.acceptedAmount ?? pc.accepted_amount) || 0,
+        ]
+      );
+    }
+
+    const validFt = fundTransactions.filter((ft) => ft?.id);
+    if (validFt.length > 0) {
+      await client.query(
+        `INSERT INTO fund_transactions (id, fund_id, target_fund_id, type, amount, note, description, rep_name, created_at)
+         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[], $6::text[], $7::text[], $8::text[], $9::text[])
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          validFt.map((ft) => String(ft.id)),
+          validFt.map((ft) => String(ft.fundId || ft.fund_id || '')),
+          validFt.map((ft) => ft.targetFundId || ft.target_fund_id || null),
+          validFt.map((ft) => ft.type || 'deposit'),
+          validFt.map((ft) => Number(ft.amount) || 0),
+          validFt.map((ft) => ft.note || ''),
+          validFt.map((ft) => ft.description || ft.note || ''),
+          validFt.map((ft) => ft.repName || ft.rep_name || ''),
+          validFt.map((ft) => ft.createdAt || ft.created_at || new Date().toISOString()),
+        ]
+      );
+    }
+
+    // Batch insert payments before sales so trg_sales_recalc runs only once per contract
+    const validPayments = payments.filter((p) => p?.id);
+    if (validPayments.length > 0) {
+      await client.query(
+        `INSERT INTO payments (id, contract_id, customer_name, amount, amount_paid, payment_date, rep_name, note, fund_id, latitude, longitude, updated_at, created_at, is_edited)
+         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::double precision[], $5::double precision[], $6::text[], $7::text[], $8::text[], $9::text[], $10::double precision[], $11::double precision[], $12::text[], $13::text[], $14::boolean[])
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          validPayments.map((p) => String(p.id)),
+          validPayments.map((p) => String(p.contractId || p.contract_id || '')),
+          validPayments.map((p) => p.customerName || p.customer_name || ''),
+          validPayments.map((p) => Number(p.amountPaid ?? p.amount_paid ?? p.amount) || 0),
+          validPayments.map((p) => Number(p.amountPaid ?? p.amount_paid ?? p.amount) || 0),
+          validPayments.map((p) => p.paymentDate || p.payment_date || new Date().toISOString().split('T')[0]),
+          validPayments.map((p) => p.repName || p.rep_name || ''),
+          validPayments.map((p) => p.note || ''),
+          validPayments.map((p) => p.fundId || p.fund_id || null),
+          validPayments.map((p) => (p.latitude != null ? Number(p.latitude) : null)),
+          validPayments.map((p) => (p.longitude != null ? Number(p.longitude) : null)),
+          validPayments.map((p) => p.updatedAt || p.updated_at || null),
+          validPayments.map((p) => p.createdAt || p.created_at || new Date().toISOString()),
+          validPayments.map((p) => Boolean(p.isEdited ?? p.is_edited)),
+        ]
+      );
+    }
+
+    const validContracts = contracts.filter((c) => c?.id);
+    if (validContracts.length > 0) {
+      await client.query(
+        `INSERT INTO sales (
+           id, customer_id, customer_name, customer_phone, customer_address,
+           latitude, longitude, location_address, location_updated_at, location_cleared_at,
+           item_id, item_name, item_quantity, purchase_price,
+           list_id, list_name, total_price, advance_payment,
+           remaining_balance, daily_installment, start_date, notes,
+           status, last_payment_date, total_paid, rep_name,
+           created_at, completed_at, updated_at, is_edited
+         )
+         SELECT * FROM unnest(
+           $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+           $6::double precision[], $7::double precision[], $8::text[], $9::text[], $10::text[],
+           $11::text[], $12::text[], $13::integer[], $14::double precision[],
+           $15::text[], $16::text[], $17::double precision[], $18::double precision[],
+           $19::double precision[], $20::double precision[], $21::text[], $22::text[],
+           $23::text[], $24::text[], $25::double precision[], $26::text[],
+           $27::text[], $28::text[], $29::text[], $30::boolean[]
+         )
+         ON CONFLICT (id) DO UPDATE SET
+           customer_name = EXCLUDED.customer_name,
+           customer_phone = EXCLUDED.customer_phone,
+           customer_address = EXCLUDED.customer_address,
+           list_id = EXCLUDED.list_id,
+           list_name = EXCLUDED.list_name,
+           total_price = EXCLUDED.total_price,
+           advance_payment = EXCLUDED.advance_payment,
+           remaining_balance = EXCLUDED.remaining_balance,
+           total_paid = EXCLUDED.total_paid,
+           status = EXCLUDED.status,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          validContracts.map((c) => String(c.id)),
+          validContracts.map((c) => c.customerId || c.customer_id || null),
+          validContracts.map((c) => c.customerName || c.customer_name || ''),
+          validContracts.map((c) => c.customerPhone || c.customer_phone || ''),
+          validContracts.map((c) => c.customerAddress || c.customer_address || ''),
+          validContracts.map((c) => (c.latitude != null ? Number(c.latitude) : null)),
+          validContracts.map((c) => (c.longitude != null ? Number(c.longitude) : null)),
+          validContracts.map((c) => c.locationAddress || c.location_address || ''),
+          validContracts.map((c) => c.locationUpdatedAt || c.location_updated_at || null),
+          validContracts.map((c) => c.locationClearedAt || c.location_cleared_at || null),
+          validContracts.map((c) => c.itemId || c.item_id || null),
+          validContracts.map((c) => c.itemName || c.item_name || ''),
+          validContracts.map((c) => Number(c.itemQuantity ?? c.item_quantity ?? 1) || 1),
+          validContracts.map((c) => Number(c.purchasePrice ?? c.purchase_price) || 0),
+          validContracts.map((c) => c.listId || c.list_id || null),
+          validContracts.map((c) => c.listName || c.list_name || null),
+          validContracts.map((c) => Number(c.totalPrice ?? c.total_price) || 0),
+          validContracts.map((c) => Number(c.advancePayment ?? c.advance_payment) || 0),
+          validContracts.map((c) => Number(c.remainingBalance ?? c.remaining_balance) || 0),
+          validContracts.map((c) => Number(c.dailyInstallment ?? c.daily_installment) || 0),
+          validContracts.map((c) => c.startDate || c.start_date || new Date().toISOString().split('T')[0]),
+          validContracts.map((c) => c.notes || ''),
+          validContracts.map((c) => c.status || 'active'),
+          validContracts.map((c) => c.lastPaymentDate || c.last_payment_date || null),
+          validContracts.map((c) => Number(c.totalPaid ?? c.total_paid) || 0),
+          validContracts.map((c) => c.repName || c.rep_name || ''),
+          validContracts.map((c) => c.createdAt || c.created_at || new Date().toISOString()),
+          validContracts.map((c) => c.completedAt || c.completed_at || null),
+          validContracts.map((c) => c.updatedAt || c.updated_at || null),
+          validContracts.map((c) => Boolean(c.isEdited ?? c.is_edited)),
+        ]
+      );
+    }
+
+    for (const d of deletedRecords) {
+      if (!d?.recordId && !d?.record_id) continue;
+      const recId = String(d.recordId || d.record_id);
+      const tbl = String(d.tableName || d.table_name || '');
+      if (!tbl || tbl === 'unknown') continue;
+      await client.query(
+        `INSERT INTO deleted_records (record_id, table_name) VALUES ($1, $2) ON CONFLICT (record_id) DO NOTHING`,
+        [recId, tbl]
+      );
+    }
+
+    await client.query('COMMIT');
+    console.log(`Migrated authoritative FileDB records into PostgreSQL (${validContracts.length} sales, ${validPayments.length} payments, ${validFt.length} fund_transactions, ${reps.length} reps).`);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  }
 }

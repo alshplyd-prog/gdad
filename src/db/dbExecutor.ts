@@ -3,7 +3,21 @@ import { fileDb } from './fileDb.ts';
 import { initializeDatabaseSchema } from './init.ts';
 
 export const isPgConfigured = () => {
-  return true;
+  if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+    return true;
+  }
+  if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {
+    return true;
+  }
+  if (
+    process.env.DATABASE_URL &&
+    !process.env.DATABASE_URL.includes('supabase.co') &&
+    !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]') &&
+    !process.env.DATABASE_URL.includes('YOUR-PASSWORD')
+  ) {
+    return true;
+  }
+  return false;
 };
 
 class AsyncSemaphore {

@@ -28,16 +28,16 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-35 build-tools;35.0.0'
+          packages: 'platforms;android-36 build-tools;36.0.0'
 
       - name: Accept Android SDK Licenses
         run: |
           yes | sdkmanager --licenses || true
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.11.1'
+          gradle-version: '8.14.3'
 
       - name: Install Dependencies
         run: |
@@ -45,37 +45,20 @@ jobs:
           npm install @tailwindcss/oxide-linux-x64-gnu --no-save || true
 
       - name: Build Web Project
-        run: npx vite build
-
-      - name: Re-apply Android Project Configuration
         run: |
-          # Keep our custom build configurations and manifests safe before syncing
-          cp android/build.gradle /tmp/build.gradle.bak || true
-          cp android/app/build.gradle /tmp/app.build.gradle.bak || true
-          cp android/variables.gradle /tmp/variables.gradle.bak || true
-          cp android/gradle.properties /tmp/gradle.properties.bak || true
-          cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml.bak || true
-          cp android/capacitor-cordova-android-plugins/build.gradle /tmp/cordova.build.gradle.bak || true
-          cp android/gradle/wrapper/gradle-wrapper.jar /tmp/gradle-wrapper.jar.bak || true
-          cp android/gradle/wrapper/gradle-wrapper.properties /tmp/gradle-wrapper.properties.bak || true
-          cp android/gradlew /tmp/gradlew.bak || true
-          
+          node scripts/bundle_initial_snapshot.cjs
+          npx vite build
+          rm -rf dist/assets/aistudio
+
+      - name: Sync Capacitor Android Project
+        run: |
           npx cap sync android
-          
-          cp /tmp/build.gradle.bak android/build.gradle || true
-          cp /tmp/app.build.gradle.bak android/app/build.gradle || true
-          cp /tmp/variables.gradle.bak android/variables.gradle || true
-          cp /tmp/gradle.properties.bak android/gradle.properties || true
-          cp /tmp/AndroidManifest.xml.bak android/app/src/main/AndroidManifest.xml || true
-          cp /tmp/cordova.build.gradle.bak android/capacitor-cordova-android-plugins/build.gradle || true
-          cp /tmp/gradle-wrapper.jar.bak android/gradle/wrapper/gradle-wrapper.jar || true
-          cp /tmp/gradle-wrapper.properties.bak android/gradle/wrapper/gradle-wrapper.properties || true
-          cp /tmp/gradlew.bak android/gradlew || true
+          rm -rf android/app/src/main/assets/public/assets/aistudio
 
       - name: Ensure Valid Gradle Wrapper
         run: |
           cd android
-          gradle wrapper --gradle-version 8.11.1 --no-daemon
+          gradle wrapper --gradle-version 8.14.3 --no-daemon
           chmod +x gradlew
 
       - name: Build APK with Gradle

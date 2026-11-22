@@ -17,8 +17,8 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
     }
 
     buildTypes {
@@ -29,7 +29,7 @@ android {
         }
     }
 
-    lintOptions {
+    lint {
         abortOnError false
         checkReleaseBuilds false
     }
@@ -37,8 +37,7 @@ android {
 
 repositories {
     flatDir {
-        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
-		dirs '../../node_modules/@capacitor/background-runner/android/src/main/libs', 'libs'
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs', '../../node_modules/@capacitor/background-runner/android/src/main/libs'
     }
 }
 
@@ -46,17 +45,19 @@ dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
-    implementation "androidx.core:core-ktx:$androidxCoreVersion"
+    implementation "androidx.core:core-ktx:$androidxCoreKTXVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation "androidx.activity:activity:$androidxActivityVersion"
     implementation "androidx.fragment:fragment:$androidxFragmentVersion"
-    implementation "androidx.work:work-runtime:2.9.0"
+    implementation "androidx.work:work-runtime:$workManagerVersion"
     implementation "androidx.security:security-crypto:1.1.0-alpha06"
     implementation "net.zetetic:android-database-sqlcipher:4.5.4"
     implementation "androidx.sqlite:sqlite:2.4.0"
-    testImplementation "junit:junit:4.13.2"
-    androidTestImplementation "androidx.test.ext:junit:1.1.5"
-    androidTestImplementation "androidx.test.espresso:espresso-core:3.5.1"
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-android')
+    implementation project(':capacitor-cordova-android-plugins')
 }
 
 apply from: 'capacitor.build.gradle'
