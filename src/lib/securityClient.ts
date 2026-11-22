@@ -351,8 +351,8 @@ export async function decryptStringFromStorage(stored: string): Promise<string |
 }
 
 /**
- * Synchronous read from decrypted memory mirror (or plaintext fallback).
- * If plaintext is encountered on disk, upgrades it silently to AES-256-GCM ciphertext.
+ * Synchronous read from memory mirror (or plaintext localStorage).
+ * Decodes any legacy ENC_V1 entries asynchronously into memory and migrates to plaintext.
  */
 export function secureStorageGetSync(key: string): string | null {
   if (memoryCacheMap.has(key)) {
@@ -363,19 +363,15 @@ export function secureStorageGetSync(key: string): string | null {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     if (raw.startsWith(ENC_PREFIX)) {
-      // Trigger async decrypt into memory map
       decryptStringFromStorage(raw).then((plain) => {
-        if (plain !== null) memoryCacheMap.set(key, plain);
+        if (plain !== null) {
+          memoryCacheMap.set(key, plain);
+          try { localStorage.setItem(key, plain); } catch (e) {}
+        }
       }).catch(() => {});
       return null;
     }
     memoryCacheMap.set(key, raw);
-    // Upgrade legacy plaintext in background to AES-256-GCM
-    encryptStringForStorage(raw).then((enc) => {
-      if (enc.startsWith(ENC_PREFIX)) {
-        try { localStorage.setItem(key, enc); } catch (e) {}
-      }
-    }).catch(() => {});
     return raw;
   } catch (e) {
     return null;
@@ -385,19 +381,9 @@ export function secureStorageGetSync(key: string): string | null {
 export function secureStorageSetSync(key: string, plaintext: string): void {
   memoryCacheMap.set(key, plaintext);
   if (typeof localStorage === 'undefined') return;
-
-  // Store encrypted asynchronously; if webcrypto unavailable, store plaintext directly
-  encryptStringForStorage(plaintext)
-    .then((enc) => {
-      try {
-        localStorage.setItem(key, enc);
-      } catch (e) {}
-    })
-    .catch(() => {
-      try {
-        localStorage.setItem(key, plaintext);
-      } catch (e) {}
-    });
+  try {
+    localStorage.setItem(key, plaintext);
+  } catch (e) {}
 }
 
 export function secureStorageRemoveSync(key: string): void {
@@ -460,7 +446,6 @@ async function mirrorAuthSessionToIndexedDb(session: { token: string; hmacKey: s
 export function sanitizeRepForStorage(rep: SalesRepresentative): SalesRepresentative {
   return {
     ...rep,
-    code: '',
   };
 }
 
@@ -571,13 +556,12 @@ export async function initSecurityClient(): Promise<void> {
               if (!raw) return;
               if (raw.startsWith(ENC_PREFIX)) {
                 const plain = await decryptStringFromStorage(raw);
-                if (plain !== null) memoryCacheMap.set(k, plain);
+                if (plain !== null) {
+                  memoryCacheMap.set(k, plain);
+                  try { localStorage.setItem(k, plain); } catch (e) {}
+                }
               } else {
                 memoryCacheMap.set(k, raw);
-                const enc = await encryptStringForStorage(raw);
-                if (enc.startsWith(ENC_PREFIX)) {
-                  localStorage.setItem(k, enc);
-                }
               }
             } catch (e) {}
           })

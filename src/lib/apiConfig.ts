@@ -293,8 +293,8 @@ export async function fetchWithFallback(
         return res;
       }
 
-      // Surface security/auth/conflict responses directly instead of treating them as network failures
-      if (res.status === 401 || res.status === 403 || res.status === 409) {
+      // Surface validation/security/auth/conflict responses directly instead of treating them as network failures
+      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 409) {
         if (
           res.status === 401 &&
           !skipSigning &&

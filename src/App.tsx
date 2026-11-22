@@ -620,7 +620,7 @@ export default function App() {
       } else {
         // Quick lightweight version verification
         try {
-          const res = await fetch('/api/sync/version', { method: 'GET', cache: 'no-store' }).catch(() => null);
+          const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 4000).catch(() => null);
           if (res && res.ok) {
             setSyncError(false);
             const data = await res.json().catch(() => null);
@@ -693,41 +693,14 @@ export default function App() {
   useEffect(() => {
     const handleAuth401 = async () => {
       if (authVerifyInFlightRef.current) return;
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
       authVerifyInFlightRef.current = true;
       try {
-        let currentSession = getAuthSession();
-        if (!currentSession?.token || currentSession.offlinePendingExchange || currentSession.token === 'offline_pending') {
-          const exchanged = await retryPendingJwtExchangeNow().catch(() => false);
-          if (exchanged) {
-            flushPendingQueue().catch(() => {});
-            return;
-          }
-          currentSession = getAuthSession();
-          if (currentSession?.token && currentSession.token !== 'offline_pending' && !currentSession.offlinePendingExchange) {
-            flushPendingQueue().catch(() => {});
-            return;
-          }
-        }
-
-        const res = await fetchWithFallback('/api/auth/verify', { method: 'POST' }, 5000).catch(() => null);
-        if (res && res.status === 401) {
-          const data = await res.json().catch(() => null);
-          if (data?.pinChanged || data?.code === 'INVALID_TOKEN' || data?.code === 'PIN_CHANGED' || data?.code === 'AUTH_REQUIRED') {
-            clearAuthSession();
-            localStorage.removeItem('sami_app_pin_unlocked');
-            setIsPinUnlocked(false);
-            showToast(
-              isArRef.current
-                ? 'انتهت جلسة الأمان، يرجى إدخال الرمز السري لإتمام المزامنة مع السيرفر'
-                : 'Session expired, please enter your PIN to sync with server'
-            );
-          }
-        }
+        await retryPendingJwtExchangeNow().catch(() => false);
+        flushPendingQueue().catch(() => {});
       } finally {
         setTimeout(() => {
           authVerifyInFlightRef.current = false;
-        }, 4000);
+        }, 5000);
       }
     };
 

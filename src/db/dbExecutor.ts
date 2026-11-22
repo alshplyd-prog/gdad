@@ -34,53 +34,104 @@ class AsyncSemaphore {
 
 const pgSemaphore = new AsyncSemaphore(8);
 
+const PG_CIRCUIT_COOLDOWN_MS = 15000;
+let pgUnavailableUntil = 0;
+let pgLastFailureMessage = 'PostgreSQL temporarily unavailable';
+let pgLastWarnAt = 0;
+
+function isNonTransientPgRejection(errStr: string): boolean {
+  return (
+    errStr.includes('pg_hba') ||
+    errStr.includes('no encryption') ||
+    errStr.includes('password authentication') ||
+    errStr.includes('econnrefused') ||
+    errStr.includes('enotfound') ||
+    errStr.includes('eai_again') ||
+    errStr.includes('does not exist') && errStr.includes('database')
+  );
+}
+
+function isTransientConnError(errStr: string): boolean {
+  if (isNonTransientPgRejection(errStr)) return false;
+  return (
+    errStr.includes('econnreset') ||
+    errStr.includes('etimedout') ||
+    errStr.includes('timeout') ||
+    errStr.includes('terminated') ||
+    errStr.includes('closed') ||
+    errStr.includes('connection')
+  );
+}
+
+function tripPgCircuit(message: string) {
+  pgUnavailableUntil = Date.now() + PG_CIRCUIT_COOLDOWN_MS;
+  pgLastFailureMessage = message || 'PostgreSQL unavailable';
+  const now = Date.now();
+  if (now - pgLastWarnAt > PG_CIRCUIT_COOLDOWN_MS) {
+    pgLastWarnAt = now;
+    console.warn(`PostgreSQL unavailable (${pgLastFailureMessage}); using local fileDb fallback for 15s.`);
+  }
+}
+
 export async function executePg(sql: string, params: any[] = []): Promise<any[]> {
+  if (Date.now() < pgUnavailableUntil) {
+    throw new Error(pgLastFailureMessage);
+  }
   await pgSemaphore.acquire();
   try {
+    if (Date.now() < pgUnavailableUntil) {
+      throw new Error(pgLastFailureMessage);
+    }
     let attempts = 0;
-    const maxAttempts = 3;
+    const maxAttempts = 2;
     while (attempts < maxAttempts) {
       try {
         const currentPool = createPool();
         const res = await currentPool.query(sql, params);
+        pgUnavailableUntil = 0;
         return res.rows || [];
       } catch (e: any) {
         attempts++;
-        const errStr = (e?.message || '').toLowerCase();
-        const isConnError = errStr.includes('econnreset') || 
-                            errStr.includes('etimedout') || 
-                            errStr.includes('timeout') || 
-                            errStr.includes('terminated') || 
-                            errStr.includes('closed') || 
-                            errStr.includes('connection');
-        const isMaxConn = errStr.includes('emaxconnsession') || 
-                          errStr.includes('too many clients') || 
-                          errStr.includes('connection limit');
+        const errMsg = e?.message || String(e || 'Unknown PG error');
+        const errStr = errMsg.toLowerCase();
 
-        if (isConnError || isMaxConn) {
-          // Immediately reset dead pool reference so fresh connection will be initiated
+        if (isNonTransientPgRejection(errStr)) {
           resetPool();
-          if (attempts < maxAttempts) {
-            await new Promise((r) => setTimeout(r, attempts * 500 + Math.random() * 300));
-            continue;
-          }
+          tripPgCircuit(errMsg);
+          throw e;
         }
 
-        if (e.message && e.message.includes('does not exist')) {
+        const isConnErr = isTransientConnError(errStr);
+        const isMaxConn =
+          errStr.includes('emaxconnsession') ||
+          errStr.includes('too many clients') ||
+          errStr.includes('connection limit');
+
+        if (isConnErr || isMaxConn) {
+          resetPool();
+          if (attempts < maxAttempts) {
+            await new Promise((r) => setTimeout(r, 250 + Math.random() * 150));
+            continue;
+          }
+          tripPgCircuit(errMsg);
+          throw e;
+        }
+
+        if (errMsg.includes('does not exist')) {
           try {
-            if (e.message.includes('employee_name')) {
+            if (errMsg.includes('employee_name')) {
               const currentPool = createPool();
               await currentPool.query('ALTER TABLE employee_transactions ADD COLUMN IF NOT EXISTS employee_name TEXT;').catch(() => {});
               const resRetry = await currentPool.query(sql, params);
               return resRetry.rows || [];
             }
-            if (e.message.includes('avatar_url') && e.message.includes('reps')) {
+            if (errMsg.includes('avatar_url') && errMsg.includes('reps')) {
               const currentPool = createPool();
               await currentPool.query('ALTER TABLE reps ADD COLUMN IF NOT EXISTS avatar_url TEXT;').catch(() => {});
               const resRetry = await currentPool.query(sql, params);
               return resRetry.rows || [];
             }
-            if (e.message.includes('latitude') || e.message.includes('longitude') || e.message.includes('location_address') || e.message.includes('location_updated_at') || e.message.includes('location_cleared_at')) {
+            if (errMsg.includes('latitude') || errMsg.includes('longitude') || errMsg.includes('location_address') || errMsg.includes('location_updated_at') || errMsg.includes('location_cleared_at')) {
               const currentPool = createPool();
               await currentPool.query(`
                 ALTER TABLE sales ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
@@ -108,7 +159,7 @@ export async function executePg(sql: string, params: any[] = []): Promise<any[]>
               const resRetry = await currentPool.query(sql, params);
               return resRetry.rows || [];
             }
-            if (e.message.includes('funds') && (e.message.includes('relation') || e.message.includes('table'))) {
+            if (errMsg.includes('funds') && (errMsg.includes('relation') || errMsg.includes('table'))) {
               const currentPool = createPool();
               await currentPool.query('CREATE OR REPLACE VIEW funds AS SELECT * FROM cash_funds;').catch(() => {});
               const resRetry = await currentPool.query(sql, params);
@@ -122,7 +173,7 @@ export async function executePg(sql: string, params: any[] = []): Promise<any[]>
         }
 
         if (attempts >= maxAttempts) {
-          console.warn('PostgreSQL query error after retries (falling back to local data):', e.message);
+          console.warn('PostgreSQL query error after retries (falling back to local data):', errMsg);
           throw e;
         }
       }
@@ -150,8 +201,14 @@ export async function executePgWithContext(
   if (!ctx) {
     return executePg(sql, params);
   }
+  if (Date.now() < pgUnavailableUntil) {
+    throw new Error(pgLastFailureMessage);
+  }
   await pgSemaphore.acquire();
   try {
+    if (Date.now() < pgUnavailableUntil) {
+      throw new Error(pgLastFailureMessage);
+    }
     const currentPool = createPool();
     const client = await currentPool.connect();
     try {
@@ -175,6 +232,7 @@ export async function executePgWithContext(
       );
       const res = await client.query(sql, params);
       await client.query('COMMIT');
+      pgUnavailableUntil = 0;
       return res.rows || [];
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -182,6 +240,14 @@ export async function executePgWithContext(
     } finally {
       client.release();
     }
+  } catch (outerErr: any) {
+    const errMsg = outerErr?.message || String(outerErr || '');
+    const errStr = errMsg.toLowerCase();
+    if (isNonTransientPgRejection(errStr) || isTransientConnError(errStr)) {
+      resetPool();
+      tripPgCircuit(errMsg);
+    }
+    throw outerErr;
   } finally {
     pgSemaphore.release();
   }

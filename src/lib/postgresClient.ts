@@ -1485,7 +1485,7 @@ function mapRow(tableName: string, r: any): any {
       id: r.id,
       name: r.name ?? '',
       phone: r.phone ?? '',
-      code: '',
+      code: r.code ?? '',
       pinSet: Boolean(r.pinSet ?? r.pin_set ?? true),
       pinVersion: r.pinVersion ?? r.pin_version ?? '',
       offlineVerifier: r.offlineVerifier ?? r.offline_verifier ?? '',

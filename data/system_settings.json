@@ -1,0 +1,7 @@
+[
+  {
+    "id": "jwt_signing_secret",
+    "key": "jwt_signing_secret",
+    "value": "fd2667890e37423e0eb86844b08f790f9d463de39976c76705625f2817a4be4b386263d4fe9f3ace4365eeaec9185f44"
+  }
+]

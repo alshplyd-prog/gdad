@@ -10208,5 +10208,266 @@
     "note": "تسديد قسط زبون: رحيم حمزه بجاي",
     "repName": "ضياء المحاسب",
     "createdAt": "2026-09-01T00:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_8754b81a-9bd5-44a5-b7c5-337a0f26bc59",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 20000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T00:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_f754f620-baae-4a02-b464-b549b7d748db",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 20000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T00:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_2551753e-d223-4afb-840e-52db2c1be2e6",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 5000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T00:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_e9a96060-33e1-44d8-83f2-693664503274",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 20000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T00:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_e409bed8-5e47-4229-955a-38db56a2790d",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 15000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_e3996018-83b4-4ec0-8a9a-cecd882cb1f3",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 5000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_d06cdf15-258e-45db-98a0-7eddf1b6faf1",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 20000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_c5a15e9a-4a48-4642-9d03-4ce0079d6222",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 3000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_bdd4d36f-7475-4c3d-ae78-bd4ec0dd5563",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 15000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_b38ad640-9f88-4eec-b636-21ea9ea1a5c7",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 10000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_b0a75fa1-f1ea-4426-ba02-9bd21c8bcfe1",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 12000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_a24b1a3d-b110-45b9-95db-b4b55281577b",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 25000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_a08f939b-74f9-446f-bd1f-ccefb1356815",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 4000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_9551cd9d-4d9c-4e64-83b2-087121bbbc6e",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 7000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_8b528c18-cf5d-42e5-a2ab-7d1d7697663e",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 5000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_24147b57-f5a9-4829-8ebf-58605895b623",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 150000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_16c3e4d3-e84a-4e84-badc-122a0b182f43",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 6000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_10a0d135-414e-41d0-84d0-2dfd12bfd241",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 35000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_855b8919-82b7-4d93-9cdd-f37da6409207",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 10000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T00:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_825b016c-b523-441d-b15e-1afee74ba32c",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 5000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_80eb717c-cdd5-46dc-92f6-ce560d1601c9",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 7000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_646a93f3-2bf9-4b53-a06d-7cc04e53c285",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 50000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_56d7d334-2560-42b6-9f8d-991f57cef782",
+    "fundId": "fund_1791618782897_u79cy",
+    "type": "installment",
+    "amount": 15000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_56310150-fd81-4378-a537-05dd4e957f4e",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 3000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_55857cfb-36a3-4df3-b613-fa6e750478e6",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 10000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_4c068809-85e1-40d2-ab6c-64364a0fc662",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 10000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_45c92e93-0f60-48b3-a4c1-f7eaf8c3dfd7",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 35000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_401799f0-028f-41bd-acf7-2ee0e87ef54f",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 5000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
+  },
+  {
+    "id": "ft_pay_pay_313ec761-0c9a-412b-948c-b8283f51e3d5",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 25000,
+    "note": "تسديد قسط زبون: ",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-19T12:00:00.000Z"
   }
 ]

@@ -1,43 +1,36 @@
 const fs = require('fs');
 const path = require('path');
 
-try {
-  const dataDir = path.join(__dirname, '..', 'data');
-  const publicDir = path.join(__dirname, '..', 'public');
+const dataDir = path.join(__dirname, '../data');
+const outputFile = path.join(__dirname, '../public/initial_snapshot.json');
 
-  const readFileSafe = (filename) => {
+const files = [
+  'contracts.json',
+  'payments.json',
+  'appointments.json',
+  'cash_funds.json',
+  'customer_lists.json',
+  'employees.json',
+  'inventory_items.json',
+  'reps.json'
+];
+
+const snapshot = {};
+
+for (const f of files) {
+  const filePath = path.join(dataDir, f);
+  const key = f.replace('.json', '');
+  if (fs.existsSync(filePath)) {
     try {
-      const filePath = path.join(dataDir, filename);
-      if (fs.existsSync(filePath)) {
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      }
-    } catch (e) {}
-    return [];
-  };
-
-  const contracts = readFileSafe('contracts.json');
-  const appointments = readFileSafe('appointments.json');
-  const customerLists = readFileSafe('customer_lists.json');
-  const funds = readFileSafe('funds.json');
-  const reps = readFileSafe('reps.json');
-  const inventory = readFileSafe('inventory_items.json');
-
-  const snapshot = {
-    timestamp: Date.now(),
-    contracts,
-    appointments,
-    customerLists,
-    funds,
-    reps,
-    inventory,
-  };
-
-  if (!fs.existsSync(publicDir)) {
-    fs.mkdirSync(publicDir, { recursive: true });
+      const content = fs.readFileSync(filePath, 'utf8');
+      snapshot[key] = JSON.parse(content);
+    } catch (e) {
+      snapshot[key] = [];
+    }
+  } else {
+    snapshot[key] = [];
   }
-
-  fs.writeFileSync(path.join(publicDir, 'initial_snapshot.json'), JSON.stringify(snapshot, null, 2));
-  console.log(`[Snapshot Bundler] Successfully bundled initial snapshot (${contracts.length} contracts, ${appointments.length} appointments).`);
-} catch (err) {
-  console.warn('[Snapshot Bundler] Warning:', err.message);
 }
+
+fs.writeFileSync(outputFile, JSON.stringify(snapshot, null, 2), 'utf8');
+console.log('[Snapshot Bundler] Successfully bundled initial snapshot.');

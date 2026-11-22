@@ -1053,8 +1053,9 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       body: method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : undefined,
     }, 8000);
 
-    if (res && (res.status === 401 || res.status === 403)) {
-      return { ok: false, authError: true };
+    if (res && res.status === 409) {
+      // Already recorded in database -> mark as synced so offline queue item is cleared
+      return { ok: true };
     }
     if (!res || !res.ok || res.status < 200 || res.status >= 300) {
       return { ok: false };
@@ -1064,7 +1065,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       return { ok: false };
     }
     const data = await res.json().catch(() => null);
-    if (!data || data.error) {
+    if (!data || (data.error && !data.idempotent)) {
       return { ok: false };
     }
     return { ok: true };
@@ -1121,7 +1122,6 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
 
     // 3. Path A: Send Batch Request to /api/sync/batch in chunks of 200 (with fast 12s timeout)
     let processedIdsFromBatch: string[] = [];
-    let abortedDueToAuth = false;
     const BATCH_CHUNK = 200;
     for (let b = 0; b < actionsToSync.length; b += BATCH_CHUNK) {
       const batchSlice = actionsToSync.slice(b, b + BATCH_CHUNK);
@@ -1135,11 +1135,6 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
           },
           12000
         );
-
-        if (response && (response.status === 401 || response.status === 403)) {
-          abortedDueToAuth = true;
-          break;
-        }
 
         if (response && response.ok && response.status >= 200 && response.status < 300) {
           const ct = response.headers?.get('content-type') || '';
@@ -1172,10 +1167,6 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         action.error = null;
         verifiedSyncedIds.push(action.id);
         deletePromises.push(deleteActionFromIndexedDb(action.id).catch(() => {}));
-      } else if (abortedDueToAuth) {
-        action.status = 'pending';
-        action.error = 'Auth session expired (awaiting PIN login)';
-        await saveActionToIndexedDb(action).catch(() => {});
       } else {
         pendingFallbackActions.push(action);
       }
@@ -1185,17 +1176,12 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
     }
 
     // 5. Fallback path for unconfirmed actions (parallel chunks of 8)
-    if (!abortedDueToAuth && pendingFallbackActions.length > 0) {
+    if (pendingFallbackActions.length > 0) {
       const CHUNK_SIZE = 8;
       for (let i = 0; i < pendingFallbackActions.length; i += CHUNK_SIZE) {
         const chunk = pendingFallbackActions.slice(i, i + CHUNK_SIZE);
         await Promise.all(
           chunk.map(async (action) => {
-            if (abortedDueToAuth) {
-              action.status = 'pending';
-              await saveActionToIndexedDb(action).catch(() => {});
-              return;
-            }
             // First fallback: REST endpoint directly
             const restResult = await executeActionViaRestEndpoint(action);
             if (restResult.ok) {
@@ -1207,14 +1193,6 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
               return;
             }
 
-            if (restResult.authError) {
-              abortedDueToAuth = true;
-              action.status = 'pending';
-              action.error = 'Auth session expired (awaiting PIN login)';
-              await saveActionToIndexedDb(action).catch(() => {});
-              return;
-            }
-
             // Otherwise revert to pending for next retry
             action.status = 'pending';
             action.retryCount = (action.retryCount || 0) + 1;
@@ -1222,13 +1200,6 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
             await saveActionToIndexedDb(action).catch(() => {});
           })
         );
-        if (abortedDueToAuth) {
-          for (let j = i + CHUNK_SIZE; j < pendingFallbackActions.length; j++) {
-            pendingFallbackActions[j].status = 'pending';
-            await saveActionToIndexedDb(pendingFallbackActions[j]).catch(() => {});
-          }
-          break;
-        }
       }
     }
 
