@@ -8,24 +8,23 @@ import { signRequestHeaders } from '../lib/securityClient';
 
 /**
  * Production backend URL for mobile APK and external environments
+ * استبدل الرابط بالرابط الحقيقي لسيرفرك في Hostinger (مثال: http://72.62.158.128/api أو https://your-domain.com/api)
  */
-export const CLOUD_API_URL = 'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api';
+export const CLOUD_API_URL = 'http://72.62.158.128/api';
 
 /**
  * Dynamic API Base URL resolver:
- * - In mobile / APK requests, directs to configured HTTPS server
- * - In web browser, uses relative `/api` or custom HTTPS server
+ * - In mobile / APK requests, directs to configured server or VPS backend
+ * - In web browser, uses relative `/api` or custom server
  */
 export function getActiveApiUrl(): string {
   if (typeof window !== 'undefined') {
-    if (!isNativeOrApkEnvironment()) {
-      const custom = getApiBaseUrl();
-      if (custom) return `${custom.replace(/\/+$/, '')}/api`;
-      return '/api';
+    const custom = getApiBaseUrl();
+    if (custom && custom.trim() !== '') {
+      return `${custom.trim().replace(/\/+$/, '')}/api`;
     }
-    const base = getApiBaseUrl();
-    if (base) {
-      return `${base.replace(/\/+$/, '')}/api`;
+    if (!isNativeOrApkEnvironment()) {
+      return '/api';
     }
   }
   return CLOUD_API_URL;
@@ -38,9 +37,9 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
   const cleanEndpoint = endpoint.replace(/^\/+/, '');
   const baseUrl = getActiveApiUrl();
   const url = `${baseUrl.replace(/\/+$/, '')}/${cleanEndpoint}`;
-  
+
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const timeoutId = setTimeout(() => controller.abort(), 20000);
 
   try {
     const method = (options.method || 'GET').toUpperCase();
@@ -63,9 +62,9 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
       data = JSON.parse(text);
     } catch (e) {
       if (text.trim().toLowerCase().startsWith('<!doctype') || text.trim().toLowerCase().startsWith('<html')) {
-        throw new Error('استجابة السيرفر غير صالحة (يبدو أن الخادم أعمل إعادة توجيه أو يعرض صفحة خطأ HTML بدلاً من بيانات JSON)');
+        throw new Error('استجابة السيرفر غير صالحة (يعرض صفحة HTML بدلاً من JSON)');
       }
-      throw new Error(`خطأ في قراءة رد السيرفر`);
+      throw new Error('خطأ في قراءة رد السيرفر');
     }
 
     if (!response.ok) {
@@ -77,184 +76,8 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
     if (err.name === 'AbortError') {
       throw new Error('انتهت مهلة الاتصال بالسيرفر. يرجى التحقق من اتصال الإنترنت.');
     }
-    // Fallback: if we were using a relative URL that failed or vice versa, try cloud URL
-    if (baseUrl !== CLOUD_API_URL) {
-      try {
-        const fallbackUrl = `${CLOUD_API_URL}/${cleanEndpoint}`;
-        const method = (options.method || 'GET').toUpperCase();
-        const bodyStr = typeof options.body === 'string' ? options.body : '';
-        const securityHeaders = await signRequestHeaders(method, fallbackUrl, bodyStr).catch(() => ({}));
-        const fallbackRes = await fetch(fallbackUrl, {
-          ...options,
-          headers: {
-            'Content-Type': 'application/json',
-            ...securityHeaders,
-            ...(options.headers || {}),
-          },
-        });
-        if (fallbackRes.ok) {
-          return fallbackRes.json();
-        }
-      } catch (fallbackErr) {
-        // ignore and throw original error
-      }
-    }
     throw err;
   } finally {
     clearTimeout(timeoutId);
   }
 }
-
-// ==========================================
-// 1. قسم الزبائن والمبيعات (Customers & Sales)
-// ==========================================
-export const SalesService = {
-  // جلب كافة العقود والمبيعات
-  async getAllSales(): Promise<any[]> {
-    return apiRequest<any[]>('/contracts');
-  },
-
-  // إضافة بيع / عقد جديد
-  async createSale(saleData: {
-    customerName: string;
-    customerPhone: string;
-    customerAddress?: string;
-    itemName: string;
-    totalPrice: number;
-    advancePayment: number;
-    dailyInstallment: number;
-    listId?: string;
-    listName?: string;
-    notes?: string;
-    repId?: string;
-    repName?: string;
-    startDate?: string;
-  }): Promise<any> {
-    return apiRequest<any>('/contracts', {
-      method: 'POST',
-      body: JSON.stringify(saleData),
-    });
-  },
-
-  // تعديل عقد بيع
-  async updateSale(id: string, updatedData: any): Promise<any> {
-    return apiRequest<any>(`/contracts/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(updatedData),
-    });
-  },
-
-  // حذف عقد
-  async deleteSale(id: string): Promise<{ success: boolean }> {
-    return apiRequest<{ success: boolean }>(`/contracts/${id}`, {
-      method: 'DELETE',
-    });
-  },
-};
-
-// ==========================================
-// 2. قسم المدفوعات والتحصيلات (Payments)
-// ==========================================
-export const PaymentsService = {
-  // جلب سجل المدفوعات
-  async getPayments(): Promise<any[]> {
-    return apiRequest<any[]>('/payments');
-  },
-
-  // تسديد دفعة جديدة
-  async addPayment(paymentData: {
-    contractId: string;
-    amount: number;
-    receiptNumber?: string;
-    repName?: string;
-    repId?: string;
-    notes?: string;
-    fundId?: string;
-    paymentMethod?: string;
-    createdAt?: string;
-  }): Promise<any> {
-    return apiRequest<any>('/payments', {
-      method: 'POST',
-      body: JSON.stringify(paymentData),
-    });
-  },
-
-  // تعديل دفعة
-  async updatePayment(paymentId: string, updatedData: any): Promise<any> {
-    return apiRequest<any>(`/payments/${paymentId}`, {
-      method: 'PUT',
-      body: JSON.stringify(updatedData),
-    });
-  },
-
-  // حذف دفعة
-  async deletePayment(paymentId: string): Promise<{ success: boolean }> {
-    return apiRequest<{ success: boolean }>(`/payments/${paymentId}`, {
-      method: 'DELETE',
-    });
-  },
-};
-
-// ==========================================
-// 3. قسم الأرصدة والصناديق المالية (Funds & Balances)
-// ==========================================
-export const FundsService = {
-  // جلب بيانات الصناديق والأرصدة
-  async getFunds(): Promise<any[]> {
-    return apiRequest<any[]>('/funds');
-  },
-
-  // جلب الحركات المالية
-  async getFundTransactions(): Promise<any[]> {
-    return apiRequest<any[]>('/fund-transactions');
-  },
-
-  // إنشاء حركة مالية (إيداع، سحب، أو تحويل بين الصناديق)
-  async createTransaction(txData: {
-    fundId: string;
-    type: 'deposit' | 'withdraw' | 'transfer';
-    amount: number;
-    targetFundId?: string;
-    notes?: string;
-    repId?: string;
-    repName?: string;
-    createdAt?: string;
-  }): Promise<any> {
-    return apiRequest<any>('/fund-transactions', {
-      method: 'POST',
-      body: JSON.stringify(txData),
-    });
-  },
-
-  // إنشاء صندوق مالي جديد
-  async createFund(fundData: { name: string; balance?: number; type?: string; description?: string }): Promise<any> {
-    return apiRequest<any>('/funds', {
-      method: 'POST',
-      body: JSON.stringify(fundData),
-    });
-  },
-};
-
-// ==========================================
-// 4. قسم الموظفين والمندوبين (Employees & Reps)
-// ==========================================
-export const EmployeesService = {
-  // جلب الموظفين
-  async getEmployees(): Promise<any[]> {
-    return apiRequest<any[]>('/employees');
-  },
-
-  // جلب المندوبين
-  async getReps(): Promise<any[]> {
-    return apiRequest<any[]>('/reps');
-  },
-};
-
-// ==========================================
-// 5. المزامنة والتحقق من الإصدار (Sync Version)
-// ==========================================
-export const SyncService = {
-  async getSyncVersion(): Promise<{ success: boolean; syncVersion: number; timestamp: number }> {
-    return apiRequest<{ success: boolean; syncVersion: number; timestamp: number }>('/sync/version');
-  },
-};
