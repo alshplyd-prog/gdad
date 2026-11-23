@@ -1,18 +1,18 @@
 import { Capacitor } from '@capacitor/core';
-import { signRequestHeaders } from './securityClient';
+import { Network } from '@capacitor/network';
 
 /**
  * Centralized API & Server Endpoint Resolver for Web and Android APK
+ * استبدل الرابط أدناه برابط سيرفرك الحقيقي في Hostinger (مثال: http://72.62.158.128 أو https://your-domain.com)
  */
 
-export const HOSTINGER_DEFAULT_SERVER = 'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app';
+export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128';
 
 export const CANDIDATE_SERVERS: string[] = [
-  'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
-  'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
+  'http://72.62.158.128',
 ];
 
-const DEFAULT_REMOTE_SERVER = 'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app';
+const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
 
 export function getCustomServerUrl(): string {
@@ -60,7 +60,7 @@ export async function autoDetectActiveServer(): Promise<string> {
   for (const server of CANDIDATE_SERVERS) {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3500);
+      const timer = setTimeout(() => controller.abort(), 5000);
       const res = await fetch(`${server}/api/reports/totals`, {
         signal: controller.signal,
         headers: { 'Cache-Control': 'no-cache' }
@@ -109,10 +109,10 @@ export function getApiBaseUrl(): string {
   let base = '';
   if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
     base = activeWorkingServer;
-  } else if (!isNative && typeof window !== 'undefined' && window.location.origin && 
-      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) && 
-      !window.location.origin.includes('localhost') && 
-      !window.location.origin.includes('127.0.0.1') && 
+  } else if (!isNative && typeof window !== 'undefined' && window.location.origin &&
+      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) &&
+      !window.location.origin.includes('localhost') &&
+      !window.location.origin.includes('127.0.0.1') &&
       !window.location.origin.includes('file://')) {
     base = window.location.origin;
   } else {
@@ -134,11 +134,11 @@ export function getPublicShareBaseUrl(): string {
   if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
     return activeWorkingServer.replace(/\/+$/, '');
   }
-  if (typeof window !== 'undefined' && window.location.origin && 
-      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) && 
-      !window.location.origin.includes('localhost') && 
-      !window.location.origin.includes('127.0.0.1') && 
-      !window.location.origin.includes('capacitor://') && 
+  if (typeof window !== 'undefined' && window.location.origin &&
+      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) &&
+      !window.location.origin.includes('localhost') &&
+      !window.location.origin.includes('127.0.0.1') &&
+      !window.location.origin.includes('capacitor://') &&
       !window.location.origin.includes('file://')) {
     return window.location.origin.replace(/\/+$/, '');
   }
@@ -151,8 +151,6 @@ export function getFullApiUrl(endpoint: string, baseOverride?: string): string {
   if (!base) return cleanEndpoint;
   return `${base}${cleanEndpoint}`;
 }
-
-import { Network } from '@capacitor/network';
 
 export async function isNetworkConnected(): Promise<boolean> {
   try {
@@ -173,7 +171,7 @@ export async function isNetworkConnected(): Promise<boolean> {
 export async function fetchWithFallback(
   endpoint: string,
   options?: RequestInit,
-  timeoutMs: number = 6000
+  timeoutMs: number = 10000
 ): Promise<Response> {
   const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   const isNative = isNativeOrApkEnvironment();
@@ -181,8 +179,6 @@ export async function fetchWithFallback(
   const urlsToTry: string[] = [];
 
   if (isNative) {
-    // In native APK / Capacitor environment, NEVER try localhost or relative URLs because there is no API server on the device!
-    // Immediately target the remote cloud servers!
     if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
       const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
       if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
@@ -206,7 +202,6 @@ export async function fetchWithFallback(
       urlsToTry.push(cleanEndpoint);
     }
   } else {
-    // 1. If in browser / web mode, prefer same-origin URLs only so cross-origin CORS mirrors don't mask real errors
     const hasHttpOrigin =
       typeof window !== 'undefined' &&
       Boolean(window.location.origin) &&
@@ -243,22 +238,12 @@ export async function fetchWithFallback(
   }
 
   let lastError: any = null;
-  const methodUpper = (options?.method || 'GET').toUpperCase();
-  const isMutation = methodUpper !== 'GET' && methodUpper !== 'HEAD' && methodUpper !== 'OPTIONS';
   const skipSigning = cleanEndpoint.startsWith('/api/auth/login') || cleanEndpoint.startsWith('/api/auth/logout');
-  const bodyStr = typeof options?.body === 'string' ? options.body : '';
-
-  let secHeaders: Record<string, string> = {};
-  if (!skipSigning) {
-    try {
-      secHeaders = await signRequestHeaders(methodUpper, cleanEndpoint, isMutation ? bodyStr : '');
-    } catch (e) {}
-  }
 
   for (const url of urlsToTry) {
     try {
       const controller = new AbortController();
-      const perUrlTimeout = timeoutMs || (isNative ? 7000 : 5000);
+      const perUrlTimeout = timeoutMs || (isNative ? 10000 : 7000);
       const timer = setTimeout(() => controller.abort(), perUrlTimeout);
       const res = await fetch(url, {
         ...options,
@@ -266,17 +251,14 @@ export async function fetchWithFallback(
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json, text/plain, */*',
-          ...secHeaders,
           ...(options?.headers || {}),
         },
       });
       clearTimeout(timer);
 
       if (res.ok) {
-        // Verify that it is not an HTML fallback page (e.g. index.html) for an API route
         const contentType = res.headers.get('content-type') || '';
         if (contentType.includes('text/html')) {
-          // If the endpoint is an API route and got HTML back, this server did not match the API route
           continue;
         }
 
@@ -289,7 +271,6 @@ export async function fetchWithFallback(
         return res;
       }
 
-      // Surface validation/security/auth/conflict/not-found JSON responses directly without slow retries
       if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404 || res.status === 409 || res.status === 422) {
         if (
           res.status === 401 &&
@@ -318,17 +299,17 @@ export async function universalApiFetch(
   endpoint: string,
   options?: RequestInit
 ): Promise<Response> {
-  return fetchWithFallback(endpoint, options, 8000);
+  return fetchWithFallback(endpoint, options, 12000);
 }
 
 export async function checkServerHealth(url?: string): Promise<{ ok: boolean; status?: string; database?: string; latencyMs: number; error?: string }> {
   const start = Date.now();
   const baseUrl = url ? url.trim().replace(/\/+$/, '') : getApiBaseUrl();
   const targetUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
-  
+
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
+    const timer = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(targetUrl, {
       signal: controller.signal,
       headers: { 'Accept': 'application/json' }
@@ -360,4 +341,3 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
     };
   }
 }
-
