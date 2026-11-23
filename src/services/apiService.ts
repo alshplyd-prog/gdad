@@ -4,7 +4,6 @@
  */
 
 import { getApiBaseUrl, isNativeOrApkEnvironment } from '../lib/apiConfig';
-import { signRequestHeaders } from '../lib/securityClient';
 
 /**
  * Production backend URL for mobile APK and external environments
@@ -42,15 +41,10 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
   const timeoutId = setTimeout(() => controller.abort(), 20000);
 
   try {
-    const method = (options.method || 'GET').toUpperCase();
-    const bodyStr = typeof options.body === 'string' ? options.body : '';
-    const securityHeaders = await signRequestHeaders(method, url, bodyStr).catch(() => ({}));
-
     const response = await fetch(url, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
-        ...securityHeaders,
         ...(options.headers || {}),
       },
       signal: controller.signal,

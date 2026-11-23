@@ -152,6 +152,7 @@ async function getCandidateServerOrigins() {
 
   // Fallback candidate origins for Cloud PostgreSQL server
   const defaults = [
+    'http://72.62.158.128',
     'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     'http://localhost:3000',
@@ -164,39 +165,12 @@ async function getCandidateServerOrigins() {
   return origins;
 }
 
-// Helper: Read JWT & HMAC Key from IndexedDB and compute HMAC-SHA256 signature headers
-async function swBuildSignedHeaders(method, endpointPath, bodyStr = '') {
-  const headers = { 'Content-Type': 'application/json' };
-  try {
-    const db = await openSyncDatabase(DB_NAME, STORE_NAME);
-    const meta = await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).get('__meta_auth_session__');
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-    });
-    const token = meta?.payload?.token;
-    const hmacKey = meta?.payload?.hmacKey;
-    if (!token || token === 'offline_pending') return headers;
-
-    headers['Authorization'] = `Bearer ${token}`;
-    if (hmacKey && self.crypto && self.crypto.subtle) {
-      const enc = new TextEncoder();
-      const timestamp = String(Date.now());
-      const nonce = (self.crypto.randomUUID ? self.crypto.randomUUID() : `sw_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-      const bodyDigest = await self.crypto.subtle.digest('SHA-256', enc.encode(bodyStr || ''));
-      const bodyHash = Array.from(new Uint8Array(bodyDigest)).map((b) => b.toString(16).padStart(2, '0')).join('');
-      const cleanPath = String(endpointPath || '').split('?')[0];
-      const canonical = `${method.toUpperCase()}|${cleanPath}|${timestamp}|${nonce}|${bodyHash}`;
-      const key = await self.crypto.subtle.importKey('raw', enc.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-      const sigBuf = await self.crypto.subtle.sign('HMAC', key, enc.encode(canonical));
-      const signature = Array.from(new Uint8Array(sigBuf)).map((b) => b.toString(16).padStart(2, '0')).join('');
-      headers['X-Timestamp'] = timestamp;
-      headers['X-Nonce'] = nonce;
-      headers['X-Signature'] = signature;
-    }
-  } catch (e) {}
-  return headers;
+// Helper: Plain JSON headers without any HMAC signing or auth protection
+async function swBuildSignedHeaders(_method, _endpointPath, _bodyStr = '') {
+  return {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
 }
 
 // Upload a single action via individual REST endpoint as fallback
@@ -371,7 +345,6 @@ async function uploadSingleActionViaRest(action, origins) {
 
   const bodyStr = method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : '';
   const signedHeaders = await swBuildSignedHeaders(method, endpointPath, bodyStr);
-  if (!signedHeaders['Authorization']) return false;
 
   for (const origin of origins) {
     try {
@@ -427,7 +400,6 @@ async function flushPendingActionsInBackground() {
       const chunkActions = actions.slice(i, i + SW_BATCH_CHUNK);
       const chunkBody = JSON.stringify({ actions: chunkActions });
       const batchHeaders = await swBuildSignedHeaders('POST', '/api/sync/batch', chunkBody);
-      if (!batchHeaders['Authorization']) break;
       let chunkDone = false;
 
       for (const origin of origins) {
@@ -484,31 +456,29 @@ async function flushPendingActionsInBackground() {
     if (remainingAfterRest.length > 0) {
       const beaconBody = JSON.stringify({ actions: remainingAfterRest });
       const beaconHeaders = await swBuildSignedHeaders('POST', '/api/sync/beacon', beaconBody);
-      if (beaconHeaders['Authorization']) {
-        for (const origin of origins) {
-          try {
-            const beaconUrl = `${origin}/api/sync/beacon`;
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 6000);
-            const bAttempt = await fetch(beaconUrl, {
-              method: 'POST',
-              headers: beaconHeaders,
-              body: beaconBody,
-              signal: controller.signal,
-            });
-            clearTimeout(timer);
-            if (bAttempt && bAttempt.ok) {
-              const bData = await bAttempt.json().catch(() => ({}));
-              if (Array.isArray(bData.processedIds)) {
-                processedIds.push(...bData.processedIds);
-                break;
-              } else if (bData.success) {
-                processedIds.push(...remainingAfterRest.map((a) => a.id));
-                break;
-              }
+      for (const origin of origins) {
+        try {
+          const beaconUrl = `${origin}/api/sync/beacon`;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 6000);
+          const bAttempt = await fetch(beaconUrl, {
+            method: 'POST',
+            headers: beaconHeaders,
+            body: beaconBody,
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (bAttempt && bAttempt.ok) {
+            const bData = await bAttempt.json().catch(() => ({}));
+            if (Array.isArray(bData.processedIds)) {
+              processedIds.push(...bData.processedIds);
+              break;
+            } else if (bData.success) {
+              processedIds.push(...remainingAfterRest.map((a) => a.id));
+              break;
             }
-          } catch (bErr) {}
-        }
+          }
+        } catch (bErr) {}
       }
     }
 

@@ -3,9 +3,6 @@ import type { SalesRepresentative } from '../types';
 
 const AUTH_SESSION_STORAGE_KEY = 'alkarrar_auth_session_v1';
 const LEGACY_REP_STORAGE_KEY = 'sami_installments_rep';
-const KEYSTORE_DB_NAME = 'alkarrar_keystore_db';
-const KEYSTORE_STORE_NAME = 'crypto_keys';
-const KEYSTORE_AES_ID = 'local_aes_gcm_key_v1';
 const SYNC_DB_NAME = 'alkarrar_sync_db';
 const SYNC_STORE_NAME = 'pending_actions';
 const SECONDARY_SYNC_DB_NAME = 'alkarrar_offline_sync_db';
@@ -32,7 +29,6 @@ export interface DeviceSecurityReport {
 
 let memoryAuthSession: AuthSession | null = null;
 const memoryCacheMap = new Map<string, string>();
-let cachedAesKey: CryptoKey | null = null;
 let initPromise: Promise<void> | null = null;
 
 function getAndroidBridge(): any {
@@ -58,13 +54,10 @@ export function isNativeAndroidApk(): boolean {
     window.location.protocol === 'capacitor:' ||
     window.location.protocol === 'ionic:' ||
     window.location.protocol === 'content:' ||
-    !!getAndroidBridge()?.getSecurityReport
+    !!getAndroidBridge()?.syncPendingQueueToNative
   );
 }
 
-// ============================================================
-// Pure-JS SHA-256 / HMAC-SHA256 fallback (if crypto.subtle is unavailable)
-// ============================================================
 function utf8Bytes(str: string): Uint8Array {
   return new TextEncoder().encode(str);
 }
@@ -146,29 +139,6 @@ function sha256BytesFallback(data: Uint8Array): Uint8Array {
   return out;
 }
 
-function hmacSha256HexFallback(keyStr: string, messageStr: string): string {
-  let keyBytes = utf8Bytes(keyStr);
-  if (keyBytes.length > 64) {
-    keyBytes = sha256BytesFallback(keyBytes);
-  }
-  const oPad = new Uint8Array(64);
-  const iPad = new Uint8Array(64);
-  for (let i = 0; i < 64; i++) {
-    const k = i < keyBytes.length ? keyBytes[i] : 0;
-    oPad[i] = k ^ 0x5c;
-    iPad[i] = k ^ 0x36;
-  }
-  const msgBytes = utf8Bytes(messageStr);
-  const inner = new Uint8Array(64 + msgBytes.length);
-  inner.set(iPad);
-  inner.set(msgBytes, 64);
-  const innerHash = sha256BytesFallback(inner);
-  const outer = new Uint8Array(64 + 32);
-  outer.set(oPad);
-  outer.set(innerHash, 64);
-  return bytesToHex(sha256BytesFallback(outer));
-}
-
 export async function sha256Hex(input: string): Promise<string> {
   const bytes = utf8Bytes(input);
   try {
@@ -180,38 +150,14 @@ export async function sha256Hex(input: string): Promise<string> {
   return bytesToHex(sha256BytesFallback(bytes));
 }
 
-export async function hmacSha256Hex(secret: string, message: string): Promise<string> {
-  try {
-    if (typeof crypto !== 'undefined' && crypto.subtle) {
-      const key = await crypto.subtle.importKey(
-        'raw',
-        utf8Bytes(secret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign']
-      );
-      const sig = await crypto.subtle.sign('HMAC', key, utf8Bytes(message));
-      return bytesToHex(new Uint8Array(sig));
-    }
-  } catch (e) {}
-  return hmacSha256HexFallback(secret, message);
+export async function hmacSha256Hex(_secret: string, _message: string): Promise<string> {
+  return '';
 }
 
-// ============================================================
-// Cryptographic Nonces & Offline PIN Verifiers
-// ============================================================
 export function generateCryptoNonce(): string {
   try {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
       return crypto.randomUUID();
-    }
-    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-      const arr = new Uint8Array(16);
-      crypto.getRandomValues(arr);
-      arr[6] = (arr[6] & 0x0f) | 0x40;
-      arr[8] = (arr[8] & 0x3f) | 0x80;
-      const hex = bytesToHex(arr);
-      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
   } catch (e) {}
   return `n_${Date.now()}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}`;
@@ -226,97 +172,7 @@ export async function computeClientOfflinePinVerifier(repId: string, pin: string
 export async function verifyOfflinePinHash(repId: string, enteredPin: string, expectedVerifier?: string | null): Promise<boolean> {
   if (!expectedVerifier) return false;
   const computed = await computeClientOfflinePinVerifier(repId, enteredPin);
-  if (!computed || computed.length !== expectedVerifier.length) return false;
-  let diff = 0;
-  for (let i = 0; i < computed.length; i++) {
-    diff |= computed.charCodeAt(i) ^ expectedVerifier.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-// ============================================================
-// AES-256-GCM Local Cache Encryption
-// ============================================================
-function openKeystoreDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    if (typeof indexedDB === 'undefined') {
-      return reject(new Error('IndexedDB unavailable'));
-    }
-    const req = indexedDB.open(KEYSTORE_DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(KEYSTORE_STORE_NAME)) {
-        db.createObjectStore(KEYSTORE_STORE_NAME, { keyPath: 'id' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function getOrCreateAesKey(): Promise<CryptoKey | null> {
-  if (cachedAesKey) return cachedAesKey;
-  if (typeof crypto === 'undefined' || !crypto.subtle) return null;
-
-  try {
-    const db = await openKeystoreDb();
-    const existing = await new Promise<any>((resolve) => {
-      try {
-        const tx = db.transaction(KEYSTORE_STORE_NAME, 'readonly');
-        const req = tx.objectStore(KEYSTORE_STORE_NAME).get(KEYSTORE_AES_ID);
-        req.onsuccess = () => resolve(req.result || null);
-        req.onerror = () => resolve(null);
-      } catch (e) {
-        resolve(null);
-      }
-    });
-
-    if (existing?.key) {
-      cachedAesKey = existing.key;
-      return cachedAesKey;
-    }
-
-    const generated = await crypto.subtle.generateKey(
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
-
-    await new Promise<void>((resolve) => {
-      try {
-        const tx = db.transaction(KEYSTORE_STORE_NAME, 'readwrite');
-        tx.objectStore(KEYSTORE_STORE_NAME).put({ id: KEYSTORE_AES_ID, key: generated, createdAt: Date.now() });
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-        tx.onabort = () => resolve();
-      } catch (e) {
-        resolve();
-      }
-    });
-
-    cachedAesKey = generated;
-    return generated;
-  } catch (e) {
-    return null;
-  }
-}
-
-function uint8ToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function base64ToUint8(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
+  return !!computed && computed === expectedVerifier;
 }
 
 export async function encryptStringForStorage(plaintext: string): Promise<string> {
@@ -325,25 +181,12 @@ export async function encryptStringForStorage(plaintext: string): Promise<string
 
 export async function decryptStringFromStorage(stored: string): Promise<string | null> {
   if (!stored || typeof stored !== 'string') return null;
-  if (!stored.startsWith(ENC_PREFIX)) return stored;
-  try {
-    const key = await getOrCreateAesKey();
-    if (!key || !crypto?.subtle) return null;
-    const body = stored.slice(ENC_PREFIX.length);
-    const sepIdx = body.indexOf(':');
-    if (sepIdx <= 0) return null;
-    const iv = base64ToUint8(body.slice(0, sepIdx));
-    const cipher = base64ToUint8(body.slice(sepIdx + 1));
-    const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
-    return new TextDecoder().decode(plainBuf);
-  } catch (e) {
-    return null;
-  }
+  if (stored.startsWith(ENC_PREFIX)) return null;
+  return stored;
 }
 
 /**
- * Synchronous read from memory mirror (or plaintext localStorage).
- * Decodes any legacy ENC_V1 entries asynchronously into memory and migrates to plaintext.
+ * Synchronous read directly from memory or plaintext localStorage (no encryption).
  */
 export function secureStorageGetSync(key: string): string | null {
   if (memoryCacheMap.has(key)) {
@@ -352,16 +195,7 @@ export function secureStorageGetSync(key: string): string | null {
   if (typeof localStorage === 'undefined') return null;
   try {
     const raw = localStorage.getItem(key);
-    if (!raw) return null;
-    if (raw.startsWith(ENC_PREFIX)) {
-      decryptStringFromStorage(raw).then((plain) => {
-        if (plain !== null) {
-          memoryCacheMap.set(key, plain);
-          try { localStorage.setItem(key, plain); } catch (e) {}
-        }
-      }).catch(() => {});
-      return null;
-    }
+    if (!raw || raw.startsWith(ENC_PREFIX)) return null;
     memoryCacheMap.set(key, raw);
     return raw;
   } catch (e) {
@@ -385,11 +219,11 @@ export function secureStorageRemoveSync(key: string): void {
 }
 
 // ============================================================
-// Auth Session Storage (Memory + Android Keystore + Encrypted localStorage + IDB for SW)
+// Auth Session Storage (Plain localStorage + Memory)
 // ============================================================
-async function mirrorAuthSessionToIndexedDb(session: { token: string; hmacKey: string } | null): Promise<void> {
+async function clearLegacySessionFromIndexedDb(): Promise<void> {
   if (typeof indexedDB === 'undefined') return;
-  const writeToDb = (dbName: string, storeName: string) =>
+  const deleteFromDb = (dbName: string, storeName: string) =>
     new Promise<void>((resolve) => {
       try {
         const req = indexedDB.open(dbName, 2);
@@ -402,19 +236,12 @@ async function mirrorAuthSessionToIndexedDb(session: { token: string; hmacKey: s
         req.onsuccess = () => {
           try {
             const db = req.result;
-            const tx = db.transaction(storeName, 'readwrite');
-            const store = tx.objectStore(storeName);
-            if (session) {
-              store.put({
-                id: '__meta_auth_session__',
-                type: '__META_CONFIG__',
-                payload: { token: session.token, hmacKey: session.hmacKey },
-                timestamp: Date.now(),
-                status: 'synced',
-              });
-            } else {
-              store.delete('__meta_auth_session__');
+            if (!db.objectStoreNames.contains(storeName)) {
+              resolve();
+              return;
             }
+            const tx = db.transaction(storeName, 'readwrite');
+            tx.objectStore(storeName).delete('__meta_auth_session__');
             tx.oncomplete = () => resolve();
             tx.onerror = () => resolve();
             tx.onabort = () => resolve();
@@ -429,8 +256,8 @@ async function mirrorAuthSessionToIndexedDb(session: { token: string; hmacKey: s
     });
 
   await Promise.all([
-    writeToDb(SYNC_DB_NAME, SYNC_STORE_NAME),
-    writeToDb(SECONDARY_SYNC_DB_NAME, SECONDARY_SYNC_STORE_NAME),
+    deleteFromDb(SYNC_DB_NAME, SYNC_STORE_NAME),
+    deleteFromDb(SECONDARY_SYNC_DB_NAME, SECONDARY_SYNC_STORE_NAME),
   ]).catch(() => {});
 }
 
@@ -443,6 +270,7 @@ export function sanitizeRepForStorage(rep: SalesRepresentative): SalesRepresenta
 export function setAuthSession(session: AuthSession): void {
   const sanitizedSession: AuthSession = {
     ...session,
+    hmacKey: '',
     rep: sanitizeRepForStorage(session.rep),
     issuedAt: session.issuedAt || Date.now(),
   };
@@ -451,22 +279,16 @@ export function setAuthSession(session: AuthSession): void {
   const json = JSON.stringify(sanitizedSession);
   secureStorageSetSync(AUTH_SESSION_STORAGE_KEY, json);
 
-  // Maintain sanitized rep copy for existing restore logic (without plaintext PIN)
   try {
     localStorage.setItem(LEGACY_REP_STORAGE_KEY, JSON.stringify(sanitizedSession.rep));
   } catch (e) {}
 
-  // Save in Android Hardware Keystore EncryptedSharedPreferences
   try {
     const bridge = getAndroidBridge();
     if (bridge && typeof bridge.secureSet === 'function') {
       bridge.secureSet(AUTH_SESSION_STORAGE_KEY, json);
-      bridge.secureSet('auth_token', sanitizedSession.token);
-      bridge.secureSet('hmac_key', sanitizedSession.hmacKey);
     }
   } catch (e) {}
-
-  mirrorAuthSessionToIndexedDb({ token: sanitizedSession.token, hmacKey: sanitizedSession.hmacKey }).catch(() => {});
 }
 
 export function getAuthSession(): AuthSession | null {
@@ -475,10 +297,10 @@ export function getAuthSession(): AuthSession | null {
   try {
     const bridge = getAndroidBridge();
     if (bridge && typeof bridge.secureGet === 'function') {
-      const fromKeystore = bridge.secureGet(AUTH_SESSION_STORAGE_KEY);
-      if (fromKeystore && typeof fromKeystore === 'string' && fromKeystore.startsWith('{')) {
-        const parsed = JSON.parse(fromKeystore) as AuthSession;
-        if (parsed?.token && parsed?.rep) {
+      const fromNative = bridge.secureGet(AUTH_SESSION_STORAGE_KEY);
+      if (fromNative && typeof fromNative === 'string' && fromNative.startsWith('{')) {
+        const parsed = JSON.parse(fromNative) as AuthSession;
+        if (parsed?.rep) {
           memoryAuthSession = parsed;
           return parsed;
         }
@@ -490,7 +312,7 @@ export function getAuthSession(): AuthSession | null {
   if (raw && raw.startsWith('{')) {
     try {
       const parsed = JSON.parse(raw) as AuthSession;
-      if (parsed?.token && parsed?.rep) {
+      if (parsed?.rep) {
         memoryAuthSession = parsed;
         return parsed;
       }
@@ -504,7 +326,7 @@ export function getAuthToken(): string {
 }
 
 export function getHmacKey(): string {
-  return getAuthSession()?.hmacKey || '';
+  return '';
 }
 
 export function clearAuthSession(): void {
@@ -521,69 +343,46 @@ export function clearAuthSession(): void {
       bridge.secureRemove('hmac_key');
     }
   } catch (e) {}
-  mirrorAuthSessionToIndexedDb(null).catch(() => {});
+  clearLegacySessionFromIndexedDb().catch(() => {});
 }
 
 /**
- * Hydrates AES-256-GCM encrypted local caches & session into synchronous memory cache before app boot.
+ * Loads plaintext local caches & session into synchronous memory cache before app boot (no encryption/keystore).
  */
 export async function initSecurityClient(): Promise<void> {
   if (initPromise) return initPromise;
-  initPromise = (async () => {
+  initPromise = Promise.resolve().then(() => {
     try {
-      await getOrCreateAesKey();
       if (typeof localStorage !== 'undefined') {
-        const keysToDecrypt: string[] = [];
         for (let i = 0; i < localStorage.length; i++) {
           const k = localStorage.key(i);
           if (k && (k.startsWith('sami_cache_') || k === AUTH_SESSION_STORAGE_KEY || k === 'alkarrar_offline_pending_queue')) {
-            keysToDecrypt.push(k);
-          }
-        }
-        await Promise.all(
-          keysToDecrypt.map(async (k) => {
             try {
               const raw = localStorage.getItem(k);
-              if (!raw) return;
-              if (raw.startsWith(ENC_PREFIX)) {
-                const plain = await decryptStringFromStorage(raw);
-                if (plain !== null) {
-                  memoryCacheMap.set(k, plain);
-                  try { localStorage.setItem(k, plain); } catch (e) {}
-                }
-              } else {
+              if (raw && !raw.startsWith(ENC_PREFIX)) {
                 memoryCacheMap.set(k, raw);
               }
             } catch (e) {}
-          })
-        );
+          }
+        }
       }
-
-      // Hydrate memory session from Android Keystore if available
       getAuthSession();
     } catch (e) {}
-  })();
+  });
   return initPromise;
 }
 
 // ============================================================
-// Lightweight Request Auth Headers (No Heavy Client Body Hashing)
+// No Signing or Auth Protection Headers
 // ============================================================
 export async function signRequestHeaders(
   _method: string,
   _endpointOrUrl: string,
   _bodyStr: string = ''
 ): Promise<Record<string, string>> {
-  const session = getAuthSession();
-  if (!session?.token) return {};
-  return {
-    Authorization: `Bearer ${session.token}`,
-  };
+  return {};
 }
 
-// ============================================================
-// Native Android Device Integrity (Root / Frida / Xposed / Debugger)
-// ============================================================
 export function checkDeviceSecurityIntegrity(): DeviceSecurityReport {
   return {
     compromised: false,

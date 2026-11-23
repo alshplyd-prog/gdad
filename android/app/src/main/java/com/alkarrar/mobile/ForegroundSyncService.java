@@ -54,6 +54,7 @@ public class ForegroundSyncService extends Service {
     private static final int NOTIFICATION_ID = 9981;
 
     private static final String[] CANDIDATE_SYNC_URLS = {
+        "http://72.62.158.128/api/sync/batch",
         "https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api/sync/batch",
         "https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api/sync/batch"
     };
@@ -492,53 +493,8 @@ public class ForegroundSyncService extends Service {
         }
     }
 
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b & 0xff));
-        }
-        return sb.toString();
-    }
-
-    private static String sha256Hex(byte[] data) throws Exception {
-        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
-        return bytesToHex(md.digest(data != null ? data : new byte[0]));
-    }
-
-    private static String hmacSha256Hex(String secret, String message) throws Exception {
-        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-        javax.crypto.spec.SecretKeySpec keySpec = new javax.crypto.spec.SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256");
-        mac.init(keySpec);
-        return bytesToHex(mac.doFinal(message.getBytes("UTF-8")));
-    }
-
-    private static void attachSignedHeaders(
-        HttpURLConnection conn,
-        String method,
-        String fullUrl,
-        byte[] bodyBytes,
-        String authToken,
-        String hmacKey
-    ) throws Exception {
-        if (authToken != null && !authToken.trim().isEmpty()) {
-            conn.setRequestProperty("Authorization", "Bearer " + authToken.trim());
-        }
-        if (hmacKey != null && !hmacKey.isEmpty() && authToken != null && !authToken.trim().isEmpty()) {
-            URL parsed = new URL(fullUrl);
-            String pathWithQuery = parsed.getPath() + (parsed.getQuery() != null ? "?" + parsed.getQuery() : "");
-            String ts = String.valueOf(System.currentTimeMillis());
-            String nonce = java.util.UUID.randomUUID().toString();
-            String bodyHash = sha256Hex(bodyBytes);
-            String canonical = method.toUpperCase() + "|" + pathWithQuery + "|" + ts + "|" + nonce + "|" + bodyHash;
-            String signature = hmacSha256Hex(hmacKey, canonical);
-            conn.setRequestProperty("X-Timestamp", ts);
-            conn.setRequestProperty("X-Nonce", nonce);
-            conn.setRequestProperty("X-Signature", signature);
-        }
-    }
-
     /**
-     * Reads pending actions from SQLCipher and uploads them via fast batch + REST fallback sync
+     * Reads pending actions from local storage and uploads them via fast batch + REST fallback sync (no signing/encryption)
      */
     public static int performNativeStorageSync(Context context) {
         int uploadedCount = 0;
@@ -547,9 +503,6 @@ public class ForegroundSyncService extends Service {
         }
         if (context == null) return 0;
         try {
-            String authToken = SecureKeyStoreHelper.getString(context, "auth_token", "");
-            String hmacKey = SecureKeyStoreHelper.getString(context, "hmac_key", "");
-
             String queueJson = readNativePendingQueue(context);
             if (queueJson == null || queueJson.trim().isEmpty() || queueJson.equals("[]")) {
                 return 0;
@@ -616,7 +569,6 @@ public class ForegroundSyncService extends Service {
                         conn.setRequestMethod("POST");
                         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                         conn.setRequestProperty("Accept", "application/json");
-                        attachSignedHeaders(conn, "POST", targetUrl, out, authToken, hmacKey);
                         conn.setConnectTimeout(10000);
                         conn.setReadTimeout(25000);
                         conn.setDoOutput(true);
@@ -753,7 +705,6 @@ public class ForegroundSyncService extends Service {
                                 sConn.setReadTimeout(10000);
 
                                 byte[] rowBytes = isDelete ? new byte[0] : payload.toString().getBytes("UTF-8");
-                                attachSignedHeaders(sConn, reqMethod, ep, rowBytes, authToken, hmacKey);
 
                                 if (!isDelete) {
                                     sConn.setDoOutput(true);

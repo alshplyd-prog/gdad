@@ -9,7 +9,6 @@ import {
   secureStorageSetSync,
   secureStorageRemoveSync,
   generateCryptoNonce,
-  signRequestHeaders,
 } from './securityClient';
 import { normalizeArabicPersonName } from './nameHelpers';
 import {
@@ -1457,26 +1456,23 @@ export function sendBeaconOnExit() {
       } catch (e) {}
     }
 
-    // 4. Resolve target URL (keepalive signed fetch to /api/sync/batch)
+    // 4. Resolve target URL (keepalive plain fetch to /api/sync/batch)
     const isNative = isNativeOrApkEnvironment();
     const batchUrl = isNative ? getFullApiUrl('/api/sync/batch') : '/api/sync/batch';
 
-    // 5. Send authenticated & HMAC-signed keepalive Fetch
-    const BEACON_CHUNK = 25;
+    // 5. Send direct keepalive Fetch synchronously
+    const BEACON_CHUNK = 100;
     for (let i = 0; i < pendingToSync.length; i += BEACON_CHUNK) {
       const chunk = pendingToSync.slice(i, i + BEACON_CHUNK);
       const payloadJson = JSON.stringify({ actions: chunk });
 
       if (typeof fetch === 'function') {
-        signRequestHeaders('POST', '/api/sync/batch', payloadJson)
-          .then((secHeaders) =>
-            fetch(batchUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', ...secHeaders },
-              body: payloadJson,
-              keepalive: true,
-            })
-          )
+        fetch(batchUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: payloadJson,
+          keepalive: true,
+        })
           .then((res) => {
             if (res && res.ok) {
               res.json().then((data) => {
