@@ -464,7 +464,6 @@ export default function App() {
       if (Network && typeof Network.addListener === 'function') {
         listenerPromise = Network.addListener('networkStatusChange', async (status) => {
           if (status.connected) {
-            if (isUserActivelyTypingOrInputFocused()) return;
             console.log("عادت الشبكة، جاري المزامنة...");
             try {
               await flushPendingQueue();
@@ -501,28 +500,32 @@ export default function App() {
       setPendingCount((prev) => (prev === count ? prev : count));
     });
 
+    // Immediately attempt automatic upload of any leftover pending items on app startup
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      flushPendingQueue().catch(() => {});
+    }
+
     const handleOnline = async () => {
-      if (isUserActivelyTypingOrInputFocused()) return;
       setSyncError(false);
-      if (isSyncingRef.current) return;
-      setIsSyncing(true);
       try {
         await loadSnapshotFromIndexedDbIfAvailable().catch(() => {});
         const res = await flushPendingQueue();
         if (res && res.remaining > 0) {
-          await new Promise((r) => setTimeout(r, 800));
-          if (!isUserActivelyTypingOrInputFocused()) {
-            await flushPendingQueue();
-          }
+          await new Promise((r) => setTimeout(r, 400));
+          await flushPendingQueue();
         }
-        if (!isUserActivelyTypingOrInputFocused()) {
-          await silentBackgroundSync();
-          await forceRefreshAllDataFromPostgres();
+        if (!isUserActivelyTypingOrInputFocused() && !isSyncingRef.current) {
+          setIsSyncing(true);
+          try {
+            await silentBackgroundSync();
+            await forceRefreshAllDataFromPostgres();
+          } finally {
+            setIsSyncing(false);
+          }
         }
       } catch (e) {
         console.warn('Sync on online notice:', e);
       } finally {
-        setIsSyncing(false);
         processPrintQueue();
       }
     };
@@ -552,7 +555,7 @@ export default function App() {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         handleAppCloseOrHide();
-      } else if (document.visibilityState === 'visible' && !isUserActivelyTypingOrInputFocused()) {
+      } else if (document.visibilityState === 'visible') {
         handleOnline();
       }
     };
@@ -561,7 +564,7 @@ export default function App() {
     window.addEventListener('offline', handleOffline);
     // Note: Do NOT listen to 'focus' on window to prevent interrupting Android keyboard input
     window.addEventListener('pageshow', () => {
-      if (!isUserActivelyTypingOrInputFocused() && !document.hidden) {
+      if (!document.hidden) {
         handleOnline();
       }
     });
@@ -579,9 +582,7 @@ export default function App() {
           event.data.type === 'BACKGROUND_DATA_UPDATED' ||
           event.data.type === 'SYNC_COMPLETE')
       ) {
-        if (!isUserActivelyTypingOrInputFocused()) {
-          handleOnline();
-        }
+        handleOnline();
       }
     };
     if ('serviceWorker' in navigator) {
@@ -591,52 +592,54 @@ export default function App() {
     // Run 5-day cycle for automatic cleanup of payments older than 1 year and periodic polling
     run5DayPruneAndPollingInspection(false).catch(() => {});
 
-    // Periodic heartbeat (every 15s) to test database connectivity & auto-flush pending queue
+    // Automatic background flush & heartbeat (every 5s): uploads queued items without waiting for idle input
+    let versionTick = 0;
     const connectionHeartbeatInterval = setInterval(async () => {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) {
         setSyncError(true);
         return;
       }
-      if (typeof document !== 'undefined' && document.hidden) return;
 
-      // Skip refresh while user is actively typing or an input is focused to guarantee zero input loss
-      if (isUserActivelyTypingOrInputFocused()) {
-        return;
-      }
+      const fullQueue = await getPendingQueue().catch(() => getPendingQueueSync());
+      const hasUnsynced = fullQueue.some((i) => i.status !== 'synced');
 
-      const queue = getPendingQueueSync();
-      const hasUnsynced = queue.some((i) => i.status !== 'synced');
-
-      if (hasUnsynced && !isSyncingRef.current) {
+      if (hasUnsynced) {
         try {
           const res = await flushPendingQueue();
           setSyncError(false);
-          if (res && res.flushed > 0) {
-            await forceRefreshAllDataFromPostgres();
+          if (res && res.flushed > 0 && !isUserActivelyTypingOrInputFocused() && typeof document !== 'undefined' && !document.hidden) {
+            await forceRefreshAllDataFromPostgres().catch(() => {});
           }
         } catch (e) {
           setSyncError(true);
         }
-      } else {
-        // Quick lightweight version verification
-        try {
-          const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 4000).catch(() => null);
-          if (res && res.ok) {
-            setSyncError(false);
-            const data = await res.json().catch(() => null);
-            if (data && data.syncVersion) {
-              const lastKnownVersion = localStorage.getItem('sami_last_sync_version');
-              if (String(data.syncVersion) !== lastKnownVersion) {
-                localStorage.setItem('sami_last_sync_version', String(data.syncVersion));
-                reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
-              }
+        return;
+      }
+
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (isUserActivelyTypingOrInputFocused()) return;
+
+      versionTick = (versionTick + 1) % 3;
+      if (versionTick !== 0) return;
+
+      // Quick lightweight version verification (~every 15s when idle & queue empty)
+      try {
+        const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 4000).catch(() => null);
+        if (res && res.ok) {
+          setSyncError(false);
+          const data = await res.json().catch(() => null);
+          if (data && data.syncVersion) {
+            const lastKnownVersion = localStorage.getItem('sami_last_sync_version');
+            if (String(data.syncVersion) !== lastKnownVersion) {
+              localStorage.setItem('sami_last_sync_version', String(data.syncVersion));
+              reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
             }
           }
-        } catch (e) {
-          // ignore transient health check
         }
+      } catch (e) {
+        // ignore transient health check
       }
-    }, 15000);
+    }, 5000);
 
     let capAppStateHandle: any = null;
     let capPauseHandle: any = null;
@@ -652,7 +655,7 @@ export default function App() {
           try {
             if (!state.isActive) {
               handleAppCloseOrHide();
-            } else if (!isUserActivelyTypingOrInputFocused()) {
+            } else {
               handleOnline();
             }
           } catch (stErr) {

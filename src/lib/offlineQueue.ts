@@ -388,6 +388,9 @@ export function subscribeToQueueChange(listener: (count: number) => void): () =>
     const activeCount = q.filter((i) => i.status !== 'synced').length;
     lastNotifiedQueueCount = activeCount;
     listener(activeCount);
+    if (activeCount > 0 && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+      flushPendingQueue().catch(() => {});
+    }
   });
   return () => {
     queueListeners = queueListeners.filter((l) => l !== listener);
@@ -1375,12 +1378,12 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         notifySyncSuccessListeners();
       }
 
-      // If more items remain AND we uploaded some, schedule a single debounced follow-up flush
+      // If more items remain AND we uploaded some, schedule an immediate follow-up flush
       if (remainingQueue.length > 0 && verifiedSyncedIds.length > 0) {
         if (followUpFlushTimer) clearTimeout(followUpFlushTimer);
         followUpFlushTimer = setTimeout(() => {
           flushPendingQueue().catch(() => {});
-        }, 500);
+        }, 150);
       }
 
       return { flushed: verifiedSyncedIds.length, remaining: remainingQueue.length };
@@ -2038,17 +2041,26 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
       }).catch(() => {});
     }
 
-    // 3. Setup Periodic Background Task & Dedicated Web Worker Heartbeat
-    const SYNC_INTERVAL_MS = 10 * 1000;
-    setInterval(() => {
-      if (isUserActivelyTypingOrInputFocused()) return;
-      const queue = getPendingQueueSync();
-      const hasUnsynced = queue.some((i) => i.status !== 'synced');
-      if (hasUnsynced && !isFlushing) {
-        console.log('[10-Second Background Task] Detected pending offline actions. Running silent sync to Postgres...');
+    // 3. Immediate startup flush + 4s Automatic Background Upload Loop (never blocked by typing focus)
+    setTimeout(() => {
+      if (typeof navigator === 'undefined' || navigator.onLine !== false) {
         flushPendingQueue().catch(() => {});
       }
-      // Also trigger BackgroundRunner event if available
+    }, 150);
+
+    const SYNC_INTERVAL_MS = 4 * 1000;
+    setInterval(async () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      const syncQueue = getPendingQueueSync();
+      let hasUnsynced = lastNotifiedQueueCount > 0 || syncQueue.some((i) => i.status !== 'synced');
+      if (!hasUnsynced) {
+        const asyncQueue = await getPendingQueue().catch(() => []);
+        hasUnsynced = asyncQueue.some((i) => i.status !== 'synced');
+      }
+      if (hasUnsynced) {
+        flushPendingQueue().catch(() => {});
+      }
+      // Also trigger BackgroundRunner event if available when user is idle
       try {
         if (BackgroundRunner && typeof BackgroundRunner.dispatchEvent === 'function' && !isUserActivelyTypingOrInputFocused()) {
           BackgroundRunner.dispatchEvent({
@@ -2070,7 +2082,7 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
               if (timer) clearInterval(timer);
               timer = setInterval(function() {
                 self.postMessage('TICK');
-              }, 6000);
+              }, 5000);
             } else if (e.data === 'STOP') {
               if (timer) clearInterval(timer);
               timer = null;
@@ -2081,10 +2093,10 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
         const worker = new Worker(URL.createObjectURL(blob));
         worker.onmessage = (e) => {
           if (e.data === 'TICK') {
-            if (isUserActivelyTypingOrInputFocused()) return;
+            if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
             const queue = getPendingQueueSync();
-            const hasUnsynced = queue.some((i) => i.status !== 'synced');
-            if (hasUnsynced && !isFlushing) {
+            const hasUnsynced = lastNotifiedQueueCount > 0 || queue.some((i) => i.status !== 'synced');
+            if (hasUnsynced) {
               flushPendingQueue().catch(() => {});
             }
           }
@@ -2279,8 +2291,11 @@ function startWorkerKeepAlive(): void {
     globalKeepAliveWorker = new Worker(workerUrl);
     globalKeepAliveWorker.onmessage = (e) => {
       if (e.data === 'TICK') {
-        if (isUserActivelyTypingOrInputFocused()) return;
-        flushPendingQueue().catch(() => {});
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+        const hasUnsynced = lastNotifiedQueueCount > 0 || getPendingQueueSync().some((i) => i.status !== 'synced');
+        if (hasUnsynced) {
+          flushPendingQueue().catch(() => {});
+        }
       }
     };
     globalKeepAliveWorker.postMessage('start');
