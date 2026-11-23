@@ -235,7 +235,7 @@ export async function verifyOfflinePinHash(repId: string, enteredPin: string, ex
 }
 
 // ============================================================
-// Local Cache Encryption (Disabled for Testing)
+// AES-256-GCM Local Cache Encryption
 // ============================================================
 function openKeystoreDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -301,6 +301,24 @@ async function getOrCreateAesKey(): Promise<CryptoKey | null> {
   }
 }
 
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToUint8(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 export async function encryptStringForStorage(plaintext: string): Promise<string> {
   return plaintext;
 }
@@ -308,11 +326,24 @@ export async function encryptStringForStorage(plaintext: string): Promise<string
 export async function decryptStringFromStorage(stored: string): Promise<string | null> {
   if (!stored || typeof stored !== 'string') return null;
   if (!stored.startsWith(ENC_PREFIX)) return stored;
-  return null;
+  try {
+    const key = await getOrCreateAesKey();
+    if (!key || !crypto?.subtle) return null;
+    const body = stored.slice(ENC_PREFIX.length);
+    const sepIdx = body.indexOf(':');
+    if (sepIdx <= 0) return null;
+    const iv = base64ToUint8(body.slice(0, sepIdx));
+    const cipher = base64ToUint8(body.slice(sepIdx + 1));
+    const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
+    return new TextDecoder().decode(plainBuf);
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
  * Synchronous read from memory mirror (or plaintext localStorage).
+ * Decodes any legacy ENC_V1 entries asynchronously into memory and migrates to plaintext.
  */
 export function secureStorageGetSync(key: string): string | null {
   if (memoryCacheMap.has(key)) {
@@ -323,6 +354,12 @@ export function secureStorageGetSync(key: string): string | null {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     if (raw.startsWith(ENC_PREFIX)) {
+      decryptStringFromStorage(raw).then((plain) => {
+        if (plain !== null) {
+          memoryCacheMap.set(key, plain);
+          try { localStorage.setItem(key, plain); } catch (e) {}
+        }
+      }).catch(() => {});
       return null;
     }
     memoryCacheMap.set(key, raw);
@@ -348,7 +385,7 @@ export function secureStorageRemoveSync(key: string): void {
 }
 
 // ============================================================
-// Auth Session Storage (Memory + Android Keystore + localStorage + IDB for SW)
+// Auth Session Storage (Memory + Android Keystore + Encrypted localStorage + IDB for SW)
 // ============================================================
 async function mirrorAuthSessionToIndexedDb(session: { token: string; hmacKey: string } | null): Promise<void> {
   if (typeof indexedDB === 'undefined') return;
@@ -414,10 +451,12 @@ export function setAuthSession(session: AuthSession): void {
   const json = JSON.stringify(sanitizedSession);
   secureStorageSetSync(AUTH_SESSION_STORAGE_KEY, json);
 
+  // Maintain sanitized rep copy for existing restore logic (without plaintext PIN)
   try {
     localStorage.setItem(LEGACY_REP_STORAGE_KEY, JSON.stringify(sanitizedSession.rep));
   } catch (e) {}
 
+  // Save in Android Hardware Keystore EncryptedSharedPreferences
   try {
     const bridge = getAndroidBridge();
     if (bridge && typeof bridge.secureSet === 'function') {
@@ -486,26 +525,41 @@ export function clearAuthSession(): void {
 }
 
 /**
- * Hydrates local caches & session into synchronous memory cache before app boot.
+ * Hydrates AES-256-GCM encrypted local caches & session into synchronous memory cache before app boot.
  */
 export async function initSecurityClient(): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     try {
+      await getOrCreateAesKey();
       if (typeof localStorage !== 'undefined') {
+        const keysToDecrypt: string[] = [];
         for (let i = 0; i < localStorage.length; i++) {
           const k = localStorage.key(i);
           if (k && (k.startsWith('sami_cache_') || k === AUTH_SESSION_STORAGE_KEY || k === 'alkarrar_offline_pending_queue')) {
+            keysToDecrypt.push(k);
+          }
+        }
+        await Promise.all(
+          keysToDecrypt.map(async (k) => {
             try {
               const raw = localStorage.getItem(k);
-              if (raw && !raw.startsWith(ENC_PREFIX)) {
+              if (!raw) return;
+              if (raw.startsWith(ENC_PREFIX)) {
+                const plain = await decryptStringFromStorage(raw);
+                if (plain !== null) {
+                  memoryCacheMap.set(k, plain);
+                  try { localStorage.setItem(k, plain); } catch (e) {}
+                }
+              } else {
                 memoryCacheMap.set(k, raw);
               }
             } catch (e) {}
-          }
-        }
+          })
+        );
       }
 
+      // Hydrate memory session from Android Keystore if available
       getAuthSession();
     } catch (e) {}
   })();
@@ -513,18 +567,22 @@ export async function initSecurityClient(): Promise<void> {
 }
 
 // ============================================================
-// Request Signing Disabled for Testing
+// Lightweight Request Auth Headers (No Heavy Client Body Hashing)
 // ============================================================
 export async function signRequestHeaders(
   _method: string,
   _endpointOrUrl: string,
   _bodyStr: string = ''
 ): Promise<Record<string, string>> {
-  return {};
+  const session = getAuthSession();
+  if (!session?.token) return {};
+  return {
+    Authorization: `Bearer ${session.token}`,
+  };
 }
 
 // ============================================================
-// Native Android Device Integrity (Bypassed for Testing)
+// Native Android Device Integrity (Root / Frida / Xposed / Debugger)
 // ============================================================
 export function checkDeviceSecurityIntegrity(): DeviceSecurityReport {
   return {

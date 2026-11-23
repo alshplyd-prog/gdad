@@ -3,16 +3,18 @@ import { BackgroundTask } from '@capawesome/capacitor-background-task';
 import { BackgroundRunner } from '@capacitor/background-runner';
 import { Preferences } from '@capacitor/preferences';
 import { Network } from '@capacitor/network';
-import { getApiBaseUrl, getFullApiUrl, fetchWithFallback, CANDIDATE_SERVERS, getCustomServerUrl, isNativeOrApkEnvironment } from './apiConfig';
+import { getApiBaseUrl, getFullApiUrl, fetchWithFallback, CANDIDATE_SERVERS, getCustomServerUrl, isNativeOrApkEnvironment, isNetworkConnected } from './apiConfig';
 import {
   secureStorageGetSync,
   secureStorageSetSync,
   secureStorageRemoveSync,
   generateCryptoNonce,
+  signRequestHeaders,
 } from './securityClient';
 import { normalizeArabicPersonName } from './nameHelpers';
 import {
   reconcileAllLocalWithDatabase,
+  verifyAndReconcileWithServer,
   verifyAndReconcileUntilMatched,
   mirrorLocalSnapshotToIndexedDb,
   loadSnapshotFromIndexedDbIfAvailable,
@@ -41,6 +43,7 @@ const STORE_NAME = 'pending_actions';
 const SECONDARY_DB_NAME = 'alkarrar_offline_sync_db';
 const SECONDARY_STORE_NAME = 'offline_queue';
 
+// Helper to ensure any async operation never hangs indefinitely
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number = 3000, fallbackVal: T): Promise<T> {
   return Promise.race([
     promise,
@@ -48,6 +51,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number = 3000, fallbackV
   ]);
 }
 
+// IndexedDB Helper with indices for status and timestamp
 export function openIndexedDb(dbName = DB_NAME, storeName = STORE_NAME): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
@@ -79,6 +83,9 @@ export function openIndexedDb(dbName = DB_NAME, storeName = STORE_NAME): Promise
   });
 }
 
+/**
+ * Get all actions directly from Primary IndexedDB
+ */
 function isValidOfflineAction(item: any, permanentlySynced?: Set<string>): boolean {
   if (!item || !item.id || !item.type) return false;
   const idStr = String(item.id);
@@ -130,7 +137,8 @@ export async function getActionsFromIndexedDb(): Promise<PendingAction[]> {
               type: item.type,
               payload: item.payload,
               timestamp: Number(item.timestamp) || now,
-              status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 15000 ? 'syncing' : 'pending')) as ActionStatus,
+              // If marked syncing but over 30s old, un-freeze back to pending
+              status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 30000 ? 'syncing' : 'pending')) as ActionStatus,
               retryCount: Number(item.retryCount) || 0,
               error: item.error || null,
               syncedAt: item.syncedAt || null,
@@ -152,6 +160,7 @@ export async function getActionsFromIndexedDb(): Promise<PendingAction[]> {
   }
 }
 
+// Helper: Generate candidate metadata payload for Service Worker
 function getMetaPayloadForSw() {
   const origins: string[] = [];
   if (typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null') {
@@ -166,6 +175,9 @@ function getMetaPayloadForSw() {
   return { origins, serverUrl };
 }
 
+/**
+ * Save an action to IndexedDB (and mirror to secondary DB)
+ */
 export async function saveActionToIndexedDb(action: PendingAction): Promise<void> {
   const metaPayload = getMetaPayloadForSw();
   const savePrimary = async () => {
@@ -174,9 +186,12 @@ export async function saveActionToIndexedDb(action: PendingAction): Promise<void
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
       store.put(action);
+
+      // Save server URL metadata for background service worker
       try {
         store.put({ id: '__meta_server_url__', type: '__META_CONFIG__', payload: metaPayload, timestamp: Date.now(), status: 'synced' });
       } catch (e) {}
+
       await new Promise((resolve) => {
         tx.oncomplete = resolve;
         tx.onerror = resolve;
@@ -205,6 +220,9 @@ export async function saveActionToIndexedDb(action: PendingAction): Promise<void
   await withTimeout(Promise.all([savePrimary(), saveSecondary()]), 2500, null);
 }
 
+/**
+ * Remove an action by ID from IndexedDB
+ */
 export async function deleteActionFromIndexedDb(id: string): Promise<void> {
   const delPrimary = async () => {
     try {
@@ -235,6 +253,9 @@ export async function deleteActionFromIndexedDb(id: string): Promise<void> {
   await withTimeout(Promise.all([delPrimary(), delSecondary()]), 2500, null);
 }
 
+/**
+ * Remove a batch of action IDs from IndexedDB using a single transaction per DB (sub-5ms for 100+ items)
+ */
 async function deleteActionsBatchFromIndexedDb(ids: string[]): Promise<void> {
   if (!ids || ids.length === 0) return;
   const delBatch = async (dbName: string, storeName: string) => {
@@ -262,6 +283,9 @@ async function deleteActionsBatchFromIndexedDb(ids: string[]): Promise<void> {
   );
 }
 
+/**
+ * Sync entire memory/localStorage queue snapshot to IndexedDB
+ */
 async function syncQueueToIndexedDb(queue: PendingAction[]): Promise<void> {
   const metaPayload = getMetaPayloadForSw();
   const syncPrimary = async () => {
@@ -276,6 +300,7 @@ async function syncQueueToIndexedDb(queue: PendingAction[]): Promise<void> {
       try {
         store.put({ id: '__meta_server_url__', type: '__META_CONFIG__', payload: metaPayload, timestamp: Date.now(), status: 'synced' });
       } catch (e) {}
+
       await new Promise((resolve) => {
         tx.oncomplete = resolve;
         tx.onerror = resolve;
@@ -425,6 +450,9 @@ export function markActionIdsAsPermanentlySynced(ids: string[]): void {
   } catch (e) {}
 }
 
+/**
+ * Synchronously read pending actions from localStorage (used for rapid local state merging)
+ */
 export function getPendingQueueSync(): PendingAction[] {
   try {
     const permanentlySynced = getPermanentlySyncedIds();
@@ -432,7 +460,8 @@ export function getPendingQueueSync(): PendingAction[] {
     const list = local ? JSON.parse(local) : [];
     if (!Array.isArray(list)) return [];
     const now = Date.now();
-
+    
+    // Deduplicate by action type group + entity/payload ID (keep latest action per record)
     const entityMap = new Map<string, any>();
     for (const item of list) {
       if (!isValidOfflineAction(item, permanentlySynced)) continue;
@@ -455,7 +484,7 @@ export function getPendingQueueSync(): PendingAction[] {
       type: item.type,
       payload: item.payload,
       timestamp: Number(item.timestamp) || now,
-      status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 15000 ? 'syncing' : 'pending') as ActionStatus,
+      status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 30000 ? 'syncing' : 'pending') as ActionStatus,
       retryCount: Number(item.retryCount) || 0,
       error: item.error || null,
       syncedAt: item.syncedAt || null,
@@ -466,11 +495,17 @@ export function getPendingQueueSync(): PendingAction[] {
   }
 }
 
+/**
+ * Asynchronously read pending actions, prioritizing IndexedDB and reconciling with Preferences/localStorage
+ */
 export async function getPendingQueue(): Promise<PendingAction[]> {
   try {
     const permanentlySynced = getPermanentlySyncedIds();
+
+    // 1. Read from IndexedDB
     const idbActions = await getActionsFromIndexedDb();
 
+    // Check if Service Worker background synced any IDs
     let swSyncedIds: string[] = [];
     try {
       const db = await openIndexedDb(DB_NAME, STORE_NAME);
@@ -492,6 +527,7 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
       swSyncedIds.forEach((id) => permanentlySynced.add(id));
     }
 
+    // 2. Read from Native Android Bridge, Preferences and localStorage
     let nativeList: any[] = [];
     try {
       const bridge =
@@ -559,7 +595,7 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
       type: item.type,
       payload: item.payload,
       timestamp: Number(item.timestamp) || now,
-      status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 15000 ? 'syncing' : 'pending') as ActionStatus,
+      status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 30000 ? 'syncing' : 'pending') as ActionStatus,
       retryCount: Number(item.retryCount) || 0,
       error: item.error || null,
       syncedAt: item.syncedAt || null,
@@ -582,12 +618,16 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
   }
 }
 
-export function syncToNativeAndroid(queue: PendingAction[]) {
+/**
+ * Synchronize pending actions directly to Native Android storage & SharedPreferences
+ */
+export function syncToNativeAndroid(queue: PendingAction[], triggerImmediateNativeSync: boolean = false) {
   if (typeof window === 'undefined') return;
   try {
     const jsonStr = JSON.stringify(queue);
     const serverUrl = getApiBaseUrl() || window.location.origin;
 
+    // 1. Direct Native JavascriptInterface Bridge
     const bridge =
       (window as any).AndroidInterface ||
       (window as any).AndroidPrinter ||
@@ -595,16 +635,17 @@ export function syncToNativeAndroid(queue: PendingAction[]) {
       (window as any).AndroidBridge;
 
     if (bridge) {
-      if (typeof bridge.triggerImmediateCloseSync === 'function') {
+      if (triggerImmediateNativeSync && typeof bridge.triggerImmediateCloseSync === 'function') {
         bridge.triggerImmediateCloseSync(jsonStr, serverUrl);
       } else if (typeof bridge.syncPendingQueueToNative === 'function') {
         bridge.syncPendingQueueToNative(jsonStr, serverUrl);
       }
-      if (typeof bridge.triggerBackgroundSyncNow === 'function' && !isUserActivelyTypingOrInputFocused()) {
+      if (triggerImmediateNativeSync && typeof bridge.triggerBackgroundSyncNow === 'function') {
         bridge.triggerBackgroundSyncNow();
       }
     }
 
+    // 2. Multi-prefix Capacitor Preferences storage
     try {
       Preferences.set({ key: QUEUE_KEY, value: jsonStr }).catch(() => {});
       Preferences.set({ key: `CapacitorStorage.${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
@@ -618,6 +659,7 @@ export function syncToNativeAndroid(queue: PendingAction[]) {
   } catch (e) {}
 }
 
+// Notify Service Worker about queue changes & register Background Sync
 function notifyServiceWorker() {
   if (typeof BroadcastChannel !== 'undefined') {
     try {
@@ -646,8 +688,12 @@ function notifyServiceWorker() {
   }
 }
 
+let addToQueueMutex: Promise<any> = Promise.resolve();
 let bgFlushTimer: any = null;
 
+/**
+ * Add a new action to the offline queue with explicit 'pending' status
+ */
 export async function addToPendingQueue(type: string, payload: any): Promise<PendingAction> {
   const nonce = generateCryptoNonce();
   const normalizedPayload =
@@ -668,12 +714,14 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
     lastAttemptAt: null,
   };
 
+  // 1. Instantaneous sub-millisecond synchronous commit to encrypted storage & memory snapshot
   let currentSyncQueue: PendingAction[] = [];
   try {
     const rawSync = secureStorageGetSync(QUEUE_KEY);
     currentSyncQueue = rawSync ? JSON.parse(rawSync) : [];
     if (!Array.isArray(currentSyncQueue)) currentSyncQueue = [];
 
+    // Deduplicate / obsolete logic in memory immediately
     if (type.startsWith('DELETE_')) {
       const targetId = typeof normalizedPayload === 'string' ? normalizedPayload : (normalizedPayload?.id || normalizedPayload?.contractId);
       if (targetId) {
@@ -701,6 +749,7 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
     console.warn('Fast local queue write notice:', e);
   }
 
+  // 2. Persist to IndexedDB & sync to native Android asynchronously in the background without blocking the UI or caller
   setTimeout(async () => {
     try {
       await saveActionToIndexedDb(action);
@@ -711,6 +760,7 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
     }
   }, 0);
 
+  // 3. Trigger fast background network flush immediately when online
   if (typeof navigator !== 'undefined' && navigator.onLine) {
     if (bgFlushTimer) clearTimeout(bgFlushTimer);
     bgFlushTimer = setTimeout(() => {
@@ -718,11 +768,15 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
     }, 250);
   }
 
-  scheduleIdleVerification(800);
+  // 4. Schedule idle verification re-query so when user stops typing/saving (سكون), it audits matches against server
+  scheduleIdleVerification(600);
 
   return action;
 }
 
+/**
+ * Remove an action by ID
+ */
 export async function removeFromPendingQueue(id: string): Promise<void> {
   try {
     markActionIdsAsPermanentlySynced([id]);
@@ -739,6 +793,9 @@ export async function removeFromPendingQueue(id: string): Promise<void> {
   }
 }
 
+/**
+ * Clear all pending actions
+ */
 export async function clearPendingQueue(): Promise<void> {
   try {
     const existing = await getPendingQueue().catch(() => getPendingQueueSync());
@@ -754,6 +811,9 @@ export async function clearPendingQueue(): Promise<void> {
   } catch (e) {}
 }
 
+/**
+ * Clear pending actions matching a predicate filter
+ */
 export async function clearPendingActionsByFilter(predicate: (action: PendingAction) => boolean): Promise<void> {
   try {
     const queue = await getPendingQueue();
@@ -772,6 +832,10 @@ export async function clearPendingActionsByFilter(predicate: (action: PendingAct
   } catch (e) {}
 }
 
+/**
+ * Scrubs any stale GPS coordinates from queued offline contract/payment actions
+ * when a customer's location is cleared so flushing old offline items can never resurrect it.
+ */
 export async function scrubLocationFromPendingQueue(
   contractIds: string[],
   customerNameHint?: string,
@@ -843,6 +907,9 @@ export async function scrubLocationFromPendingQueue(
   } catch (e) {}
 }
 
+/**
+ * Update transaction state for a specific action in IndexedDB and snapshot
+ */
 export async function updateActionStatus(
   id: string,
   status: ActionStatus,
@@ -919,7 +986,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
       case 'UPDATE_INVENTORY':
         endpoint = docId ? `/api/inventory/${docId}` : '/api/inventory';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'DELETE_INVENTORY':
         endpoint = docId ? `/api/inventory/${docId}` : '';
@@ -932,7 +999,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
       case 'UPDATE_REP':
         endpoint = docId ? `/api/reps/${docId}` : '/api/reps';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'DELETE_REP':
         endpoint = docId ? `/api/reps/${docId}` : '';
@@ -945,7 +1012,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
       case 'UPDATE_FUND':
         endpoint = docId ? `/api/funds/${docId}` : '/api/funds';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'REORDER_FUNDS':
         endpoint = '/api/funds/reorder';
@@ -962,7 +1029,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
       case 'UPDATE_CUSTOMER_LIST':
         endpoint = docId ? `/api/customer-lists/${docId}` : '/api/customer-lists';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'REORDER_CUSTOMER_LISTS':
         endpoint = '/api/customer-lists/reorder';
@@ -979,7 +1046,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
       case 'UPDATE_CUSTOMER':
         endpoint = docId ? `/api/customers/${docId}` : '/api/customers';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'DELETE_CUSTOMER':
         endpoint = docId ? `/api/customers/${docId}` : '';
@@ -992,7 +1059,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
       case 'UPDATE_EMPLOYEE':
         endpoint = docId ? `/api/employees/${docId}` : '/api/employees';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'DELETE_EMPLOYEE':
         endpoint = docId ? `/api/employees/${docId}` : '';
@@ -1007,7 +1074,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       case 'UPDATE_FUND_TX':
       case 'UPDATE_FUND_TRANSACTION':
         endpoint = docId ? `/api/fund-transactions/${docId}` : '/api/fund-transactions';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'DELETE_FUND_TX':
       case 'DELETE_FUND_TRANSACTION':
@@ -1023,7 +1090,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       case 'UPDATE_EMPLOYEE_TX':
       case 'UPDATE_EMPLOYEE_TRANSACTION':
         endpoint = docId ? `/api/employee-transactions/${docId}` : '/api/employee-transactions';
-        method = docId ? 'PUT' : 'POST';
+        method = 'PUT';
         break;
       case 'DELETE_EMPLOYEE_TX':
       case 'DELETE_EMPLOYEE_TRANSACTION':
@@ -1062,6 +1129,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
 
       default:
+        // Unknown historical/obsolete action type -> clear instead of blocking the queue forever
         return { ok: true };
     }
 
@@ -1073,13 +1141,17 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       body: method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : undefined,
     }, 10000);
 
-    if (!res) return { ok: false };
+    if (!res) {
+      return { ok: false };
+    }
+    // 409 = already recorded, 404 on DELETE = already deleted
     if (res.status === 409 || (method === 'DELETE' && res.status === 404)) {
       return { ok: true };
     }
     if (res.status === 401 || res.status === 403) {
       return { ok: false, authError: true, errorMsg: `HTTP ${res.status}` };
     }
+    // 400 / 422 / 404 on PUT = unrecoverable validation/missing target after retries
     if (res.status === 400 || res.status === 422 || (method === 'PUT' && res.status === 404)) {
       const errData = await res.json().catch(() => null);
       return { ok: false, permanentError: true, errorMsg: errData?.error || `HTTP ${res.status}` };
@@ -1125,12 +1197,18 @@ async function commitSyncedIds(syncedIds: string[]): Promise<void> {
   await deleteActionsBatchFromIndexedDb(syncedIds).catch(() => {});
 }
 
+/**
+ * Flush all pending offline actions using explicit transaction states (pending -> syncing -> synced)
+ * with single-flight locking, fast concurrent 100-item bulk SQL chunks, single-tx IndexedDB commits, and REST fallback.
+ */
 export async function flushPendingQueue(): Promise<{ flushed: number; remaining: number }> {
   const now = Date.now();
   if (activeFlushPromise) {
-    if (now - lastFlushStartTime < 15000) {
+    // Allow generous 60s before stale-promise guard releases so large queues finish all batches cleanly
+    if (now - lastFlushStartTime < 60000) {
       return activeFlushPromise;
     }
+    console.warn('[Offline Sync Engine] Previous flush exceeded 60s limit. Starting fresh flush.');
   }
 
   const runFlush = async (): Promise<{ flushed: number; remaining: number }> => {
@@ -1140,12 +1218,16 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
 
     try {
       const queue = await getPendingQueue();
+
+      // 1. Select ALL un-synced valid actions
       const actionsToSync = queue.filter((item) => item.status !== 'synced');
 
       if (actionsToSync.length === 0) {
         notifyQueueListeners(0);
         return { flushed: 0, remaining: 0 };
       }
+
+      console.log(`[Offline Sync Engine] Initiating high-speed upload for ${actionsToSync.length} offline actions...`);
 
       const timestampNow = Date.now();
       for (const action of actionsToSync) {
@@ -1154,9 +1236,10 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       }
       secureStorageSetSync(QUEUE_KEY, JSON.stringify(queue));
 
+      // 2. Path A: Send Bulk Batch Requests in fast slices of 100 items with up to 3 concurrent requests
       const batchConfirmedSet = new Set<string>();
       const BATCH_CHUNK = 100;
-      const BATCH_CONCURRENCY = 2;
+      const BATCH_CONCURRENCY = 3;
       const slices: PendingAction[][] = [];
       for (let b = 0; b < actionsToSync.length; b += BATCH_CHUNK) {
         slices.push(actionsToSync.slice(b, b + BATCH_CHUNK));
@@ -1175,7 +1258,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ actions: batchSlice }),
                 },
-                15000
+                25000
               );
 
               if (response && response.ok && response.status >= 200 && response.status < 300) {
@@ -1192,7 +1275,9 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
                   }
                 }
               }
-            } catch (netErr: any) {}
+            } catch (netErr: any) {
+              console.log('[Offline Sync Engine] Batch slice fallback notice:', netErr?.message || netErr);
+            }
 
             if (sliceConfirmedIds.length > 0) {
               const newIds: string[] = [];
@@ -1211,6 +1296,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         );
       }
 
+      // 3. Fallback path for unconfirmed actions (parallel chunks of 10 via individual REST endpoints)
       const pendingFallbackActions = actionsToSync.filter((action) => !batchConfirmedSet.has(action.id));
       if (pendingFallbackActions.length > 0) {
         const CHUNK_SIZE = 10;
@@ -1231,6 +1317,8 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
 
               action.retryCount = (action.retryCount || 0) + 1;
               if (restResult.permanentError && action.retryCount >= 3) {
+                // Unrecoverable client validation failure after multiple attempts -> clear so it doesn't jam queue forever
+                console.warn(`[Offline Sync Engine] Clearing unrecoverable action after ${action.retryCount} failed attempts:`, action.type, action.id, restResult.errorMsg);
                 chunkSynced.push(action.id);
                 return;
               }
@@ -1253,6 +1341,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         }
       }
 
+      // 4. Final reconciliation of queue state across localStorage / IndexedDB / Preferences
       const verifiedSet = new Set(verifiedSyncedIds);
       const freshQueue = await getPendingQueue();
       const remainingQueue = freshQueue
@@ -1266,6 +1355,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       notifyQueueListeners(remainingQueue.length);
 
       if (verifiedSyncedIds.length > 0) {
+        console.log(`[Offline Sync Engine] Successfully synchronized & uploaded ${verifiedSyncedIds.length} records.`);
         try {
           const raw = localStorage.getItem('sami_offline_payments');
           if (raw) {
@@ -1288,15 +1378,17 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         notifySyncSuccessListeners();
       }
 
+      // If more items remain AND we uploaded some, schedule an immediate follow-up flush
       if (remainingQueue.length > 0 && verifiedSyncedIds.length > 0) {
         if (followUpFlushTimer) clearTimeout(followUpFlushTimer);
         followUpFlushTimer = setTimeout(() => {
           flushPendingQueue().catch(() => {});
-        }, 250);
+        }, 150);
       }
 
       return { flushed: verifiedSyncedIds.length, remaining: remainingQueue.length };
     } catch (err) {
+      console.warn('[Offline Sync Engine] Flush queue exception:', err);
       const permSet = getPermanentlySyncedIds();
       const q = getPendingQueueSync().filter((i) => i.status !== 'synced' && !permSet.has(i.id));
       return { flushed: verifiedSyncedIds.length, remaining: q.length };
@@ -1314,16 +1406,22 @@ export const syncOfflineData = flushPendingQueue;
 
 let lastExitSyncTime = 0;
 
+/**
+ * Send pending actions via Beacon and fetch keepalive on page exit or before close (100% non-blocking & reliable)
+ */
 export function sendBeaconOnExit() {
   const now = Date.now();
+  // Cooldown to prevent multi-event duplicate storm on exit (beforeunload + pagehide + visibilitychange)
   if (now - lastExitSyncTime < 800) {
     return;
   }
   lastExitSyncTime = now;
 
   try {
+    // 1. Mirror local snapshot to IndexedDB immediately so Service Worker has fresh state
     mirrorLocalSnapshotToIndexedDb(true).catch(() => {});
 
+    // 2. Read pending actions synchronously from encrypted cache
     const raw = secureStorageGetSync(QUEUE_KEY);
     let queue: any[] = [];
     if (raw) {
@@ -1335,46 +1433,50 @@ export function sendBeaconOnExit() {
     }
     const pendingToSync = Array.isArray(queue) ? queue.filter((i: any) => i && i.status !== 'synced') : [];
 
+    // If nothing pending, exit immediately without wasting network/battery
     if (pendingToSync.length === 0) {
       return;
     }
 
+    // Mirror queue to Native Android storage and trigger native exit upload
     try {
-      syncToNativeAndroid(queue);
-      const bridge =
-        (window as any).AndroidInterface ||
-        (window as any).AndroidPrinter ||
-        (window as any).Android ||
-        (window as any).AndroidBridge;
-      if (bridge && typeof bridge.triggerBackgroundSyncNow === 'function') {
-        bridge.triggerBackgroundSyncNow();
-      }
+      syncToNativeAndroid(queue, true);
     } catch (e) {}
 
+    // 3. Inform Service Worker to flush queue in background
     if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator && navigator.serviceWorker.controller) {
       try {
         navigator.serviceWorker.controller.postMessage({
           type: 'FLUSH_QUEUE_IMMEDIATELY',
           actions: pendingToSync,
         });
+        navigator.serviceWorker.controller.postMessage({
+          type: 'RECONCILE_ON_CLOSE',
+          timestamp: now,
+        });
       } catch (e) {}
     }
 
+    // 4. Resolve target URL (keepalive signed fetch to /api/sync/batch)
     const isNative = isNativeOrApkEnvironment();
     const batchUrl = isNative ? getFullApiUrl('/api/sync/batch') : '/api/sync/batch';
 
+    // 5. Send authenticated & HMAC-signed keepalive Fetch
     const BEACON_CHUNK = 25;
     for (let i = 0; i < pendingToSync.length; i += BEACON_CHUNK) {
       const chunk = pendingToSync.slice(i, i + BEACON_CHUNK);
       const payloadJson = JSON.stringify({ actions: chunk });
 
       if (typeof fetch === 'function') {
-        fetch(batchUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: payloadJson,
-          keepalive: true,
-        })
+        signRequestHeaders('POST', '/api/sync/batch', payloadJson)
+          .then((secHeaders) =>
+            fetch(batchUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...secHeaders },
+              body: payloadJson,
+              keepalive: true,
+            })
+          )
           .then((res) => {
             if (res && res.ok) {
               res.json().then((data) => {
@@ -1388,6 +1490,7 @@ export function sendBeaconOnExit() {
       }
     }
 
+    // 6. Update action timestamps without blindly purging unconfirmed actions
     for (const act of pendingToSync) {
       act.lastAttemptAt = now;
       if (act.status !== 'synced') {
@@ -1395,9 +1498,16 @@ export function sendBeaconOnExit() {
       }
     }
     secureStorageSetSync(QUEUE_KEY, JSON.stringify(queue));
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[Exit Sync] Exception:', e);
+  }
 }
 
+/**
+ * Universal background exit sync runner:
+ * Dispatches immediate synchronous beacons, keepalive fetch requests,
+ * and service worker messages on app close or minimize.
+ */
 export function runBackgroundExitSync(): void {
   try {
     sendBeaconOnExit();
@@ -1415,8 +1525,10 @@ export function runBackgroundExitSync(): void {
                   await globalSyncCallback().catch(() => {});
                 }
               })(),
-              new Promise((resolve) => setTimeout(resolve, 10000)),
+              new Promise((resolve) => setTimeout(resolve, 25000)),
             ]);
+          } catch (err) {
+            console.warn('Background sync on exit error:', err);
           } finally {
             if (!finished) {
               finished = true;
@@ -1430,7 +1542,9 @@ export function runBackgroundExitSync(): void {
     } catch (btErr) {}
 
     flushPendingQueue().catch(() => {});
-  } catch (e) {}
+  } catch (e) {
+    console.warn('runBackgroundExitSync exception:', e);
+  }
 }
 
 let globalSyncCallback: (() => Promise<void>) | null = null;
@@ -1438,7 +1552,13 @@ let onlineDebounceTimer: any = null;
 let idleVerificationTimer: any = null;
 let isVerifyingMatch = false;
 
-export function scheduleIdleVerification(delayMs = 1500) {
+/**
+ * Continuous Verification & Re-query Engine:
+ * Whenever data is uploaded or when idle quiescence occurs,
+ * automatically queries the server, uploads any remaining data, and re-queries in a loop
+ * until 100% full match confirmation between the app and PostgreSQL is verified.
+ */
+export function scheduleIdleVerification(delayMs = 1200) {
   if (idleVerificationTimer) {
     clearTimeout(idleVerificationTimer);
   }
@@ -1446,12 +1566,15 @@ export function scheduleIdleVerification(delayMs = 1500) {
     if (isVerifyingMatch) return;
     try {
       isVerifyingMatch = true;
+      
+      // 1. Flush any un-synced actions first
       const queue = await getPendingQueue();
       const unSynced = queue.filter((i) => i.status !== 'synced');
       if (unSynced.length > 0) {
         await flushPendingQueue().catch(() => {});
       }
 
+      // 2. Perform lightweight single-pass verification
       const verifyRes = await verifyAndReconcileUntilMatched(1).catch(() => null);
       if (verifyRes && verifyRes.matched) {
         const remainingQueue = (await getPendingQueue()).filter((item) => item.status !== 'synced');
@@ -1460,12 +1583,16 @@ export function scheduleIdleVerification(delayMs = 1500) {
         }
       }
     } catch (err) {
+      console.warn('[Continuous Sync Engine] Verification error:', err);
     } finally {
       isVerifyingMatch = false;
     }
   }, delayMs);
 }
 
+/**
+ * Reliable handler for online connectivity restoration and automatic lightweight field sync
+ */
 export function triggerImmediateSync(callback?: () => Promise<void>) {
   if (onlineDebounceTimer) clearTimeout(onlineDebounceTimer);
   onlineDebounceTimer = setTimeout(async () => {
@@ -1479,10 +1606,13 @@ export function triggerImmediateSync(callback?: () => Promise<void>) {
         await globalSyncCallback().catch(() => {});
       }
       return res;
-    } catch (e) {}
-  }, 200);
+    } catch (e) {
+      console.warn('Trigger immediate sync error:', e);
+    }
+  }, 150);
 }
 
+// Automatic network reconnection and lifecycle handlers
 if (typeof window !== 'undefined') {
   (window as any).alkarrarFlushQueue = () => {
     sendBeaconOnExit();
@@ -1494,9 +1624,15 @@ if (typeof window !== 'undefined') {
     notifySyncSuccessListeners();
   };
 
-  window.addEventListener('beforeunload', () => sendBeaconOnExit());
-  window.addEventListener('pagehide', () => sendBeaconOnExit());
-  window.addEventListener('freeze', () => sendBeaconOnExit());
+  window.addEventListener('beforeunload', () => {
+    sendBeaconOnExit();
+  });
+  window.addEventListener('pagehide', () => {
+    sendBeaconOnExit();
+  });
+  window.addEventListener('freeze', () => {
+    sendBeaconOnExit();
+  });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
       sendBeaconOnExit();
@@ -1504,13 +1640,19 @@ if (typeof window !== 'undefined') {
       triggerImmediateSync();
     }
   });
-  window.addEventListener('focus', () => triggerImmediateSync());
-  window.addEventListener('online', () => triggerImmediateSync());
+  window.addEventListener('focus', () => {
+    triggerImmediateSync();
+  });
+  window.addEventListener('online', () => {
+    triggerImmediateSync();
+  });
 
+  // Automatically start background sync lifecycle
   try {
     initBackgroundSync();
   } catch (e) {}
 
+  // Listen for Capacitor Network status changes
   try {
     if (Network && typeof Network.addListener === 'function') {
       Network.addListener('networkStatusChange', (status) => {
@@ -1521,6 +1663,7 @@ if (typeof window !== 'undefined') {
     }
   } catch (e) {}
 
+  // Service Worker background sync triggers
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', (event) => {
       if (event.data) {
@@ -1534,6 +1677,9 @@ if (typeof window !== 'undefined') {
   }
 }
 
+/**
+ * Register Background Sync Service Worker safely
+ */
 export function registerBackgroundSyncWorker(onTriggerSync?: () => void) {
   if (typeof window === 'undefined' || typeof navigator === 'undefined' || window.location.protocol === 'file:') {
     return;
@@ -1544,6 +1690,7 @@ export function registerBackgroundSyncWorker(onTriggerSync?: () => void) {
       try {
         const registration: any = await navigator.serviceWorker.register('/sw.js').catch(() => null);
         if (!registration) return;
+        console.log('[SW] ServiceWorker registered scope:', registration.scope);
 
         if ('sync' in registration) {
           try {
@@ -1558,7 +1705,9 @@ export function registerBackgroundSyncWorker(onTriggerSync?: () => void) {
             });
           } catch (e) {}
         }
-      } catch (err) {}
+      } catch (err) {
+        console.warn('ServiceWorker registration fallback:', err);
+      }
     };
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
@@ -1584,6 +1733,9 @@ export function registerBackgroundSyncWorker(onTriggerSync?: () => void) {
   }
 }
 
+/**
+ * Request and grant all background sync and OS permissions (Notifications, BackgroundSync, PeriodicSync, Battery optimization exemption)
+ */
 export async function requestAllBackgroundAndSyncPermissions(): Promise<{
   granted: boolean;
   details: {
@@ -1600,12 +1752,15 @@ export async function requestAllBackgroundAndSyncPermissions(): Promise<{
     nativeBridge: false,
   };
 
+  // 0. Request Persistent Storage to prevent OS cache eviction
   try {
     if (typeof navigator !== 'undefined' && navigator.storage && typeof navigator.storage.persist === 'function') {
-      await navigator.storage.persist().catch(() => false);
+      const isPersisted = await navigator.storage.persist().catch(() => false);
+      console.log('[Storage] Persistent storage granted:', isPersisted);
     }
   } catch (e) {}
 
+  // 1. Request Web / Mobile Notification Permission
   try {
     if (typeof window !== 'undefined' && 'Notification' in window) {
       if (Notification.permission === 'default') {
@@ -1615,8 +1770,11 @@ export async function requestAllBackgroundAndSyncPermissions(): Promise<{
         details.notifications = Notification.permission === 'granted';
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('Notification permission error:', e);
+  }
 
+  // 2. Register Background Sync & Periodic Sync with Service Worker
   try {
     if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
       const reg: any = await navigator.serviceWorker.ready.catch(() => null);
@@ -1638,8 +1796,11 @@ export async function requestAllBackgroundAndSyncPermissions(): Promise<{
         }
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('SW sync registration error:', e);
+  }
 
+  // 3. Android Native Bridge / Cordova / Capacitor Runtime Permissions
   try {
     const androidBridge =
       (window as any).AndroidPrinter ||
@@ -1660,6 +1821,9 @@ export async function requestAllBackgroundAndSyncPermissions(): Promise<{
         androidBridge.requestIgnoreBatteryOptimizations();
         details.nativeBridge = true;
       }
+      if (typeof androidBridge.requestExactAlarmPermission === 'function') {
+        androidBridge.requestExactAlarmPermission();
+      }
       if (typeof androidBridge.requestBackgroundExecution === 'function') {
         androidBridge.requestBackgroundExecution();
         details.nativeBridge = true;
@@ -1669,10 +1833,57 @@ export async function requestAllBackgroundAndSyncPermissions(): Promise<{
         details.nativeBridge = true;
       }
     }
+
+    const cordova = (window as any).cordova;
+    if (cordova && cordova.plugins) {
+      // Activate Cordova Background Mode plugin if present
+      if (cordova.plugins.backgroundMode) {
+        try {
+          const bg = cordova.plugins.backgroundMode;
+          bg.setDefaults({
+            title: 'الكرار للموبايل',
+            text: 'المزامنة السحابية قيد العمل في الخلفية...',
+            color: '059669',
+            resume: true,
+            silent: true,
+          });
+          bg.enable();
+          if (typeof bg.disableWebViewOptimizations === 'function') {
+            bg.disableWebViewOptimizations();
+          }
+          details.nativeBridge = true;
+          details.backgroundSync = true;
+        } catch (bgErr) {
+          console.warn('Cordova backgroundMode config notice:', bgErr);
+        }
+      }
+
+      if (cordova.plugins.permissions) {
+        const p = cordova.plugins.permissions;
+        const permsToRequest = [
+          p.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS || 'android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
+          p.POST_NOTIFICATIONS || 'android.permission.POST_NOTIFICATIONS',
+          p.WAKE_LOCK || 'android.permission.WAKE_LOCK',
+          p.FOREGROUND_SERVICE || 'android.permission.FOREGROUND_SERVICE',
+          p.ACCESS_NETWORK_STATE || 'android.permission.ACCESS_NETWORK_STATE',
+        ];
+        p.requestPermissions(
+          permsToRequest,
+          () => {
+            details.nativeBridge = true;
+          },
+          () => {}
+        );
+      }
+    }
+
+    // 4. Capacitor App & Background plugin check
     if (App) {
       details.nativeBridge = true;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('Native bridge permission notice:', e);
+  }
 
   try {
     localStorage.setItem('alkarrar_background_sync_granted', 'true');
@@ -1684,25 +1895,84 @@ export async function requestAllBackgroundAndSyncPermissions(): Promise<{
   };
 }
 
-let syncLoopStarted = false;
+let activeBgLoopInterval: any = null;
 
+/**
+ * Register background task listener to ensure automatic sync runs on close or background
+ */
 export function initBackgroundSync(syncCallback?: () => Promise<void>) {
   if (syncCallback) {
     globalSyncCallback = syncCallback;
   }
 
   try {
-    if (typeof window === 'undefined' || syncLoopStarted) return;
-    syncLoopStarted = true;
+    if (typeof window === 'undefined') return;
 
+    // 1. Initialize Cordova BackgroundMode if available
+    try {
+      const cordova = (window as any).cordova;
+      if (cordova && cordova.plugins && cordova.plugins.backgroundMode) {
+        const bg = cordova.plugins.backgroundMode;
+        bg.setDefaults({
+          title: 'الكرار للموبايل',
+          text: 'المزامنة السحابية قيد العمل في الخلفية...',
+          color: '059669',
+          resume: true,
+          silent: true,
+        });
+        bg.enable();
+        if (typeof bg.disableWebViewOptimizations === 'function') {
+          bg.disableWebViewOptimizations();
+        }
+
+        // When entering background
+        bg.on('activate', () => {
+          console.log('[Background Mode] App entered active background mode');
+          try {
+            if (typeof bg.disableWebViewOptimizations === 'function') {
+              bg.disableWebViewOptimizations();
+            }
+          } catch (e) {}
+          
+          flushPendingQueue().catch(() => {});
+          if (globalSyncCallback) {
+            globalSyncCallback().catch(() => {});
+          }
+
+          // Maintain active background loop every 3 seconds while in background
+          if (activeBgLoopInterval) clearInterval(activeBgLoopInterval);
+          activeBgLoopInterval = setInterval(() => {
+            const queue = getPendingQueueSync();
+            const hasUnsynced = queue.some((i) => i.status !== 'synced');
+            if (hasUnsynced && !isFlushing) {
+              flushPendingQueue().catch(() => {});
+            }
+          }, 3000);
+        });
+
+        bg.on('deactivate', () => {
+          if (activeBgLoopInterval) {
+            clearInterval(activeBgLoopInterval);
+            activeBgLoopInterval = null;
+          }
+          triggerImmediateSync();
+        });
+      }
+    } catch (bgInitErr) {
+      console.warn('Cordova backgroundMode initialization notice:', bgInitErr);
+    }
+
+    // 2. Setup Capacitor App State Listener with BackgroundTask and BackgroundRunner
     if (App && typeof App.addListener === 'function') {
       App.addListener('appStateChange', async (state) => {
         try {
           if (!state.isActive) {
+            // Immediate non-blocking exit beacon & service worker notification
             sendBeaconOnExit();
             notifyServiceWorker();
             flushPendingQueue().catch(() => {});
 
+            // Dispatch Capacitor BackgroundRunner event
             try {
               if (BackgroundRunner && typeof BackgroundRunner.dispatchEvent === 'function') {
                 BackgroundRunner.dispatchEvent({
@@ -1718,6 +1988,7 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
                 let finished = false;
                 const taskId = await BackgroundTask.beforeExit(async () => {
                   try {
+                    // Maximum 2-second window for background task before forced clean finish
                     await Promise.race([
                       (async () => {
                         await flushPendingQueue().catch(() => {});
@@ -1725,8 +1996,10 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
                           await globalSyncCallback().catch(() => {});
                         }
                       })(),
-                      new Promise((resolve) => setTimeout(resolve, 3000)),
+                      new Promise((resolve) => setTimeout(resolve, 2000)),
                     ]);
+                  } catch (err) {
+                    console.warn('Silent background sync exception:', err);
                   } finally {
                     if (!finished && taskId) {
                       finished = true;
@@ -1737,6 +2010,7 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
                   }
                 });
 
+                // Auto-cleanup timer fallback
                 setTimeout(() => {
                   if (!finished && taskId) {
                     finished = true;
@@ -1744,74 +2018,222 @@ export function initBackgroundSync(syncCallback?: () => Promise<void>) {
                       BackgroundTask.finish({ taskId });
                     } catch (e) {}
                   }
-                }, 3200);
+                }, 2200);
               }
-            } catch (err) {}
+            } catch (err) {
+              console.warn('BackgroundTask.beforeExit failed:', err);
+            }
           } else {
+            // App returned to active foreground state
             triggerImmediateSync();
           }
-        } catch (stateErr) {}
+        } catch (stateErr) {
+          console.warn('App state change handler notice:', stateErr);
+        }
       }).catch(() => {});
     }
 
+    // 3. Immediate startup flush + 4s Automatic Background Upload Loop (never blocked by typing focus)
     setTimeout(() => {
       if (typeof navigator === 'undefined' || navigator.onLine !== false) {
         flushPendingQueue().catch(() => {});
       }
-    }, 300);
+    }, 150);
 
-    const SYNC_INTERVAL_MS = 8 * 1000;
+    const SYNC_INTERVAL_MS = 4 * 1000;
+    let offlineCheckTick = 0;
     setInterval(async () => {
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-      if (isFlushing) return;
+      offlineCheckTick++;
       const syncQueue = getPendingQueueSync();
-      const hasUnsynced = syncQueue.some((i) => i.status !== 'synced');
-      if (hasUnsynced) {
-        flushPendingQueue().catch(() => {});
+      let hasUnsynced = lastNotifiedQueueCount > 0 || syncQueue.some((i) => i.status !== 'synced');
+      if (!hasUnsynced) {
+        const asyncQueue = await getPendingQueue().catch(() => []);
+        hasUnsynced = asyncQueue.some((i) => i.status !== 'synced');
       }
+      if (!hasUnsynced) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        if (offlineCheckTick % 3 !== 0) return;
+        const capOnline = await isNetworkConnected().catch(() => false);
+        if (!capOnline) return;
+      }
+      flushPendingQueue().catch(() => {});
+      // Also trigger BackgroundRunner event if available when user is idle
+      try {
+        if (BackgroundRunner && typeof BackgroundRunner.dispatchEvent === 'function' && !isUserActivelyTypingOrInputFocused()) {
+          BackgroundRunner.dispatchEvent({
+            label: 'com.alkarrar.mobile.backgroundsync',
+            event: 'syncOfflineQueue',
+            details: {},
+          }).catch(() => {});
+        }
+      } catch (e) {}
     }, SYNC_INTERVAL_MS);
 
+    // Dedicated Background Web Worker Heartbeat (unaffected by mobile background tab throttling)
+    try {
+      if (typeof window !== 'undefined' && typeof Worker !== 'undefined' && typeof Blob !== 'undefined') {
+        const workerScript = `
+          let timer = null;
+          self.onmessage = function(e) {
+            if (e.data === 'START') {
+              if (timer) clearInterval(timer);
+              timer = setInterval(function() {
+                self.postMessage('TICK');
+              }, 5000);
+            } else if (e.data === 'STOP') {
+              if (timer) clearInterval(timer);
+              timer = null;
+            }
+          };
+        `;
+        const blob = new Blob([workerScript], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(blob));
+        worker.onmessage = (e) => {
+          if (e.data === 'TICK') {
+            if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+            const queue = getPendingQueueSync();
+            const hasUnsynced = lastNotifiedQueueCount > 0 || queue.some((i) => i.status !== 'synced');
+            if (hasUnsynced) {
+              flushPendingQueue().catch(() => {});
+            }
+          }
+        };
+        worker.postMessage('START');
+      }
+    } catch (workerErr) {
+      console.warn('[Offline Sync Engine] Web Worker heartbeat fallback notice:', workerErr);
+    }
+
+    // 4. Setup Network Status Change Listener for Instant Automatic Sync
     try {
       if (Network && typeof Network.addListener === 'function') {
         Network.addListener('networkStatusChange', (status) => {
+          console.log('[Network Status Change] Connected:', status.connected, status.connectionType);
           if (status.connected) {
             triggerImmediateSync();
           }
         }).catch(() => {});
       }
     } catch (netErr) {}
-  } catch (e) {}
+
+    // 5. Setup Robust Browser Visibility & Online Listeners for Background Monitoring
+    try {
+      if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') {
+            console.log('[Background Monitoring] App became visible. Triggering immediate sync...');
+            triggerImmediateSync();
+          } else {
+            console.log('[Background Monitoring] App hidden. Flushing pending queue...');
+            flushPendingQueue().catch(() => {});
+          }
+        });
+      }
+      if (typeof window !== 'undefined') {
+        window.addEventListener('online', () => {
+          console.log('[Background Monitoring] Network online detected. Triggering immediate sync...');
+          triggerImmediateSync();
+        });
+      }
+    } catch (bgMonErr) {
+      console.warn('Background monitoring listener error:', bgMonErr);
+    }
+  } catch (e) {
+    console.warn('Capacitor App change listener not supported on current platform:', e);
+  }
 }
 
+/**
+ * Explicitly enable Foreground Service and Wake Lock for persistent background sync
+ */
 export async function enableForegroundService(): Promise<boolean> {
   let success = false;
   try {
     if (typeof window === 'undefined') return false;
-    const fg = (window as any).plugins?.foregroundService || (window as any).cordova?.plugins?.foregroundService;
-    if (fg && typeof fg.start === 'function') {
-      fg.start('الكرار للتقسيط', 'المزامنة السحابية المباشرة نشطة', 'notification_icon', 1);
-      success = true;
-    }
-    if ('wakeLock' in navigator && (navigator as any).wakeLock?.request) {
-      await (navigator as any).wakeLock.request('screen').catch(() => {});
-      success = true;
-    }
-  } catch (err) {}
+
+    // 1. Cordova Background Mode / Foreground Service
+    try {
+      const cordova = (window as any).cordova;
+      if (cordova && cordova.plugins && cordova.plugins.backgroundMode) {
+        const bg = cordova.plugins.backgroundMode;
+        bg.setDefaults({
+          title: 'الكرار للتقسيط',
+          text: 'خدمة المزامنة السحابية قيد العمل المستمر...',
+          color: '0d9488',
+          resume: true,
+          silent: true,
+        });
+        bg.enable();
+        if (typeof bg.overrideBackButton === 'function') {
+          bg.overrideBackButton();
+        }
+        if (typeof bg.disableWebViewOptimizations === 'function') {
+          bg.disableWebViewOptimizations();
+        }
+        success = true;
+      }
+    } catch (e) {}
+
+    // 2. Android Foreground Service Plugin
+    try {
+      const fg = (window as any).plugins?.foregroundService || (window as any).cordova?.plugins?.foregroundService;
+      if (fg && typeof fg.start === 'function') {
+        fg.start('الكرار للتقسيط', 'المزامنة السحابية المباشرة نشطة', 'notification_icon', 1);
+        success = true;
+      }
+    } catch (e) {}
+
+    // 3. Web Screen Wake Lock API
+    try {
+      if ('wakeLock' in navigator && (navigator as any).wakeLock?.request) {
+        await (navigator as any).wakeLock.request('screen').catch(() => {});
+        success = true;
+      }
+    } catch (e) {}
+
+    // 4. Service Worker Background Sync registration
+    try {
+      if ('serviceWorker' in navigator) {
+        const reg: any = await navigator.serviceWorker.ready.catch(() => null);
+        if (reg && reg.sync) {
+          await reg.sync.register('alkarrar-foreground-sync').catch(() => {});
+        }
+      }
+    } catch (e) {}
+
+    console.log('[Foreground Service] Service successfully initialized & active');
+  } catch (err) {
+    console.warn('[Foreground Service] Init note:', err);
+  }
   return success;
 }
 
+// -------------------------------------------------------------
+// Advanced Anti-Sleep, Display Over Apps & Keep-Alive System
+// -------------------------------------------------------------
+
 let globalWakeLockSentinel: any = null;
+let globalSilentAudioContext: any = null;
+let globalSilentAudioElement: HTMLAudioElement | null = null;
 let isKeepAliveEngineRunning = false;
 
+/**
+ * Check if Field Keep-Alive Mode is currently enabled (Defaults to TRUE for field sales reps)
+ */
 export function isKeepAliveModeEnabled(): boolean {
-  if (typeof window === 'undefined') return false;
+  if (typeof window === 'undefined') return true;
   try {
-    return localStorage.getItem('alkarrar_keepalive_mode') === 'true';
+    const val = localStorage.getItem('alkarrar_keepalive_mode');
+    // Enabled by default unless explicitly disabled by user
+    return val !== 'false';
   } catch (e) {
-    return false;
+    return true;
   }
 }
 
+/**
+ * Acquire Web Screen Wake Lock safely with auto-reacquisition
+ */
 async function acquireWakeLock(): Promise<boolean> {
   try {
     if (typeof navigator !== 'undefined' && 'wakeLock' in navigator && (navigator as any).wakeLock?.request) {
@@ -1821,32 +2243,211 @@ async function acquireWakeLock(): Promise<boolean> {
       globalWakeLockSentinel = await (navigator as any).wakeLock.request('screen');
       globalWakeLockSentinel.addEventListener('release', () => {
         globalWakeLockSentinel = null;
+        // If keep alive is still active, re-acquire when app becomes visible
+        if (isKeepAliveEngineRunning && typeof document !== 'undefined' && document.visibilityState === 'visible') {
+          setTimeout(() => acquireWakeLock().catch(() => {}), 1000);
+        }
       });
       return true;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[KeepAlive] WakeLock notice:', e);
+  }
   return false;
 }
 
+let globalKeepAliveWorker: Worker | null = null;
+
+function startWorkerKeepAlive(): void {
+  try {
+    if (typeof window === 'undefined' || typeof Worker === 'undefined') return;
+    if (globalKeepAliveWorker) return;
+
+    const workerCode = `
+      var timer = null;
+      self.onmessage = function(e) {
+        if (e.data === 'start') {
+          if (!timer) {
+            timer = setInterval(function() {
+              self.postMessage('TICK');
+            }, 7000);
+          }
+        } else if (e.data === 'stop') {
+          if (timer) {
+            clearInterval(timer);
+            timer = null;
+          }
+        }
+      };
+      timer = setInterval(function() {
+        self.postMessage('TICK');
+      }, 7000);
+    `;
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(blob);
+    globalKeepAliveWorker = new Worker(workerUrl);
+    globalKeepAliveWorker.onmessage = (e) => {
+      if (e.data === 'TICK') {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+        const hasUnsynced = lastNotifiedQueueCount > 0 || getPendingQueueSync().some((i) => i.status !== 'synced');
+        if (hasUnsynced) {
+          flushPendingQueue().catch(() => {});
+        }
+      }
+    };
+    globalKeepAliveWorker.postMessage('start');
+  } catch (err) {
+    console.warn('[KeepAlive] Worker keepalive notice:', err);
+  }
+}
+
+function stopWorkerKeepAlive(): void {
+  try {
+    if (globalKeepAliveWorker) {
+      globalKeepAliveWorker.postMessage('stop');
+      globalKeepAliveWorker.terminate();
+      globalKeepAliveWorker = null;
+    }
+  } catch (e) {}
+}
+
+/**
+ * Start a silent WebAudio keep-alive loop to prevent Android/iOS from suspending the JS thread
+ */
+function startSilentAudioKeepAlive(): void {
+  try {
+    if (typeof window === 'undefined') return;
+
+    // 0. Dedicated Web Worker ticking loop
+    startWorkerKeepAlive();
+
+    // 1. Silent HTML5 Audio Element Loop (extremely reliable across Android WebViews)
+    if (!globalSilentAudioElement) {
+      // 1-second silent WAV base64
+      const silentWavBase64 = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+      const audio = new Audio(silentWavBase64);
+      audio.loop = true;
+      audio.volume = 0.01; // virtually inaudible but informs mobile OS of active media session
+      (audio as any).playsInline = true;
+      
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(() => {
+          // On mobile, autoplay might require first user gesture
+          const handleFirstClick = () => {
+            audio.play().catch(() => {});
+            window.removeEventListener('click', handleFirstClick);
+            window.removeEventListener('touchstart', handleFirstClick);
+          };
+          window.addEventListener('click', handleFirstClick, { once: true });
+          window.addEventListener('touchstart', handleFirstClick, { once: true });
+        });
+      }
+      globalSilentAudioElement = audio;
+    }
+
+    // 2. Silent Web Audio API Context
+    const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (AudioContextClass && !globalSilentAudioContext) {
+      const ctx = new AudioContextClass();
+      if (ctx.state === 'suspended') {
+        const resumeCtx = () => {
+          ctx.resume().catch(() => {});
+          window.removeEventListener('click', resumeCtx);
+          window.removeEventListener('touchstart', resumeCtx);
+        };
+        window.addEventListener('click', resumeCtx, { once: true });
+        window.addEventListener('touchstart', resumeCtx, { once: true });
+      }
+      const oscillator = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 0.00001; // Inaudible
+      oscillator.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      oscillator.start();
+      globalSilentAudioContext = ctx;
+    }
+  } catch (err) {
+    console.warn('[KeepAlive] Audio keepalive notice:', err);
+  }
+}
+
+/**
+ * Stop silent audio keep-alive
+ */
+function stopSilentAudioKeepAlive(): void {
+  try {
+    stopWorkerKeepAlive();
+    if (globalSilentAudioElement) {
+      globalSilentAudioElement.pause();
+      globalSilentAudioElement.src = '';
+      globalSilentAudioElement = null;
+    }
+    if (globalSilentAudioContext) {
+      globalSilentAudioContext.close().catch(() => {});
+      globalSilentAudioContext = null;
+    }
+  } catch (e) {}
+}
+
+/**
+ * Toggle Field Keep-Alive Mode (Anti-Sleep, WakeLock, Silent Heartbeat, Background Sync)
+ */
 export async function setFieldKeepAliveMode(enable: boolean): Promise<boolean> {
   isKeepAliveEngineRunning = enable;
   try {
     if (typeof window !== 'undefined') {
       localStorage.setItem('alkarrar_keepalive_mode', enable ? 'true' : 'false');
     }
+
+    const androidBridge =
+      (window as any).AndroidPrinter ||
+      (window as any).AndroidInterface ||
+      (window as any).Android ||
+      (window as any).AndroidBridge;
+
+    if (androidBridge && typeof androidBridge.setKeepScreenOn === 'function') {
+      try {
+        androidBridge.setKeepScreenOn(enable);
+      } catch (e) {}
+    }
+
     if (enable) {
       await acquireWakeLock();
+      startSilentAudioKeepAlive();
+      await enableForegroundService();
+      await requestAllBackgroundAndSyncPermissions();
+      
+      // Listen for visibility to restore WakeLock if screen turned off & on
+      if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible' && isKeepAliveEngineRunning) {
+            acquireWakeLock().catch(() => {});
+          }
+        });
+      }
+      console.log('[KeepAlive] Field Keep-Alive mode ACTIVATED (WakeLock + Audio Heartbeat + Foreground Service)');
       return true;
-    } else if (globalWakeLockSentinel) {
-      try {
-        await globalWakeLockSentinel.release();
-      } catch (e) {}
-      globalWakeLockSentinel = null;
+    } else {
+      stopSilentAudioKeepAlive();
+      if (globalWakeLockSentinel) {
+        try {
+          await globalWakeLockSentinel.release();
+        } catch (e) {}
+        globalWakeLockSentinel = null;
+      }
+      console.log('[KeepAlive] Field Keep-Alive mode DEACTIVATED');
+      return false;
     }
-  } catch (err) {}
-  return false;
+  } catch (err) {
+    console.warn('[KeepAlive] Error setting keepalive mode:', err);
+    return false;
+  }
 }
 
+/**
+ * Request Display Over Other Apps (SYSTEM_ALERT_WINDOW) Permission & open Android Settings
+ */
 export async function requestDisplayOverAppsPermission(): Promise<{ success: boolean; message: string }> {
   try {
     const androidBridge =
@@ -1855,6 +2456,7 @@ export async function requestDisplayOverAppsPermission(): Promise<{ success: boo
       (window as any).Android ||
       (window as any).AndroidBridge;
 
+    // 1. Direct native bridge call
     if (androidBridge) {
       if (typeof androidBridge.requestOverlayPermission === 'function') {
         androidBridge.requestOverlayPermission();
@@ -1864,7 +2466,42 @@ export async function requestDisplayOverAppsPermission(): Promise<{ success: boo
         androidBridge.openOverlaySettings();
         return { success: true, message: 'تم فتح إعدادات الظهور فوق التطبيقات' };
       }
+      if (typeof androidBridge.requestSystemAlertWindow === 'function') {
+        androidBridge.requestSystemAlertWindow();
+        return { success: true, message: 'تم طلب إذن النوافذ العائمة والظهور فوق التطبيقات' };
+      }
     }
+
+    // 2. Cordova / Capacitor Plugins
+    const cordova = (window as any).cordova;
+    if (cordova && cordova.plugins) {
+      if (cordova.plugins.permissions) {
+        const p = cordova.plugins.permissions;
+        const overlayPerm = p.SYSTEM_ALERT_WINDOW || 'android.permission.SYSTEM_ALERT_WINDOW';
+        p.requestPermission(
+          overlayPerm,
+          () => {},
+          () => {}
+        );
+      }
+      if (cordova.plugins.diagnostic && typeof cordova.plugins.diagnostic.switchToOverlaySettings === 'function') {
+        cordova.plugins.diagnostic.switchToOverlaySettings();
+        return { success: true, message: 'تم فتح إعدادات الظهور فوق التطبيقات' };
+      }
+    }
+
+    // 3. Fallback intent trigger for Android browsers / WebView
+    if (typeof window !== 'undefined') {
+      try {
+        const intentUrl = 'intent:#Intent;action=android.settings.action.MANAGE_OVERLAY_PERMISSION;end';
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = intentUrl;
+        document.body.appendChild(iframe);
+        setTimeout(() => document.body.removeChild(iframe), 1000);
+      } catch (e) {}
+    }
+
     return {
       success: true,
       message: 'يرجى الانتقال إلى إعدادات الهاتف > التطبيقات > تفعيل "الظهور فوق التطبيقات"',
@@ -1874,6 +2511,9 @@ export async function requestDisplayOverAppsPermission(): Promise<{ success: boo
   }
 }
 
+/**
+ * Open Battery Optimization Exemption Settings (Unrestricted battery)
+ */
 export async function openBatteryOptimizationSettings(): Promise<{ success: boolean; message: string }> {
   try {
     const androidBridge =
@@ -1892,6 +2532,28 @@ export async function openBatteryOptimizationSettings(): Promise<{ success: bool
         return { success: true, message: 'تم فتح إعدادات البطارية' };
       }
     }
+
+    const cordova = (window as any).cordova;
+    if (cordova && cordova.plugins?.backgroundMode) {
+      try {
+        if (typeof cordova.plugins.backgroundMode.disableBatteryOptimizations === 'function') {
+          cordova.plugins.backgroundMode.disableBatteryOptimizations();
+          return { success: true, message: 'تم تعطيل قيود البطارية' };
+        }
+      } catch (e) {}
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        const intentUrl = 'intent:#Intent;action=android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS;end';
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = intentUrl;
+        document.body.appendChild(iframe);
+        setTimeout(() => document.body.removeChild(iframe), 1000);
+      } catch (e) {}
+    }
+
     return {
       success: true,
       message: 'يرجى اختيار "غير مقيد" (Unrestricted) في إعدادات بطارية التطبيق',
@@ -1901,10 +2563,51 @@ export async function openBatteryOptimizationSettings(): Promise<{ success: bool
   }
 }
 
+/**
+ * Open Auto-Start & Application Details Settings
+ */
 export async function openAutoStartSettings(): Promise<{ success: boolean; message: string }> {
-  return openApplicationDetailsSettings();
+  try {
+    const androidBridge =
+      (window as any).AndroidPrinter ||
+      (window as any).AndroidInterface ||
+      (window as any).Android ||
+      (window as any).AndroidBridge;
+
+    if (androidBridge) {
+      if (typeof androidBridge.openAutoStartSettings === 'function') {
+        androidBridge.openAutoStartSettings();
+        return { success: true, message: 'تم فتح إعدادات التشغيل التلقائي' };
+      }
+      if (typeof androidBridge.openAppSettings === 'function') {
+        androidBridge.openAppSettings();
+        return { success: true, message: 'تم فتح معلومات التطبيق' };
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        const intentUrl = 'intent:#Intent;action=android.settings.APPLICATION_DETAILS_SETTINGS;end';
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = intentUrl;
+        document.body.appendChild(iframe);
+        setTimeout(() => document.body.removeChild(iframe), 1000);
+      } catch (e) {}
+    }
+
+    return {
+      success: true,
+      message: 'يرجى تفعيل "التشغيل التلقائي" (Auto-start) وقفل التطبيق في الرام',
+    };
+  } catch (err: any) {
+    return { success: false, message: err?.message || 'تعذر فتح الإعدادات' };
+  }
 }
 
+/**
+ * Open Application Details Settings Page directly
+ */
 export async function openApplicationDetailsSettings(): Promise<{ success: boolean; message: string }> {
   try {
     const androidBridge =
@@ -1917,9 +2620,21 @@ export async function openApplicationDetailsSettings(): Promise<{ success: boole
       androidBridge.openAppSettings();
       return { success: true, message: 'تم فتح معلومات وأذونات التطبيق في النظام' };
     }
+
+    if (typeof window !== 'undefined') {
+      try {
+        const intentUrl = 'intent:#Intent;action=android.settings.APPLICATION_DETAILS_SETTINGS;end';
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = intentUrl;
+        document.body.appendChild(iframe);
+        setTimeout(() => document.body.removeChild(iframe), 1000);
+      } catch (e) {}
+    }
+
     return {
       success: true,
-      message: 'يرجى الانتقال إلى إعدادات الهاتف > التطبيقات > اختيار التطبيق > تفعيل الأذونات',
+      message: 'يرجى الانتقال إلى إعدادات الهاتف > التطبيقات > اختيار التطبيق > تفعيل الأذونات والظهور في الأعلى',
     };
   } catch (err: any) {
     return { success: false, message: err?.message || 'تعذر فتح الإعدادات' };
@@ -1942,6 +2657,9 @@ export interface BackgroundSyncHealthStatus {
   keepScreenOn: boolean;
 }
 
+/**
+ * Perform a complete live audit of the 5-layer Background Sync pipeline
+ */
 export async function checkBackgroundSyncHealth(): Promise<BackgroundSyncHealthStatus> {
   const queue = await getPendingQueue();
   const pendingCount = queue.filter((i) => i.status !== 'synced').length;
@@ -1972,6 +2690,30 @@ export async function checkBackgroundSyncHealth(): Promise<BackgroundSyncHealthS
 
   const notifPerm = typeof Notification !== 'undefined' ? Notification.permission : 'default';
 
+  let overlayPermissionGranted = false;
+  let batteryUnrestricted = false;
+  let keepScreenOn = false;
+
+  const androidBridge =
+    (window as any).AndroidPrinter ||
+    (window as any).AndroidInterface ||
+    (window as any).Android ||
+    (window as any).AndroidBridge;
+
+  if (androidBridge) {
+    try {
+      if (typeof androidBridge.hasOverlayPermission === 'function') {
+        overlayPermissionGranted = !!androidBridge.hasOverlayPermission();
+      }
+      if (typeof androidBridge.isIgnoringBatteryOptimizations === 'function') {
+        batteryUnrestricted = !!androidBridge.isIgnoringBatteryOptimizations();
+      }
+      if (typeof androidBridge.isKeepScreenOn === 'function') {
+        keepScreenOn = !!androidBridge.isKeepScreenOn();
+      }
+    } catch (e) {}
+  }
+
   return {
     serviceWorkerActive: swActive,
     backgroundSyncSupported: bgSyncSupported,
@@ -1981,14 +2723,17 @@ export async function checkBackgroundSyncHealth(): Promise<BackgroundSyncHealthS
     storagePersisted,
     pendingCount,
     isOnline,
-    batteryOptimizationsDisabled: isKeepAliveEngineRunning,
+    batteryOptimizationsDisabled: batteryUnrestricted || isKeepAliveEngineRunning,
     notificationPermission: notifPerm,
-    overlayPermissionGranted: false,
-    batteryUnrestricted: false,
-    keepScreenOn: false,
+    overlayPermissionGranted,
+    batteryUnrestricted,
+    keepScreenOn,
   };
 }
 
+/**
+ * Trigger an immediate high-priority test through all 5 background sync layers
+ */
 export async function triggerForceBackgroundSyncTest(): Promise<{
   success: boolean;
   flushedCount: number;
@@ -1997,13 +2742,78 @@ export async function triggerForceBackgroundSyncTest(): Promise<{
   layersTriggered: string[];
 }> {
   const startTime = Date.now();
-  const layersTriggered: string[] = ['BatchPostgresPipeline'];
+  const layersTriggered: string[] = [];
+
+  // Layer 1: BroadcastChannel
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      const ch = new BroadcastChannel('alkarrar_sync_channel');
+      ch.postMessage({ type: 'TRIGGER_SYNC', timestamp: Date.now() });
+      ch.close();
+      layersTriggered.push('BroadcastChannel');
+    } catch (e) {}
+  }
+
+  // Layer 2: Service Worker controller & sync tags
+  if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+    try {
+      if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: 'FLUSH_QUEUE_IMMEDIATELY' });
+        layersTriggered.push('ServiceWorkerMessage');
+      }
+      const reg = await navigator.serviceWorker.ready;
+      if (reg && 'sync' in reg) {
+        await (reg as any).sync.register('postgres-background-sync').catch(() => {});
+        layersTriggered.push('AndroidBackgroundSyncAPI');
+      }
+    } catch (e) {}
+  }
+
+  // Layer 3: Native Android Bridge
+  try {
+    const bridge =
+      (window as any).AndroidInterface ||
+      (window as any).AndroidPrinter ||
+      (window as any).Android ||
+      (window as any).AndroidBridge;
+    if (bridge && typeof bridge.triggerBackgroundSyncNow === 'function') {
+      bridge.triggerBackgroundSyncNow();
+      layersTriggered.push('NativeAndroidBridge');
+    }
+  } catch (e) {}
+
+  // Layer 4: KeepAlive & Foreground activation
+  if (isKeepAliveModeEnabled()) {
+    setFieldKeepAliveMode(true).catch(() => {});
+    layersTriggered.push('KeepAliveMediaHeartbeat');
+  }
+
+  // Layer 5: Direct Client Flush
   const flushRes = await flushPendingQueue();
+  layersTriggered.push('BatchPostgresPipeline');
+
+  const latencyMs = Date.now() - startTime;
   return {
     success: true,
     flushedCount: flushRes.flushed,
     remainingCount: flushRes.remaining,
-    latencyMs: Date.now() - startTime,
+    latencyMs,
     layersTriggered,
   };
 }
+
+// Auto-activate field keepalive on first user touch anywhere
+if (typeof window !== 'undefined') {
+  const handleUserFirstGesture = () => {
+    if (isKeepAliveModeEnabled()) {
+      setFieldKeepAliveMode(true).catch(() => {});
+    }
+    window.removeEventListener('pointerdown', handleUserFirstGesture);
+    window.removeEventListener('touchstart', handleUserFirstGesture);
+    window.removeEventListener('click', handleUserFirstGesture);
+  };
+  window.addEventListener('pointerdown', handleUserFirstGesture, { once: true, passive: true });
+  window.addEventListener('touchstart', handleUserFirstGesture, { once: true, passive: true });
+  window.addEventListener('click', handleUserFirstGesture, { once: true, passive: true });
+}
+

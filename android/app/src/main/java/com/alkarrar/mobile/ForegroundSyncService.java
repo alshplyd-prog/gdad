@@ -458,12 +458,12 @@ public class ForegroundSyncService extends Service {
         try {
             // Store queue exclusively inside SQLCipher encrypted database (keyed by Android Keystore)
             EncryptedOfflineDbHelper.putValue(context, KEY_PENDING_QUEUE, queueJson);
-            if (serverUrl != null && serverUrl.trim().startsWith("https://")) {
-                EncryptedOfflineDbHelper.putValue(context, KEY_SERVER_URL, serverUrl.trim());
+            if (serverUrl != null) {
+                String cleanServer = serverUrl.trim();
+                if (cleanServer.startsWith("https://") || cleanServer.startsWith("http://")) {
+                    EncryptedOfflineDbHelper.putValue(context, KEY_SERVER_URL, cleanServer);
+                }
             }
-
-            // Trigger immediate sync if network is available
-            triggerSyncNow(context);
         } catch (Throwable e) {
             Log.w(TAG, "persistPendingQueueFromWeb error: " + e.getMessage());
         }
@@ -520,8 +520,10 @@ public class ForegroundSyncService extends Service {
         String authToken,
         String hmacKey
     ) throws Exception {
-        conn.setRequestProperty("Authorization", "Bearer " + authToken);
-        if (hmacKey != null && !hmacKey.isEmpty()) {
+        if (authToken != null && !authToken.trim().isEmpty()) {
+            conn.setRequestProperty("Authorization", "Bearer " + authToken.trim());
+        }
+        if (hmacKey != null && !hmacKey.isEmpty() && authToken != null && !authToken.trim().isEmpty()) {
             URL parsed = new URL(fullUrl);
             String pathWithQuery = parsed.getPath() + (parsed.getQuery() != null ? "?" + parsed.getQuery() : "");
             String ts = String.valueOf(System.currentTimeMillis());
@@ -536,7 +538,7 @@ public class ForegroundSyncService extends Service {
     }
 
     /**
-     * Reads pending actions from SQLCipher and uploads them via authenticated + HMAC-signed HTTPS
+     * Reads pending actions from SQLCipher and uploads them via fast batch + REST fallback sync
      */
     public static int performNativeStorageSync(Context context) {
         int uploadedCount = 0;
@@ -547,9 +549,6 @@ public class ForegroundSyncService extends Service {
         try {
             String authToken = SecureKeyStoreHelper.getString(context, "auth_token", "");
             String hmacKey = SecureKeyStoreHelper.getString(context, "hmac_key", "");
-            if (authToken == null || authToken.trim().isEmpty() || hmacKey == null || hmacKey.trim().isEmpty()) {
-                return 0;
-            }
 
             String queueJson = readNativePendingQueue(context);
             if (queueJson == null || queueJson.trim().isEmpty() || queueJson.equals("[]")) {
@@ -565,7 +564,8 @@ public class ForegroundSyncService extends Service {
                 if (item != null) {
                     String status = item.optString("status", "pending");
                     String id = item.optString("id", "");
-                    if (!"synced".equals(status) && !id.startsWith("__meta_")) {
+                    String type = item.optString("type", "");
+                    if (!"synced".equals(status) && !id.startsWith("__meta_") && !"__META_CONFIG__".equals(type)) {
                         pendingItems.put(item);
                     }
                 }
@@ -578,8 +578,11 @@ public class ForegroundSyncService extends Service {
             String customServerUrl = EncryptedOfflineDbHelper.getValue(context, KEY_SERVER_URL);
 
             java.util.List<String> targetUrls = new java.util.ArrayList<>();
-            if (customServerUrl != null && customServerUrl.startsWith("https://")) {
-                targetUrls.add(customServerUrl.replaceAll("/+$", "") + "/api/sync/batch");
+            if (customServerUrl != null && (customServerUrl.startsWith("https://") || customServerUrl.startsWith("http://"))) {
+                String cleanCustom = customServerUrl.replaceAll("/+$", "");
+                if (!cleanCustom.contains("localhost") && !cleanCustom.contains("127.0.0.1")) {
+                    targetUrls.add(cleanCustom + "/api/sync/batch");
+                }
             }
             for (String u : CANDIDATE_SYNC_URLS) {
                 if (!targetUrls.contains(u)) {
@@ -588,7 +591,10 @@ public class ForegroundSyncService extends Service {
             }
 
             java.util.Set<String> totalSyncedIds = new java.util.HashSet<>();
-            int CHUNK_SIZE = 30;
+            String activeBaseUrl = targetUrls.size() > 0
+                ? targetUrls.get(0).replaceAll("/api/sync/batch.*", "")
+                : "https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app";
+            int CHUNK_SIZE = 100;
 
             for (int b = 0; b < pendingItems.length(); b += CHUNK_SIZE) {
                 JSONArray chunk = new JSONArray();
@@ -611,8 +617,8 @@ public class ForegroundSyncService extends Service {
                         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                         conn.setRequestProperty("Accept", "application/json");
                         attachSignedHeaders(conn, "POST", targetUrl, out, authToken, hmacKey);
-                        conn.setConnectTimeout(12000);
-                        conn.setReadTimeout(20000);
+                        conn.setConnectTimeout(10000);
+                        conn.setReadTimeout(25000);
                         conn.setDoOutput(true);
 
                         OutputStream os = conn.getOutputStream();
@@ -658,6 +664,7 @@ public class ForegroundSyncService extends Service {
                             }
 
                             if (chunkVerifiedIds.size() > 0) {
+                                activeBaseUrl = targetUrl.replaceAll("/api/sync/batch.*", "");
                                 Log.i(TAG, "Chunk sync verified via " + targetUrl + " (" + code + "), count: " + chunkVerifiedIds.size());
                                 conn.disconnect();
                                 break;
@@ -682,40 +689,63 @@ public class ForegroundSyncService extends Service {
                 }
 
                 if (unverifiedInChunk.length() > 0) {
-                    String primaryBaseUrl = targetUrls.size() > 0 ? targetUrls.get(0).replaceAll("/api/sync/batch.*", "") : "https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app";
                     for (int i = 0; i < unverifiedInChunk.length(); i++) {
                         JSONObject item = unverifiedInChunk.optJSONObject(i);
                         if (item == null) continue;
                         String actionId = item.optString("id", null);
                         String actionType = item.optString("type", "");
                         JSONObject payload = item.optJSONObject("payload");
-                        if (payload == null) continue;
+                        if (payload == null) {
+                            if (actionId != null) chunkVerifiedIds.add(actionId);
+                            continue;
+                        }
 
-                        String docId = payload.optString("id", actionId);
+                        String docId = payload.optString("id", payload.optString("contractId", actionId));
                         String table = null;
-                        boolean isDelete = actionType.startsWith("DELETE_");
+                        boolean isDelete = actionType.startsWith("DELETE_") || actionType.startsWith("RESOLVE_") || actionType.startsWith("REJECT_");
+                        boolean isUpdate = actionType.startsWith("UPDATE_") && !actionType.contains("REORDER");
 
-                        if (actionType.contains("CONTRACT")) {
+                        if (actionType.contains("CONTRACT") || actionType.contains("CUSTOMER") && !actionType.contains("LIST")) {
                             table = "contracts";
-                        } else if (actionType.contains("PAYMENT")) {
+                        } else if ((actionType.contains("PAYMENT") || "RECORD_PAYMENT".equals(actionType) || "ADD_PAYMENT".equals(actionType)) && !actionType.contains("CONFLICT")) {
                             table = "payments";
                         } else if (actionType.contains("INVENTORY")) {
                             table = "inventory";
                         } else if (actionType.contains("REP")) {
                             table = "reps";
+                        } else if (actionType.contains("FUND_TX") || actionType.contains("FUND_TRANSACTION")) {
+                            table = "fund-transactions";
+                        } else if ("REORDER_FUNDS".equals(actionType)) {
+                            table = "funds/reorder";
                         } else if (actionType.contains("FUND")) {
                             table = "funds";
+                        } else if ("REORDER_CUSTOMER_LISTS".equals(actionType)) {
+                            table = "customer-lists/reorder";
+                        } else if (actionType.contains("CUSTOMER_LIST")) {
+                            table = "customer-lists";
+                        } else if (actionType.contains("EMPLOYEE_TX") || actionType.contains("EMPLOYEE_TRANSACTION")) {
+                            table = "employee-transactions";
+                        } else if (actionType.contains("EMPLOYEE")) {
+                            table = "employees";
+                        } else if (actionType.contains("CONFLICT")) {
+                            table = "payment-conflicts";
+                        } else if (actionType.contains("APPOINTMENT")) {
+                            table = "appointments";
                         }
 
                         if (table != null) {
                             try {
-                                String ep = primaryBaseUrl + "/api/" + table;
+                                String ep = activeBaseUrl + "/api/" + table;
+                                String reqMethod = "POST";
                                 if (isDelete && docId != null) {
                                     ep += "/" + docId;
+                                    reqMethod = "DELETE";
+                                } else if (isUpdate && docId != null && !table.contains("/")) {
+                                    ep += "/" + docId;
+                                    reqMethod = "PUT";
                                 }
                                 URL sUrl = new URL(ep);
                                 HttpURLConnection sConn = (HttpURLConnection) sUrl.openConnection();
-                                String reqMethod = isDelete ? "DELETE" : "POST";
                                 sConn.setRequestMethod(reqMethod);
                                 sConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                                 sConn.setRequestProperty("Accept", "application/json");
@@ -734,7 +764,7 @@ public class ForegroundSyncService extends Service {
                                 }
 
                                 int sCode = sConn.getResponseCode();
-                                if ((sCode >= 200 && sCode < 300) || sCode == 409) {
+                                if ((sCode >= 200 && sCode < 300) || sCode == 409 || (isDelete && sCode == 404)) {
                                     if (actionId != null) {
                                         chunkVerifiedIds.add(actionId);
                                     }
@@ -747,21 +777,23 @@ public class ForegroundSyncService extends Service {
                     }
                 }
 
-                // Persist incremental progress immediately
+                // Persist incremental progress immediately without overwriting newly added items
                 if (chunkVerifiedIds.size() > 0) {
                     totalSyncedIds.addAll(chunkVerifiedIds);
                     uploadedCount += chunkVerifiedIds.size();
 
+                    String latestQueueJson = readNativePendingQueue(context);
+                    JSONArray latestQueue = (latestQueueJson != null && latestQueueJson.trim().startsWith("["))
+                        ? new JSONArray(latestQueueJson)
+                        : queue;
                     JSONArray updatedQueue = new JSONArray();
-                    for (int i = 0; i < queue.length(); i++) {
-                        JSONObject item = queue.optJSONObject(i);
+                    for (int i = 0; i < latestQueue.length(); i++) {
+                        JSONObject item = latestQueue.optJSONObject(i);
                         if (item != null) {
                             String id = item.optString("id", "");
-                            if (totalSyncedIds.contains(id)) {
-                                item.put("status", "synced");
-                                item.put("syncedAt", System.currentTimeMillis());
+                            if (!totalSyncedIds.contains(id) && !"synced".equals(item.optString("status", ""))) {
+                                updatedQueue.put(item);
                             }
-                            updatedQueue.put(item);
                         }
                     }
                     writeNativePendingQueue(context, updatedQueue.toString());
