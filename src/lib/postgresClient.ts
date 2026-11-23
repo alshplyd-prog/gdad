@@ -2631,7 +2631,7 @@ export function prunePaymentsOlderThanOneYearFromLocalCache(): {
     // Pending offline payments must NEVER be pruned
     const pendingIds = new Set<string>();
     try {
-      const qRaw = localStorage.getItem('sami_pending_queue') || '[]';
+      const qRaw = localStorage.getItem('alkarrar_offline_pending_queue') || localStorage.getItem('sami_pending_queue') || '[]';
       const q = JSON.parse(qRaw);
       if (Array.isArray(q)) {
         for (const item of q) {

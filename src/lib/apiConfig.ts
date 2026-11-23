@@ -216,10 +216,6 @@ export async function fetchWithFallback(
       if (!urlsToTry.includes(cleanEndpoint)) {
         urlsToTry.push(cleanEndpoint);
       }
-      const originUrl = `${window.location.origin}${cleanEndpoint}`;
-      if (!urlsToTry.includes(originUrl)) {
-        urlsToTry.push(originUrl);
-      }
       const custom = getCustomServerUrl();
       if (custom && custom !== window.location.origin) {
         const customUrl = `${custom}${cleanEndpoint}`;
@@ -293,8 +289,8 @@ export async function fetchWithFallback(
         return res;
       }
 
-      // Surface validation/security/auth/conflict responses directly instead of treating them as network failures
-      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 409) {
+      // Surface validation/security/auth/conflict/not-found JSON responses directly without slow retries
+      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404 || res.status === 409 || res.status === 422) {
         if (
           res.status === 401 &&
           !skipSigning &&
@@ -306,7 +302,7 @@ export async function fetchWithFallback(
           } catch (e) {}
         }
         const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
+        if (contentType.includes('application/json') || res.status === 404) {
           return res;
         }
       }

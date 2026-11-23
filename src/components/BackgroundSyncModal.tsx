@@ -84,11 +84,14 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
     setIsLoadingHealth(true);
     try {
       const [h, q] = await Promise.all([checkBackgroundSyncHealth(), getPendingQueue()]);
+      const pendingOnly = q.filter((i) => i.status !== 'synced');
       setHealth(h);
-      setQueueItems(q.filter((i) => i.status !== 'synced'));
+      setQueueItems(pendingOnly);
       setKeepAliveActive(isKeepAliveModeEnabled());
+      return pendingOnly;
     } catch (e) {
       console.warn('Failed to load sync health:', e);
+      return [];
     } finally {
       setIsLoadingHealth(false);
     }
@@ -96,7 +99,13 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      loadHealthAndQueue();
+      let autoFlushedOnOpen = false;
+      loadHealthAndQueue().then((items) => {
+        if (!autoFlushedOnOpen && items.length > 0 && typeof navigator !== 'undefined' && navigator.onLine !== false) {
+          autoFlushedOnOpen = true;
+          handleManualFlush();
+        }
+      });
       const unsub = subscribeToQueueChange(() => {
         loadHealthAndQueue();
       });

@@ -209,6 +209,7 @@ async function uploadSingleActionViaRest(action, origins) {
   switch (type) {
     case 'CREATE_PAYMENT':
     case 'RECORD_PAYMENT':
+    case 'ADD_PAYMENT':
       endpointPath = '/api/payments';
       method = 'POST';
       break;
@@ -268,6 +269,10 @@ async function uploadSingleActionViaRest(action, origins) {
       endpointPath = docId ? `/api/funds/${docId}` : '';
       method = 'DELETE';
       break;
+    case 'REORDER_FUNDS':
+      endpointPath = '/api/funds/reorder';
+      method = 'POST';
+      break;
     case 'CREATE_CUSTOMER_LIST':
       endpointPath = '/api/customer-lists';
       method = 'POST';
@@ -279,6 +284,10 @@ async function uploadSingleActionViaRest(action, origins) {
     case 'DELETE_CUSTOMER_LIST':
       endpointPath = docId ? `/api/customer-lists/${docId}` : '';
       method = 'DELETE';
+      break;
+    case 'REORDER_CUSTOMER_LISTS':
+      endpointPath = '/api/customer-lists/reorder';
+      method = 'POST';
       break;
     case 'CREATE_EMPLOYEE':
       endpointPath = '/api/employees';
@@ -298,6 +307,7 @@ async function uploadSingleActionViaRest(action, origins) {
       method = 'POST';
       break;
     case 'UPDATE_FUND_TRANSACTION':
+    case 'UPDATE_FUND_TX':
       endpointPath = docId ? `/api/fund-transactions/${docId}` : '/api/fund-transactions';
       method = 'PUT';
       break;
@@ -312,6 +322,7 @@ async function uploadSingleActionViaRest(action, origins) {
       method = 'POST';
       break;
     case 'UPDATE_EMPLOYEE_TRANSACTION':
+    case 'UPDATE_EMPLOYEE_TX':
       endpointPath = docId ? `/api/employee-transactions/${docId}` : '/api/employee-transactions';
       method = 'PUT';
       break;
@@ -366,7 +377,7 @@ async function uploadSingleActionViaRest(action, origins) {
     try {
       const url = `${origin}${endpointPath}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
+      const timer = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(url, {
         method,
         headers: signedHeaders,
@@ -374,7 +385,7 @@ async function uploadSingleActionViaRest(action, origins) {
         signal: controller.signal,
       });
       clearTimeout(timer);
-      if (res && res.status === 409) {
+      if (res && (res.status === 409 || (method === 'DELETE' && res.status === 404))) {
         return true;
       }
       if (res && res.ok && res.status >= 200 && res.status < 300) {
@@ -410,8 +421,8 @@ async function flushPendingActionsInBackground() {
     const origins = await getCandidateServerOrigins();
     const processedIds = [];
 
-    // Path 1: Try batch sync endpoint in chunks of 200
-    const SW_BATCH_CHUNK = 200;
+    // Path 1: Try batch sync endpoint in fast 100-item chunks
+    const SW_BATCH_CHUNK = 100;
     for (let i = 0; i < actions.length; i += SW_BATCH_CHUNK) {
       const chunkActions = actions.slice(i, i + SW_BATCH_CHUNK);
       const chunkBody = JSON.stringify({ actions: chunkActions });
@@ -424,7 +435,7 @@ async function flushPendingActionsInBackground() {
         try {
           const batchUrl = `${origin}/api/sync/batch`;
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 6000);
+          const timer = setTimeout(() => controller.abort(), 25000);
           const attempt = await fetch(batchUrl, {
             method: 'POST',
             headers: batchHeaders,

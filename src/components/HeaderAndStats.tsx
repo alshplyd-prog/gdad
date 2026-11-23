@@ -808,13 +808,16 @@ export const HeaderAndStats: React.FC<HeaderAndStatsProps> = ({
               <div
                 className="select-none inline-flex items-center cursor-pointer shrink-0"
                 onClick={() => {
+                  if (pendingCount > 0 && onManualSync) {
+                    onManualSync();
+                  }
                   if (onOpenBackgroundSync) {
                     onOpenBackgroundSync();
-                  } else if (onManualSync) {
+                  } else if (pendingCount === 0 && onManualSync) {
                     onManualSync();
                   }
                 }}
-                title={isAr ? 'المزامنة بالخلفية وحالة الاتصال - اضغط للإعدادات والفحص' : 'Background Sync & Connection - Click for settings & test'}
+                title={isAr ? 'المزامنة بالخلفية وحالة الاتصال - اضغط للرفع الفوري والإعدادات' : 'Background Sync & Connection - Click to sync & configure'}
               >
                 {pendingCount > 0 ? (
                   <span className="inline-flex items-center gap-1 text-[10px] xs:text-[11px] sm:text-xs font-extrabold px-2 sm:px-2.5 py-1 sm:py-1.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-white animate-pulse shadow-xs transition-all whitespace-nowrap">

@@ -749,15 +749,57 @@ async function recalculateAllFundBalancesInPg() {
       }
     }
 
-    // Also update fileDb funds & transactions
+    // Also update fileDb funds & transactions (O(N) indexed lookups without per-row PG queries)
     const filePayments = fileDb.get<any>("payments") || [];
     const fileFundTxs = fileDb.get<any>("fund_transactions") || [];
     const fileEmpTxs = fileDb.get<any>("employee_transactions") || [];
-    const activePaymentIds = new Set(filePayments.filter((p: any) => Number(p.amountPaid ?? p.amount) > 0).map((p: any) => String(p.id)));
-    const activeEmpTxIds = new Set(fileEmpTxs.map((t: any) => String(t.id)));
+    const fileContracts = fileDb.get<any>("contracts") || [];
+    const activePaymentIds = new Set(filePayments.filter((p: any) => p && Number(p.amountPaid ?? p.amount) > 0).map((p: any) => String(p.id)));
+    const activeEmpTxIds = new Set(fileEmpTxs.filter(Boolean).map((t: any) => String(t.id)));
+
+    const fundIdSet = new Set(funds.map((f: any) => f?.id).filter(Boolean));
+    const listFundById = new Map<string, string>();
+    const listFundByNormName = new Map<string, string>();
+    for (const l of lists) {
+      const fid = l?.fundId || l?.fund_id;
+      if (!fid) continue;
+      if (l.id) listFundById.set(String(l.id), fid);
+      if (l.name) listFundByNormName.set(normalizeEntityName(l.name), fid);
+    }
+    const contractById = new Map<string, any>();
+    const contractByNormName = new Map<string, any>();
+    for (const c of fileContracts) {
+      if (!c) continue;
+      if (c.id) contractById.set(String(c.id), c);
+      if (c.customerName) contractByNormName.set(normalizeEntityName(c.customerName), c);
+    }
+    const resolveLocalFundSync = (fId?: string | null, cId?: string | null, cName?: string | null): string | null => {
+      if (fId) {
+        if (fundIdSet.has(fId)) return fId;
+        const fromList = listFundById.get(fId) || listFundByNormName.get(normalizeEntityName(fId));
+        if (fromList) return fromList;
+      }
+      if (cId) {
+        const c = contractById.get(String(cId));
+        const lid = c?.listId || c?.list_id;
+        if (lid) {
+          const fl = listFundById.get(String(lid)) || listFundByNormName.get(normalizeEntityName(String(lid)));
+          if (fl) return fl;
+        }
+      }
+      if (cName) {
+        const c = contractByNormName.get(normalizeEntityName(cName));
+        const lid = c?.listId || c?.list_id;
+        if (lid) {
+          const fl = listFundById.get(String(lid)) || listFundByNormName.get(normalizeEntityName(String(lid)));
+          if (fl) return fl;
+        }
+      }
+      return defaultFundId;
+    };
 
     // Clean orphan installment & duplicate employee debt transactions
-    let updatedTxs = fileFundTxs.filter((tx: any) => {
+    const updatedTxs = fileFundTxs.filter((tx: any) => {
       if (tx && tx.id && String(tx.id).startsWith("ft_pay_")) {
         const pId = String(tx.id).replace("ft_pay_", "");
         return activePaymentIds.has(pId);
@@ -772,20 +814,23 @@ async function recalculateAllFundBalancesInPg() {
       return true;
     });
     let txsChanged = updatedTxs.length !== fileFundTxs.length;
+    const txIndexById = new Map<string, number>();
+    for (let i = 0; i < updatedTxs.length; i++) {
+      if (updatedTxs[i]?.id) txIndexById.set(String(updatedTxs[i].id), i);
+    }
 
     let paymentsChanged = false;
     for (const p of filePayments) {
       if (!p || (Number(p.amountPaid ?? p.amount) <= 0)) continue;
       const ftId = `ft_pay_${p.id}`;
-      let pFundId = await resolveFundIdForPayment(p.fundId || p.fund_id, p.contractId || p.sale_id, p.customerName || p.customer_name);
-      if (!pFundId) pFundId = defaultFundId;
+      const pFundId = resolveLocalFundSync(p.fundId || p.fund_id, p.contractId || p.sale_id, p.customerName || p.customer_name);
       if (pFundId && (p.fundId !== pFundId || p.fund_id !== pFundId)) {
         p.fundId = pFundId;
         p.fund_id = pFundId;
         paymentsChanged = true;
       }
       if (pFundId) {
-        const existingTxIdx = updatedTxs.findIndex((tx: any) => tx.id === ftId);
+        const existingTxIdx = txIndexById.get(ftId);
         const amount = Number(p.amountPaid ?? p.amount) || 0;
         const txObj = {
           id: ftId,
@@ -796,12 +841,13 @@ async function recalculateAllFundBalancesInPg() {
           repName: p.repName || '',
           createdAt: p.createdAt || p.paymentDate || new Date().toISOString()
         };
-        if (existingTxIdx >= 0) {
+        if (existingTxIdx !== undefined) {
           if (updatedTxs[existingTxIdx].amount !== amount || updatedTxs[existingTxIdx].fundId !== pFundId) {
             updatedTxs[existingTxIdx] = { ...updatedTxs[existingTxIdx], ...txObj };
             txsChanged = true;
           }
         } else {
+          txIndexById.set(ftId, updatedTxs.length);
           updatedTxs.push(txObj);
           txsChanged = true;
         }
@@ -813,7 +859,7 @@ async function recalculateAllFundBalancesInPg() {
       if (!et || Number(et.amount) <= 0 || !et.fundId) continue;
       const ftId = `ft_emp_${et.id}`;
       const isLoan = et.type === 'loan' || et.type === 'debt' || et.type === 'سلفة' || et.type === 'دين';
-      const existingTxIdx = updatedTxs.findIndex((tx: any) => tx.id === ftId);
+      const existingTxIdx = txIndexById.get(ftId);
       const amount = Number(et.amount) || 0;
       const empName = et.employeeName || et.repName || 'الموظف';
       const ftObj = {
@@ -827,12 +873,13 @@ async function recalculateAllFundBalancesInPg() {
         repName: et.repName || 'الإدارة',
         createdAt: et.createdAt || new Date().toISOString()
       };
-      if (existingTxIdx >= 0) {
+      if (existingTxIdx !== undefined) {
         if (updatedTxs[existingTxIdx].amount !== amount || updatedTxs[existingTxIdx].fundId !== et.fundId) {
           updatedTxs[existingTxIdx] = { ...updatedTxs[existingTxIdx], ...ftObj };
           txsChanged = true;
         }
       } else {
+        txIndexById.set(ftId, updatedTxs.length);
         updatedTxs.push(ftObj);
         txsChanged = true;
       }
@@ -978,7 +1025,8 @@ async function recordPaymentFundAdjustment(
   customerName: string,
   repName: string,
   paymentDate: string,
-  isReversal = false
+  isReversal = false,
+  skipBalanceRecalc = false
 ) {
   if (!fundId || amount === 0) return;
   const ftId = `ft_pay_${paymentId}`;
@@ -995,23 +1043,6 @@ async function recordPaymentFundAdjustment(
   paymentAdjustmentMutex.set(ftId, lockPromise);
 
   try {
-    // 2. Check if fund transaction ft_pay_${paymentId} already exists in DB or fileDb
-    let existingFt: any = (fileDb.get<any>("fund_transactions") || []).find((f: any) => f.id === ftId);
-    if (!existingFt && isPgConfigured()) {
-      const rows = await executePg("SELECT * FROM fund_transactions WHERE id = $1 LIMIT 1", [ftId]).catch(() => []);
-      if (rows && rows.length > 0) {
-        existingFt = {
-          id: rows[0].id,
-          fundId: rows[0].fund_id ?? rows[0].fundId,
-          amount: Number(rows[0].amount) || 0,
-          type: rows[0].type,
-          note: rows[0].note,
-          repName: rows[0].rep_name ?? rows[0].repName,
-          createdAt: rows[0].created_at ?? rows[0].createdAt,
-        };
-      }
-    }
-
     if (isReversal) {
       if (isPgConfigured()) {
         await executePg("DELETE FROM fund_transactions WHERE id = $1", [ftId]).catch(() => {});
@@ -1046,8 +1077,10 @@ async function recordPaymentFundAdjustment(
       });
     }
 
-    // Always recalculate fund balances from fund_transactions to guarantee 100% accuracy and consistency
-    await recalculateAllFundBalancesInPg();
+    // Recalculate fund balances unless deferred to end of batch
+    if (!skipBalanceRecalc) {
+      await recalculateAllFundBalancesInPg();
+    }
   } finally {
     paymentAdjustmentMutex.delete(ftId);
     resolveLock();
@@ -6060,13 +6093,13 @@ async function startServer() {
   });
 
   // --- Background Sync Batch & Beacon API ---
-  async function processSingleSyncAction(action: any, skipBalanceRecalc: boolean = false): Promise<boolean> {
+  async function processSingleSyncAction(action: any, skipBalanceRecalc: boolean = false, skipDeletedCheck: boolean = false): Promise<boolean> {
     if (!action || !action.type) return true;
     try {
       const { type, payload } = action;
 
-      // Check if this record was previously deleted so we never resurrect it
-      if (payload?.id && (type.startsWith('CREATE_') || type.startsWith('UPDATE_'))) {
+      // Check if this record was previously deleted so we never resurrect it (skipped when batch already checked deletedSet)
+      if (!skipDeletedCheck && payload?.id && (type.startsWith('CREATE_') || type.startsWith('UPDATE_'))) {
         const deletedCheck = await executePg(
           `SELECT 1 FROM deleted_records WHERE record_id = $1 LIMIT 1`,
           [payload.id]
@@ -7895,7 +7928,7 @@ async function startServer() {
       // 1. Bulk lookup all deleted records in a single query
       const candidateIds = actions.map((a: any) => a?.payload?.id || (typeof a?.payload === 'string' ? a.payload : null)).filter(Boolean);
       let deletedSet = new Set<string>();
-      if (candidateIds.length > 0) {
+      if (candidateIds.length > 0 && isPgConfigured()) {
         const deletedRows = await executePg(
           `SELECT record_id FROM deleted_records WHERE record_id = ANY($1)`,
           [candidateIds]
@@ -7908,6 +7941,7 @@ async function startServer() {
       const processedIds: string[] = [];
       const rejectedReplayIds: string[] = [];
       const affectedContractIds = new Set<string>();
+      let needsFundRecalc = false;
 
       // Partition actions into Payments, Contracts, Deletes, and Others for maximum batch speed
       const paymentActions: any[] = [];
@@ -7915,43 +7949,44 @@ async function startServer() {
       const otherActions: any[] = [];
 
       for (const act of actions) {
-        const targetId = act?.payload?.id || (typeof act?.payload === 'string' ? act?.payload : null);
-        const isDelete = act?.type?.startsWith('DELETE_') || act?.type?.endsWith('_DELETE');
+        if (!act) continue;
+        const normalizedType =
+          act.type === 'RECORD_PAYMENT' || act.type === 'ADD_PAYMENT' ? 'CREATE_PAYMENT' : act.type;
+        const normalizedAct = normalizedType === act.type ? act : { ...act, type: normalizedType };
+        const targetId = normalizedAct?.payload?.id || (typeof normalizedAct?.payload === 'string' ? normalizedAct?.payload : null);
+        const isDelete = normalizedType?.startsWith('DELETE_') || normalizedType?.endsWith('_DELETE');
 
         // If previously deleted entity (and NOT a new creation/payment), mark as processed and skip
-        if (!isDelete && act?.type !== 'CREATE_PAYMENT' && targetId && deletedSet.has(targetId)) {
-          if (act?.id) processedIds.push(act.id);
+        if (!isDelete && normalizedType !== 'CREATE_PAYMENT' && targetId && deletedSet.has(targetId)) {
+          if (normalizedAct?.id) processedIds.push(normalizedAct.id);
           continue;
         }
 
-        if (act?.type === 'CREATE_PAYMENT' || act?.type === 'UPDATE_PAYMENT') {
+        if (normalizedType === 'CREATE_PAYMENT' || normalizedType === 'UPDATE_PAYMENT') {
           if (targetId && deletedSet.has(targetId)) {
             deletedSet.delete(targetId);
           }
           // Anti-Replay Verification per offline payment
-          if (act.type === 'CREATE_PAYMENT') {
-            const p = act.payload || {};
-            const pNonce = String(p.nonce || act.nonce || p.id || '');
+          if (normalizedType === 'CREATE_PAYMENT') {
+            const p = normalizedAct.payload || {};
+            const pNonce = String(p.nonce || normalizedAct.nonce || p.id || '');
             const pAmt = Number(p.amount ?? p.amountPaid ?? p.amount_paid) || 0;
             const nRes = await consumeReplayNonce(`pay:${pNonce}`, '/api/sync/batch', 'CREATE_PAYMENT', req.authUser?.repId, pAmt, p.contractId || '');
             if (!nRes.ok) {
-              // Reject replay (do NOT re-credit balance or funds)
               const existingSameAmt = nRes.existing && Math.abs(Number(nRes.existing.amount || 0) - pAmt) < 0.01;
               if (existingSameAmt) {
-                // Identical idempotent network retry -> clear from client queue without altering DB
-                if (act?.id) processedIds.push(act.id);
+                if (normalizedAct?.id) processedIds.push(normalizedAct.id);
               } else {
-                // Tampered replay attempt -> reject explicitly
-                if (act?.id) rejectedReplayIds.push(act.id);
+                if (normalizedAct?.id) rejectedReplayIds.push(normalizedAct.id);
               }
               continue;
             }
           }
-          paymentActions.push(act);
-        } else if (act?.type === 'CREATE_CONTRACT') {
-          contractActions.push(act);
+          paymentActions.push(normalizedAct);
+        } else if (normalizedType === 'CREATE_CONTRACT') {
+          contractActions.push(normalizedAct);
         } else {
-          otherActions.push(act);
+          otherActions.push(normalizedAct);
         }
       }
 
@@ -7959,7 +7994,11 @@ async function startServer() {
       if (paymentActions.length > 0) {
         const paymentRows = paymentActions.map((act) => {
           const p = act.payload || {};
+          const pId = String(p.id || '').trim();
           const amt = Number(p.amount ?? p.amountPaid ?? p.amount_paid) || 0;
+          if (!pId || amt <= 0 || pId.startsWith('contract_') || pId.startsWith('emp_') || pId.startsWith('item_') || pId.startsWith('fund_')) {
+            return null;
+          }
           const cId = p.contractId ?? p.contract_id ?? '';
           const cName = p.customerName ?? p.customer_name ?? '';
           const pDate = p.paymentDate ?? p.payment_date ?? new Date().toISOString().split('T')[0];
@@ -7975,7 +8014,7 @@ async function startServer() {
 
           try {
             fileDb.upsert("payments", {
-              id: p.id,
+              id: pId,
               contractId: cId,
               customerName: cName,
               amount: amt,
@@ -7992,7 +8031,7 @@ async function startServer() {
           } catch (e) {}
 
           return {
-            id: String(p.id),
+            id: pId,
             contract_id: String(cId),
             customer_name: String(cName),
             amount: amt,
@@ -8006,7 +8045,7 @@ async function startServer() {
             created_at: String(cAt),
             is_edited: isEd,
           };
-        }).filter((r) => r.id);
+        }).filter((r): r is NonNullable<typeof r> => Boolean(r && r.id));
 
         const uniquePaymentRowsMap = new Map<string, any>();
         for (const row of paymentRows) {
@@ -8018,105 +8057,211 @@ async function startServer() {
 
         if (dedupedPaymentRows.length > 0) {
           let pgBulkPayOk = false;
-          try {
-            await executePg(`
-              INSERT INTO payments (
-                id, contract_id, customer_name, amount, amount_paid,
-                payment_date, note, rep_name, fund_id, latitude, longitude, created_at, is_edited
-              )
-              SELECT
-                x.id,
-                x.contract_id,
-                x.customer_name,
-                COALESCE(x.amount, 0),
-                COALESCE(x.amount_paid, x.amount, 0),
-                x.payment_date,
-                x.note,
-                x.rep_name,
-                x.fund_id,
-                x.latitude,
-                x.longitude,
-                COALESCE(x.created_at, NOW()::text),
-                COALESCE(x.is_edited, false)
-              FROM jsonb_to_recordset($1::jsonb) AS x(
-                id text,
-                contract_id text,
-                customer_name text,
-                amount double precision,
-                amount_paid double precision,
-                payment_date text,
-                note text,
-                rep_name text,
-                fund_id text,
-                latitude double precision,
-                longitude double precision,
-                created_at text,
-                is_edited boolean
-              )
-              ON CONFLICT (id) DO UPDATE SET
-                contract_id = EXCLUDED.contract_id,
-                customer_name = EXCLUDED.customer_name,
-                amount = EXCLUDED.amount,
-                amount_paid = EXCLUDED.amount_paid,
-                payment_date = EXCLUDED.payment_date,
-                note = EXCLUDED.note,
-                rep_name = EXCLUDED.rep_name,
-                fund_id = EXCLUDED.fund_id,
-                latitude = COALESCE(EXCLUDED.latitude, payments.latitude),
-                longitude = COALESCE(EXCLUDED.longitude, payments.longitude),
-                is_edited = EXCLUDED.is_edited
-            `, [JSON.stringify(dedupedPaymentRows)]);
-            pgBulkPayOk = true;
-          } catch (bulkPayErr) {
-            console.warn('[Batch Sync] Bulk payment upsert PG warning, saved in fileDb:', (bulkPayErr as any)?.message || bulkPayErr);
+          if (isPgConfigured()) {
+            try {
+              await executePg(`
+                INSERT INTO payments (
+                  id, contract_id, customer_name, amount, amount_paid,
+                  payment_date, note, rep_name, fund_id, latitude, longitude, created_at, is_edited
+                )
+                SELECT
+                  x.id,
+                  x.contract_id,
+                  x.customer_name,
+                  COALESCE(x.amount, 0),
+                  COALESCE(x.amount_paid, x.amount, 0),
+                  x.payment_date,
+                  x.note,
+                  x.rep_name,
+                  x.fund_id,
+                  x.latitude,
+                  x.longitude,
+                  COALESCE(x.created_at, NOW()::text),
+                  COALESCE(x.is_edited, false)
+                FROM jsonb_to_recordset($1::jsonb) AS x(
+                  id text,
+                  contract_id text,
+                  customer_name text,
+                  amount double precision,
+                  amount_paid double precision,
+                  payment_date text,
+                  note text,
+                  rep_name text,
+                  fund_id text,
+                  latitude double precision,
+                  longitude double precision,
+                  created_at text,
+                  is_edited boolean
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                  contract_id = EXCLUDED.contract_id,
+                  customer_name = EXCLUDED.customer_name,
+                  amount = EXCLUDED.amount,
+                  amount_paid = EXCLUDED.amount_paid,
+                  payment_date = EXCLUDED.payment_date,
+                  note = EXCLUDED.note,
+                  rep_name = EXCLUDED.rep_name,
+                  fund_id = EXCLUDED.fund_id,
+                  latitude = COALESCE(EXCLUDED.latitude, payments.latitude),
+                  longitude = COALESCE(EXCLUDED.longitude, payments.longitude),
+                  is_edited = EXCLUDED.is_edited
+              `, [JSON.stringify(dedupedPaymentRows)]);
+              pgBulkPayOk = true;
+            } catch (bulkPayErr) {
+              console.warn('[Batch Sync] Bulk payment upsert PG warning, saved in fileDb:', (bulkPayErr as any)?.message || bulkPayErr);
+            }
           }
 
           for (const row of dedupedPaymentRows) {
             if (row.amount > 0) {
-              const targetFundId = await resolveFundIdForPayment(row.fund_id, row.contract_id);
-              if (targetFundId) {
-                await recordPaymentFundAdjustment(
-                  row.id,
-                  targetFundId,
-                  row.amount,
-                  row.customer_name || '',
-                  row.rep_name || '',
-                  row.payment_date || '',
-                  false
-                ).catch(() => {});
+              // Fast O(1) fund lookup from memory maps
+              const localLists = fileDb.get<any>("customer_lists") || [];
+              const localFunds = fileDb.get<any>("cash_funds") || fileDb.get<any>("funds") || [];
+              const localContracts = fileDb.get<any>("contracts") || [];
+              let targetFundId: string | null = null;
+              if (row.fund_id && localFunds.some((f: any) => f?.id === row.fund_id)) {
+                targetFundId = row.fund_id;
+              } else if (row.fund_id) {
+                const lm = localLists.find((l: any) => l?.id === row.fund_id || (l?.name && normalizeEntityName(l.name) === normalizeEntityName(row.fund_id)));
+                if (lm?.fundId || lm?.fund_id) targetFundId = lm.fundId || lm.fund_id;
               }
-            }
-            if (pgBulkPayOk && row.contract_id && row.latitude != null && row.longitude != null && row.latitude !== 0 && row.longitude !== 0) {
-              const nowIso = new Date().toISOString();
-              const paymentTs = String(row.created_at || '');
-              const clearState = await getServerClearedLocationState(row.contract_id, row.customer_name);
-              const clearedAt = clearState.clearedAt || '';
-              if (!clearState.cleared || (paymentTs && clearedAt && paymentTs > clearedAt)) {
-                await unclearContractLocation(row.contract_id, row.customer_name || clearState.customerName);
-                await executePg(`
-                  UPDATE sales
-                  SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                  WHERE id = $4 AND (latitude IS NULL OR latitude = 0)
-                `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
-                await executePg(`
-                  UPDATE customers
-                  SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
-                  WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR ${pgNormColSql('name')} IN (SELECT ${pgNormColSql('customer_name')} FROM sales WHERE id = $4))
-                    AND (latitude IS NULL OR latitude = 0)
-                `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {});
+              if (!targetFundId && row.contract_id) {
+                const c = localContracts.find((x: any) => x?.id === row.contract_id);
+                const lid = c?.listId || c?.list_id;
+                if (lid) {
+                  const lm = localLists.find((l: any) => l?.id === lid || (l?.name && normalizeEntityName(l.name) === normalizeEntityName(lid)));
+                  if (lm?.fundId || lm?.fund_id) targetFundId = lm.fundId || lm.fund_id;
+                }
+              }
+              if (!targetFundId && row.customer_name) {
+                const normName = normalizeEntityName(row.customer_name);
+                const c = localContracts.find((x: any) => x?.customerName && normalizeEntityName(x.customerName) === normName);
+                const lid = c?.listId || c?.list_id;
+                if (lid) {
+                  const lm = localLists.find((l: any) => l?.id === lid || (l?.name && normalizeEntityName(l.name) === normalizeEntityName(lid)));
+                  if (lm?.fundId || lm?.fund_id) targetFundId = lm.fundId || lm.fund_id;
+                }
+              }
+              if (!targetFundId && localFunds.length > 0) {
+                targetFundId = localFunds[0].id;
+              }
+              if (!targetFundId) {
+                targetFundId = await resolveFundIdForPayment(row.fund_id, row.contract_id, row.customer_name);
+              }
+              if (targetFundId) {
+                row.fund_id = targetFundId;
+                (row as any)._resolvedFundId = targetFundId;
+                fileDb.upsert("payments", { id: row.id, fundId: targetFundId });
+                fileDb.upsert("fund_transactions", {
+                  id: `ft_pay_${row.id}`,
+                  fundId: targetFundId,
+                  type: 'installment',
+                  amount: row.amount,
+                  note: `تسديد قسط زبون: ${row.customer_name || ''}`,
+                  repName: row.rep_name || '',
+                  createdAt: row.payment_date ? new Date(row.payment_date).toISOString() : (row.created_at || new Date().toISOString()),
+                });
               }
             }
           }
 
-          for (const act of paymentActions) {
-            if (act?.id) processedIds.push(act.id);
+          // Bulk upsert all payment fund transactions & affected fund balances in 1 SQL round-trip
+          const ftBulkRows = dedupedPaymentRows
+            .filter((r: any) => r.amount > 0 && (r._resolvedFundId || r.fund_id))
+            .map((r: any) => ({
+              id: `ft_pay_${r.id}`,
+              fund_id: String(r._resolvedFundId || r.fund_id),
+              type: 'installment',
+              amount: r.amount,
+              note: `تسديد قسط زبون: ${r.customer_name || ''}`,
+              rep_name: r.rep_name || '',
+              created_at: r.payment_date ? new Date(r.payment_date).toISOString() : (r.created_at || new Date().toISOString()),
+            }));
+
+          const postPaymentTasks: Promise<any>[] = [];
+          if (ftBulkRows.length > 0) {
+            const touchedFundIds = Array.from(new Set(ftBulkRows.map((x) => x.fund_id).filter(Boolean)));
+            if (isPgConfigured()) {
+              postPaymentTasks.push(
+                executePg(`
+                  INSERT INTO fund_transactions (id, fund_id, type, amount, note, rep_name, created_at)
+                  SELECT x.id, x.fund_id, x.type, x.amount, x.note, x.rep_name, x.created_at
+                  FROM jsonb_to_recordset($1::jsonb) AS x(
+                    id text, fund_id text, type text, amount double precision, note text, rep_name text, created_at text
+                  )
+                  ON CONFLICT (id) DO UPDATE SET
+                    amount = EXCLUDED.amount,
+                    fund_id = EXCLUDED.fund_id,
+                    note = EXCLUDED.note,
+                    rep_name = EXCLUDED.rep_name,
+                    created_at = EXCLUDED.created_at
+                `, [JSON.stringify(ftBulkRows)])
+                  .then(() =>
+                    executePg(`
+                      UPDATE cash_funds cf
+                      SET balance = GREATEST(0, COALESCE((
+                        SELECT SUM(
+                          CASE
+                            WHEN ft.type IN ('deposit', 'installment', 'transfer_in', 'employee_repay', 'manual_adjustment', 'initial') AND ft.fund_id = cf.id THEN ft.amount
+                            WHEN ft.type = 'transfer' AND ft.target_fund_id = cf.id THEN ft.amount
+                            WHEN ft.type IN ('withdraw', 'transfer_out', 'transfer', 'expense', 'employee_loan') AND ft.fund_id = cf.id THEN -ft.amount
+                            ELSE 0
+                          END
+                        )
+                        FROM fund_transactions ft
+                        WHERE (ft.fund_id = cf.id OR ft.target_fund_id = cf.id)
+                          AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = ft.id)
+                      ), 0))
+                      WHERE cf.id = ANY($1)
+                    `, [touchedFundIds])
+                  )
+                  .catch(() => {})
+              );
+            }
           }
+
+          if (pgBulkPayOk) {
+            for (const row of dedupedPaymentRows) {
+              if (row.contract_id && row.latitude != null && row.longitude != null && row.latitude !== 0 && row.longitude !== 0) {
+                postPaymentTasks.push((async () => {
+                  const nowIso = new Date().toISOString();
+                  const paymentTs = String(row.created_at || '');
+                  const clearState = await getServerClearedLocationState(row.contract_id, row.customer_name);
+                  const clearedAt = clearState.clearedAt || '';
+                  if (!clearState.cleared || (paymentTs && clearedAt && paymentTs > clearedAt)) {
+                    await unclearContractLocation(row.contract_id, row.customer_name || clearState.customerName);
+                    await Promise.all([
+                      executePg(`
+                        UPDATE sales
+                        SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                        WHERE id = $4 AND (latitude IS NULL OR latitude = 0)
+                      `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {}),
+                      executePg(`
+                        UPDATE customers
+                        SET latitude = $1, longitude = $2, location_updated_at = $3, location_cleared_at = NULL
+                        WHERE (id IN (SELECT customer_id FROM sales WHERE id = $4) OR ${pgNormColSql('name')} IN (SELECT ${pgNormColSql('customer_name')} FROM sales WHERE id = $4))
+                          AND (latitude IS NULL OR latitude = 0)
+                      `, [row.latitude, row.longitude, nowIso, row.contract_id]).catch(() => {}),
+                    ]);
+                  }
+                })());
+              }
+            }
+          }
+
+          if (postPaymentTasks.length > 0) {
+            await Promise.all(postPaymentTasks);
+          }
+        }
+
+        // Mark ALL payment actions (including skipped malformed/0-amount ones) as processed so invalid ghosts clear cleanly
+        for (const act of paymentActions) {
+          if (act?.id) processedIds.push(act.id);
         }
       }
 
       // 3. High-Performance Bulk Upsert for Contracts (jsonb_to_recordset in 1 single SQL statement)
       if (contractActions.length > 0) {
-        const candIds = contractActions.map((a) => String(a?.payload?.id || '')).filter(Boolean);
         const clearedLookup = new Map<string, string>();
         const clearedNameLookup = new Map<string, string>();
         const explicitClearBatch: Array<{ id: string; iso: string; name: string }> = [];
@@ -8161,7 +8306,8 @@ async function startServer() {
 
         const contractRows = contractActions.map((act) => {
           const c = act.payload || {};
-          if (c.id && (String(c.id).startsWith('pay_') || String(c.id).startsWith('ft_') || String(c.id).startsWith('emptx_') || String(c.id).startsWith('conflict_'))) {
+          const cId = String(c.id || '').trim();
+          if (!cId || cId.startsWith('pay_') || cId.startsWith('ft_') || cId.startsWith('emptx_') || cId.startsWith('conflict_')) {
             return null;
           }
           const totalPrice = Number(c.totalPrice ?? c.total_price) || 0;
@@ -8187,12 +8333,10 @@ async function startServer() {
             locAddr = null;
             locUpAt = null;
             locClearedAt = clearIso;
-            if (c.id) {
-              explicitClearBatch.push({ id: String(c.id), iso: clearIso, name: c.customerName ?? c.customer_name ?? '' });
-            }
+            explicitClearBatch.push({ id: cId, iso: clearIso, name: c.customerName ?? c.customer_name ?? '' });
           } else {
             const serverClearedAt =
-              clearedLookup.get(String(c.id)) ||
+              clearedLookup.get(cId) ||
               (c.customerId ? clearedLookup.get(String(c.customerId)) : undefined) ||
               (normCName ? clearedNameLookup.get(normCName) : undefined);
             if (serverClearedAt) {
@@ -8207,11 +8351,12 @@ async function startServer() {
             }
           }
 
-          if (c.id) affectedContractIds.add(c.id);
+          affectedContractIds.add(cId);
 
           try {
             fileDb.upsert("contracts", {
               ...c,
+              id: cId,
               totalPrice,
               advancePayment: adv,
               totalPaid: paid,
@@ -8223,7 +8368,7 @@ async function startServer() {
           } catch (e) {}
 
           return {
-            id: String(c.id),
+            id: cId,
             customer_name: String(c.customerName ?? c.customer_name ?? ''),
             customer_phone: String(c.customerPhone ?? c.customer_phone ?? ''),
             customer_address: c.customerAddress ?? c.customer_address ?? null,
@@ -8253,7 +8398,7 @@ async function startServer() {
             updated_at: c.updatedAt ?? c.updated_at ?? new Date().toISOString(),
             is_edited: Boolean(c.isEdited ?? c.is_edited),
           };
-        }).filter((r) => r && r.id);
+        }).filter((r): r is NonNullable<typeof r> => Boolean(r && r.id));
 
         const uniqueContractRowsMap = new Map<string, any>();
         for (const row of contractRows) {
@@ -8265,148 +8410,218 @@ async function startServer() {
 
         if (dedupedContractRows.length > 0) {
           let pgBulkContractsOk = false;
-          try {
-            await executePg(`
-              INSERT INTO sales (
-                id, customer_name, customer_phone, customer_address,
-                item_id, item_name, item_quantity, purchase_price,
-                list_id, list_name, total_price, advance_payment,
-                remaining_balance, daily_installment, start_date, notes,
-                status, last_payment_date, total_paid, rep_name,
-                latitude, longitude, location_address, location_updated_at, location_cleared_at,
-                created_at, completed_at, updated_at, is_edited
-              )
-              SELECT
-                x.id, x.customer_name, x.customer_phone, x.customer_address,
-                x.item_id, x.item_name, COALESCE(x.item_quantity, 1), COALESCE(x.purchase_price, 0),
-                x.list_id, x.list_name, COALESCE(x.total_price, 0), COALESCE(x.advance_payment, 0),
-                COALESCE(x.remaining_balance, 0), COALESCE(x.daily_installment, 0), COALESCE(x.start_date, NOW()::date::text), x.notes,
-                COALESCE(x.status, 'active'), x.last_payment_date, COALESCE(x.total_paid, 0), x.rep_name,
-                x.latitude, x.longitude, x.location_address, x.location_updated_at, x.location_cleared_at,
-                COALESCE(x.created_at, NOW()::text), x.completed_at, x.updated_at, COALESCE(x.is_edited, false)
-              FROM jsonb_to_recordset($1::jsonb) AS x(
-                id text, customer_name text, customer_phone text, customer_address text,
-                item_id text, item_name text, item_quantity integer, purchase_price double precision,
-                list_id text, list_name text, total_price double precision, advance_payment double precision,
-                remaining_balance double precision, daily_installment double precision, start_date text, notes text,
-                status text, last_payment_date text, total_paid double precision, rep_name text,
-                latitude double precision, longitude double precision, location_address text, location_updated_at text, location_cleared_at text,
-                created_at text, completed_at text, updated_at text, is_edited boolean
-              )
-              ON CONFLICT (id) DO UPDATE SET
-                customer_name = COALESCE(NULLIF(EXCLUDED.customer_name, ''), sales.customer_name),
-                customer_phone = COALESCE(NULLIF(EXCLUDED.customer_phone, ''), sales.customer_phone),
-                customer_address = COALESCE(EXCLUDED.customer_address, sales.customer_address),
-                item_id = COALESCE(EXCLUDED.item_id, sales.item_id),
-                item_name = COALESCE(NULLIF(EXCLUDED.item_name, ''), sales.item_name),
-                item_quantity = CASE WHEN EXCLUDED.item_quantity > 0 THEN EXCLUDED.item_quantity ELSE sales.item_quantity END,
-                purchase_price = CASE WHEN EXCLUDED.purchase_price > 0 THEN EXCLUDED.purchase_price ELSE sales.purchase_price END,
-                list_id = COALESCE(EXCLUDED.list_id, sales.list_id),
-                list_name = COALESCE(EXCLUDED.list_name, sales.list_name),
-                total_price = CASE WHEN EXCLUDED.total_price > 0 THEN EXCLUDED.total_price ELSE sales.total_price END,
-                advance_payment = CASE WHEN EXCLUDED.advance_payment > 0 THEN EXCLUDED.advance_payment ELSE sales.advance_payment END,
-                remaining_balance = EXCLUDED.remaining_balance,
-                daily_installment = CASE WHEN EXCLUDED.daily_installment > 0 THEN EXCLUDED.daily_installment ELSE sales.daily_installment END,
-                start_date = COALESCE(NULLIF(EXCLUDED.start_date, ''), sales.start_date),
-                notes = COALESCE(EXCLUDED.notes, sales.notes),
-                status = EXCLUDED.status,
-                last_payment_date = COALESCE(EXCLUDED.last_payment_date, sales.last_payment_date),
-                total_paid = EXCLUDED.total_paid,
-                rep_name = COALESCE(NULLIF(EXCLUDED.rep_name, ''), sales.rep_name),
-                latitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude) END,
-                longitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
-                location_address = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
-                location_updated_at = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END,
-                location_cleared_at = COALESCE(sales.location_cleared_at, EXCLUDED.location_cleared_at),
-                completed_at = COALESCE(EXCLUDED.completed_at, sales.completed_at),
-                updated_at = EXCLUDED.updated_at,
-                is_edited = EXCLUDED.is_edited
-            `, [JSON.stringify(dedupedContractRows)]);
-            pgBulkContractsOk = true;
-          } catch (bulkContractErr) {
-            console.warn('[Batch Sync] Bulk contract upsert PG warning, saved in fileDb:', (bulkContractErr as any)?.message || bulkContractErr);
+          if (isPgConfigured()) {
+            try {
+              await executePg(`
+                INSERT INTO sales (
+                  id, customer_name, customer_phone, customer_address,
+                  item_id, item_name, item_quantity, purchase_price,
+                  list_id, list_name, total_price, advance_payment,
+                  remaining_balance, daily_installment, start_date, notes,
+                  status, last_payment_date, total_paid, rep_name,
+                  latitude, longitude, location_address, location_updated_at, location_cleared_at,
+                  created_at, completed_at, updated_at, is_edited
+                )
+                SELECT
+                  x.id, x.customer_name, x.customer_phone, x.customer_address,
+                  x.item_id, x.item_name, COALESCE(x.item_quantity, 1), COALESCE(x.purchase_price, 0),
+                  x.list_id, x.list_name, COALESCE(x.total_price, 0), COALESCE(x.advance_payment, 0),
+                  COALESCE(x.remaining_balance, 0), COALESCE(x.daily_installment, 0), COALESCE(x.start_date, NOW()::date::text), x.notes,
+                  COALESCE(x.status, 'active'), x.last_payment_date, COALESCE(x.total_paid, 0), x.rep_name,
+                  x.latitude, x.longitude, x.location_address, x.location_updated_at, x.location_cleared_at,
+                  COALESCE(x.created_at, NOW()::text), x.completed_at, x.updated_at, COALESCE(x.is_edited, false)
+                FROM jsonb_to_recordset($1::jsonb) AS x(
+                  id text, customer_name text, customer_phone text, customer_address text,
+                  item_id text, item_name text, item_quantity integer, purchase_price double precision,
+                  list_id text, list_name text, total_price double precision, advance_payment double precision,
+                  remaining_balance double precision, daily_installment double precision, start_date text, notes text,
+                  status text, last_payment_date text, total_paid double precision, rep_name text,
+                  latitude double precision, longitude double precision, location_address text, location_updated_at text, location_cleared_at text,
+                  created_at text, completed_at text, updated_at text, is_edited boolean
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                  customer_name = COALESCE(NULLIF(EXCLUDED.customer_name, ''), sales.customer_name),
+                  customer_phone = COALESCE(NULLIF(EXCLUDED.customer_phone, ''), sales.customer_phone),
+                  customer_address = COALESCE(EXCLUDED.customer_address, sales.customer_address),
+                  item_id = COALESCE(EXCLUDED.item_id, sales.item_id),
+                  item_name = COALESCE(NULLIF(EXCLUDED.item_name, ''), sales.item_name),
+                  item_quantity = CASE WHEN EXCLUDED.item_quantity > 0 THEN EXCLUDED.item_quantity ELSE sales.item_quantity END,
+                  purchase_price = CASE WHEN EXCLUDED.purchase_price > 0 THEN EXCLUDED.purchase_price ELSE sales.purchase_price END,
+                  list_id = COALESCE(EXCLUDED.list_id, sales.list_id),
+                  list_name = COALESCE(EXCLUDED.list_name, sales.list_name),
+                  total_price = CASE WHEN EXCLUDED.total_price > 0 THEN EXCLUDED.total_price ELSE sales.total_price END,
+                  advance_payment = CASE WHEN EXCLUDED.advance_payment > 0 THEN EXCLUDED.advance_payment ELSE sales.advance_payment END,
+                  remaining_balance = EXCLUDED.remaining_balance,
+                  daily_installment = CASE WHEN EXCLUDED.daily_installment > 0 THEN EXCLUDED.daily_installment ELSE sales.daily_installment END,
+                  start_date = COALESCE(NULLIF(EXCLUDED.start_date, ''), sales.start_date),
+                  notes = COALESCE(EXCLUDED.notes, sales.notes),
+                  status = EXCLUDED.status,
+                  last_payment_date = COALESCE(EXCLUDED.last_payment_date, sales.last_payment_date),
+                  total_paid = EXCLUDED.total_paid,
+                  rep_name = COALESCE(NULLIF(EXCLUDED.rep_name, ''), sales.rep_name),
+                  latitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.latitude, 0), sales.latitude) END,
+                  longitude = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.longitude, 0), sales.longitude) END,
+                  location_address = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_address, ''), sales.location_address) END,
+                  location_updated_at = CASE WHEN sales.location_cleared_at IS NOT NULL AND COALESCE(EXCLUDED.location_updated_at, '') <= sales.location_cleared_at THEN NULL ELSE COALESCE(NULLIF(EXCLUDED.location_updated_at, ''), sales.location_updated_at) END,
+                  location_cleared_at = COALESCE(sales.location_cleared_at, EXCLUDED.location_cleared_at),
+                  completed_at = COALESCE(EXCLUDED.completed_at, sales.completed_at),
+                  updated_at = EXCLUDED.updated_at,
+                  is_edited = EXCLUDED.is_edited
+              `, [JSON.stringify(dedupedContractRows)]);
+              pgBulkContractsOk = true;
+            } catch (bulkContractErr) {
+              console.warn('[Batch Sync] Bulk contract upsert PG warning, saved in fileDb:', (bulkContractErr as any)?.message || bulkContractErr);
+            }
           }
 
+          const contractPostTasks: Promise<any>[] = [];
           if (pgBulkContractsOk) {
             for (const row of dedupedContractRows) {
               if (row.latitude != null && row.longitude != null && row.latitude !== 0 && row.longitude !== 0) {
-                await executePg(`
-                  UPDATE customers
-                  SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
-                      longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
-                      location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
-                      location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
-                  WHERE id = $5 OR ${pgNormColSql('name')} = ${pgNormColSql('$6')}
-                `, [row.latitude, row.longitude, row.location_address || '', row.location_updated_at || new Date().toISOString(), row.id, row.customer_name]).catch(() => {});
+                contractPostTasks.push(
+                  executePg(`
+                    UPDATE customers
+                    SET latitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(latitude, 0), $1) END,
+                        longitude = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(longitude, 0), $2) END,
+                        location_address = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(NULLIF(location_address, ''), $3) END,
+                        location_updated_at = CASE WHEN location_cleared_at IS NOT NULL AND COALESCE($4, '') <= location_cleared_at THEN NULL ELSE COALESCE(location_updated_at, $4) END
+                    WHERE id = $5 OR ${pgNormColSql('name')} = ${pgNormColSql('$6')}
+                  `, [row.latitude, row.longitude, row.location_address || '', row.location_updated_at || new Date().toISOString(), row.id, row.customer_name]).catch(() => {})
+                );
               }
             }
           }
-
           for (const ec of explicitClearBatch) {
-            await clearContractAndCustomerLocations(ec.id, ec.iso, ec.name).catch(() => {});
+            contractPostTasks.push(clearContractAndCustomerLocations(ec.id, ec.iso, ec.name).catch(() => {}));
           }
+          if (contractPostTasks.length > 0) {
+            await Promise.all(contractPostTasks);
+          }
+        }
 
-          for (const act of contractActions) {
-            if (act?.id) processedIds.push(act.id);
-          }
+        // Mark ALL contract actions (including skipped invalid-prefix ones) as processed
+        for (const act of contractActions) {
+          if (act?.id) processedIds.push(act.id);
         }
       }
 
-      // 4. Process any remaining non-payment/non-contract actions (inventory, reps, deletes, funds, etc.)
+      // 4. Process any remaining non-payment/non-contract actions in fast parallel chunks of 10
       if (otherActions.length > 0) {
-        for (const act of otherActions) {
-          try {
-            if (act?.type === 'DELETE_PAYMENT') {
-              const pContractId = act.payload?.contractId || act.payload?.contract_id;
-              if (pContractId) affectedContractIds.add(pContractId);
+        const OTHER_CONCURRENCY = 10;
+        for (let i = 0; i < otherActions.length; i += OTHER_CONCURRENCY) {
+          const chunk = otherActions.slice(i, i + OTHER_CONCURRENCY);
+          await Promise.all(chunk.map(async (act) => {
+            try {
+              if (act?.type === 'DELETE_PAYMENT') {
+                const pContractId = act.payload?.contractId || act.payload?.contract_id;
+                if (pContractId) affectedContractIds.add(pContractId);
+                needsFundRecalc = true;
+              } else if (
+                act?.type === 'DELETE_CONTRACT' ||
+                act?.type === 'DELETE_CUSTOMER' ||
+                act?.type === 'CREATE_FUND_TX' ||
+                act?.type === 'CREATE_FUND_TRANSACTION' ||
+                act?.type === 'UPDATE_FUND_TX' ||
+                act?.type === 'UPDATE_FUND_TRANSACTION' ||
+                act?.type === 'DELETE_FUND_TX' ||
+                act?.type === 'DELETE_FUND_TRANSACTION' ||
+                act?.type === 'CREATE_EMPLOYEE_TX' ||
+                act?.type === 'CREATE_EMPLOYEE_TRANSACTION' ||
+                act?.type === 'UPDATE_EMPLOYEE_TRANSACTION' ||
+                act?.type === 'DELETE_EMPLOYEE_TX' ||
+                act?.type === 'DELETE_EMPLOYEE_TRANSACTION'
+              ) {
+                needsFundRecalc = true;
+              }
+              const ok = await processSingleSyncAction(act, true, true);
+              if (ok && act?.id) {
+                processedIds.push(act.id);
+              }
+            } catch (actErr) {
+              console.warn('[Batch Sync] Other action error:', act?.id, actErr);
             }
-            const ok = await processSingleSyncAction(act, true);
-            if (ok && act?.id) {
-              processedIds.push(act.id);
-            }
-          } catch (actErr) {
-            console.warn('[Batch Sync] Other action error:', act?.id, actErr);
-          }
+          }));
         }
       }
 
-      // 5. Batch recalculate contract balances once for all touched contracts
+      // 5. Fast contract balance recalculation in 1 parallel PG pass + O(1) local fileDb update
       if (affectedContractIds.size > 0) {
         const cIds = Array.from(affectedContractIds).filter(Boolean);
+        const cIdSet = new Set(cIds);
         try {
-          await executePg(`
-            UPDATE sales c
-            SET
-              total_paid = LEAST(GREATEST(0, c.total_price - c.advance_payment), COALESCE(p.sum_paid, 0)),
-              remaining_balance = GREATEST(0, c.total_price - c.advance_payment - COALESCE(p.sum_paid, 0)),
-              status = CASE
-                WHEN (c.total_price - c.advance_payment - COALESCE(p.sum_paid, 0)) <= 0 THEN 'completed'
-                ELSE 'active'
-              END
-            FROM (
-              SELECT contract_id, SUM(COALESCE(amount_paid, amount, 0)) as sum_paid
-              FROM payments
-              WHERE contract_id = ANY($1)
-              GROUP BY contract_id
-            ) p
-            WHERE c.id = p.contract_id AND c.id = ANY($1)
-          `, [cIds]).catch(() => {});
-
-          await executePg(`
-            UPDATE sales c
-            SET
-              total_paid = 0,
-              remaining_balance = GREATEST(0, c.total_price - c.advance_payment),
-              status = CASE WHEN (c.total_price - c.advance_payment) <= 0 THEN 'completed' ELSE 'active' END
-            WHERE c.id = ANY($1) AND NOT EXISTS (
-              SELECT 1 FROM payments p 
-              WHERE p.contract_id = c.id OR ((p.contract_id IS NULL OR p.contract_id = '') AND p.customer_name = c.customer_name)
-            )
-          `, [cIds]).catch(() => {});
+          if (isPgConfigured()) {
+            await Promise.all([
+              executePg(`
+                UPDATE sales c
+                SET
+                  total_paid = LEAST(GREATEST(0, c.total_price - c.advance_payment), COALESCE(p.sum_paid, 0)),
+                  remaining_balance = GREATEST(0, c.total_price - c.advance_payment - COALESCE(p.sum_paid, 0)),
+                  last_payment_date = COALESCE(p.max_date, c.last_payment_date),
+                  status = CASE
+                    WHEN (c.total_price - c.advance_payment - COALESCE(p.sum_paid, 0)) <= 0 THEN 'completed'
+                    ELSE 'active'
+                  END
+                FROM (
+                  SELECT contract_id, SUM(COALESCE(amount_paid, amount, 0)) as sum_paid, MAX(payment_date) as max_date
+                  FROM payments
+                  WHERE contract_id = ANY($1)
+                    AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = payments.id)
+                  GROUP BY contract_id
+                ) p
+                WHERE c.id = p.contract_id AND c.id = ANY($1)
+              `, [cIds]).catch(() => {}),
+              executePg(`
+                UPDATE sales c
+                SET
+                  total_paid = 0,
+                  remaining_balance = GREATEST(0, c.total_price - c.advance_payment),
+                  status = CASE WHEN (c.total_price - c.advance_payment) <= 0 THEN 'completed' ELSE 'active' END
+                WHERE c.id = ANY($1) AND NOT EXISTS (
+                  SELECT 1 FROM payments p
+                  WHERE (p.contract_id = c.id OR ((p.contract_id IS NULL OR p.contract_id = '') AND p.customer_name = c.customer_name))
+                    AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id)
+                )
+              `, [cIds]).catch(() => {}),
+            ]);
+          }
         } catch (balErr) {
           console.warn('Batch balance recalc notice:', balErr);
         }
-        await syncContractBalancesInPgAndFileDb(cIds).catch(() => {});
+
+        // Fast local fileDb update ONLY for affected contracts (avoids extra PG round-trips)
+        try {
+          const allContracts = fileDb.get<any>("contracts") || [];
+          const allPayments = fileDb.get<any>("payments") || [];
+          const payByContract = new Map<string, any[]>();
+          for (const p of allPayments) {
+            if (p && p.contractId && cIdSet.has(p.contractId)) {
+              const list = payByContract.get(p.contractId);
+              if (list) list.push(p);
+              else payByContract.set(p.contractId, [p]);
+            }
+          }
+          for (const c of allContracts) {
+            if (!c || !cIdSet.has(c.id)) continue;
+            const cPays = payByContract.get(c.id) || [];
+            const sum = cPays.reduce((s, x) => s + (Number(x.amountPaid ?? x.amount ?? 0) || 0), 0);
+            const net = Math.max(0, (Number(c.totalPrice) || 0) - (Number(c.advancePayment) || 0));
+            const totalPaid = net > 0 ? Math.min(net, sum) : sum;
+            const remainingBalance = Math.max(0, net - sum);
+            fileDb.upsert("contracts", {
+              id: c.id,
+              totalPaid,
+              rawTotalPaid: sum,
+              excessAmount: Math.max(0, sum - net),
+              remainingBalance,
+              status: (remainingBalance === 0 && (net === 0 || sum > 0)) ? 'completed' : 'active',
+            });
+          }
+        } catch (e) {}
+      }
+
+      // Run full cross-table fund recalculation asynchronously only for complex TX/delete actions so response returns immediately
+      if (needsFundRecalc) {
+        void recalculateAllFundBalancesInPg().catch(() => {});
       }
 
       bumpSyncVersion();
@@ -8833,6 +9048,7 @@ async function startServer() {
       const affectedContractIds = new Set<string>();
       const processedIds: string[] = [];
       const rejectedReplayIds: string[] = [];
+      let needsFundRecalc = false;
 
       // Partition actions into Payments, Contracts, Deletes, and Others for maximum batch speed
       const paymentActions: any[] = [];
@@ -8840,38 +9056,42 @@ async function startServer() {
       const otherActions: any[] = [];
 
       for (const act of actions) {
-        const targetId = act?.payload?.id || (typeof act?.payload === 'string' ? act?.payload : null);
-        const isDelete = act?.type?.startsWith('DELETE_');
+        if (!act) continue;
+        const normalizedType =
+          act.type === 'RECORD_PAYMENT' || act.type === 'ADD_PAYMENT' ? 'CREATE_PAYMENT' : act.type;
+        const normalizedAct = normalizedType === act.type ? act : { ...act, type: normalizedType };
+        const targetId = normalizedAct?.payload?.id || (typeof normalizedAct?.payload === 'string' ? normalizedAct?.payload : null);
+        const isDelete = normalizedType?.startsWith('DELETE_') || normalizedType?.endsWith('_DELETE');
 
-        if (!isDelete && act?.type !== 'CREATE_PAYMENT' && targetId && deletedSet.has(targetId)) {
-          if (act?.id) processedIds.push(act.id);
+        if (!isDelete && normalizedType !== 'CREATE_PAYMENT' && targetId && deletedSet.has(targetId)) {
+          if (normalizedAct?.id) processedIds.push(normalizedAct.id);
           continue;
         }
 
-        if (act?.type === 'CREATE_PAYMENT' || act?.type === 'UPDATE_PAYMENT') {
+        if (normalizedType === 'CREATE_PAYMENT' || normalizedType === 'UPDATE_PAYMENT') {
           if (targetId && deletedSet.has(targetId)) {
             deletedSet.delete(targetId);
           }
-          if (act.type === 'CREATE_PAYMENT') {
-            const p = act.payload || {};
-            const pNonce = String(p.nonce || act.nonce || p.id || '');
+          if (normalizedType === 'CREATE_PAYMENT') {
+            const p = normalizedAct.payload || {};
+            const pNonce = String(p.nonce || normalizedAct.nonce || p.id || '');
             const pAmt = Number(p.amount ?? p.amountPaid ?? p.amount_paid) || 0;
             const nRes = await consumeReplayNonce(`pay:${pNonce}`, '/api/sync/beacon', 'CREATE_PAYMENT', req.authUser?.repId, pAmt, p.contractId || '');
             if (!nRes.ok) {
               const existingSameAmt = nRes.existing && Math.abs(Number(nRes.existing.amount || 0) - pAmt) < 0.01;
               if (existingSameAmt) {
-                if (act?.id) processedIds.push(act.id);
+                if (normalizedAct?.id) processedIds.push(normalizedAct.id);
               } else {
-                if (act?.id) rejectedReplayIds.push(act.id);
+                if (normalizedAct?.id) rejectedReplayIds.push(normalizedAct.id);
               }
               continue;
             }
           }
-          paymentActions.push(act);
-        } else if (act?.type === 'CREATE_CONTRACT') {
-          contractActions.push(act);
+          paymentActions.push(normalizedAct);
+        } else if (normalizedType === 'CREATE_CONTRACT') {
+          contractActions.push(normalizedAct);
         } else {
-          otherActions.push(act);
+          otherActions.push(normalizedAct);
         }
       }
 
@@ -8879,7 +9099,11 @@ async function startServer() {
       if (paymentActions.length > 0) {
         const paymentRows = paymentActions.map((act) => {
           const p = act.payload || {};
+          const pId = String(p.id || '').trim();
           const amt = Number(p.amount ?? p.amountPaid ?? p.amount_paid) || 0;
+          if (!pId || amt <= 0 || pId.startsWith('contract_') || pId.startsWith('emp_') || pId.startsWith('item_') || pId.startsWith('fund_')) {
+            return null;
+          }
           const cId = p.contractId ?? p.contract_id ?? '';
           const cName = p.customerName ?? p.customer_name ?? '';
           const pDate = p.paymentDate ?? p.payment_date ?? new Date().toISOString().split('T')[0];
@@ -8893,7 +9117,7 @@ async function startServer() {
 
           try {
             fileDb.upsert("payments", {
-              id: p.id,
+              id: pId,
               contractId: cId,
               customerName: cName,
               amount: amt,
@@ -8908,7 +9132,7 @@ async function startServer() {
           } catch (e) {}
 
           return {
-            id: String(p.id),
+            id: pId,
             contract_id: String(cId),
             customer_name: String(cName),
             amount: amt,
@@ -8920,7 +9144,7 @@ async function startServer() {
             created_at: String(cAt),
             is_edited: isEd,
           };
-        }).filter((r) => r.id);
+        }).filter((r): r is NonNullable<typeof r> => Boolean(r && r.id));
 
         const uniquePaymentRowsMap = new Map<string, any>();
         for (const row of paymentRows) {
@@ -8931,72 +9155,136 @@ async function startServer() {
         const dedupedPaymentRows = Array.from(uniquePaymentRowsMap.values());
 
         if (dedupedPaymentRows.length > 0) {
-          try {
-            await executePg(`
-              INSERT INTO payments (
-                id, contract_id, customer_name, amount, amount_paid,
-                payment_date, note, rep_name, fund_id, created_at, is_edited
-              )
-              SELECT
-                x.id,
-                x.contract_id,
-                x.customer_name,
-                COALESCE(x.amount, 0),
-                COALESCE(x.amount_paid, x.amount, 0),
-                x.payment_date,
-                x.note,
-                x.rep_name,
-                x.fund_id,
-                COALESCE(x.created_at, NOW()::text),
-                COALESCE(x.is_edited, false)
-              FROM jsonb_to_recordset($1::jsonb) AS x(
-                id text,
-                contract_id text,
-                customer_name text,
-                amount double precision,
-                amount_paid double precision,
-                payment_date text,
-                note text,
-                rep_name text,
-                fund_id text,
-                created_at text,
-                is_edited boolean
-              )
-              ON CONFLICT (id) DO UPDATE SET
-                contract_id = EXCLUDED.contract_id,
-                customer_name = EXCLUDED.customer_name,
-                amount = EXCLUDED.amount,
-                amount_paid = EXCLUDED.amount_paid,
-                payment_date = EXCLUDED.payment_date,
-                note = EXCLUDED.note,
-                rep_name = EXCLUDED.rep_name,
-                fund_id = EXCLUDED.fund_id,
-                is_edited = EXCLUDED.is_edited
-            `, [JSON.stringify(dedupedPaymentRows)]);
-          } catch (bulkPayErr) {
-            console.warn('[Beacon Sync] Bulk payment upsert PG warning, saved in fileDb:', (bulkPayErr as any)?.message || bulkPayErr);
+          if (isPgConfigured()) {
+            try {
+              await executePg(`
+                INSERT INTO payments (
+                  id, contract_id, customer_name, amount, amount_paid,
+                  payment_date, note, rep_name, fund_id, created_at, is_edited
+                )
+                SELECT
+                  x.id,
+                  x.contract_id,
+                  x.customer_name,
+                  COALESCE(x.amount, 0),
+                  COALESCE(x.amount_paid, x.amount, 0),
+                  x.payment_date,
+                  x.note,
+                  x.rep_name,
+                  x.fund_id,
+                  COALESCE(x.created_at, NOW()::text),
+                  COALESCE(x.is_edited, false)
+                FROM jsonb_to_recordset($1::jsonb) AS x(
+                  id text,
+                  contract_id text,
+                  customer_name text,
+                  amount double precision,
+                  amount_paid double precision,
+                  payment_date text,
+                  note text,
+                  rep_name text,
+                  fund_id text,
+                  created_at text,
+                  is_edited boolean
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                  contract_id = EXCLUDED.contract_id,
+                  customer_name = EXCLUDED.customer_name,
+                  amount = EXCLUDED.amount,
+                  amount_paid = EXCLUDED.amount_paid,
+                  payment_date = EXCLUDED.payment_date,
+                  note = EXCLUDED.note,
+                  rep_name = EXCLUDED.rep_name,
+                  fund_id = EXCLUDED.fund_id,
+                  is_edited = EXCLUDED.is_edited
+              `, [JSON.stringify(dedupedPaymentRows)]);
+            } catch (bulkPayErr) {
+              console.warn('[Beacon Sync] Bulk payment upsert PG warning, saved in fileDb:', (bulkPayErr as any)?.message || bulkPayErr);
+            }
           }
 
           for (const row of dedupedPaymentRows) {
             if (row.amount > 0) {
-              const targetFundId = await resolveFundIdForPayment(row.fund_id, row.contract_id);
+              const localLists = fileDb.get<any>("customer_lists") || [];
+              const localFunds = fileDb.get<any>("cash_funds") || fileDb.get<any>("funds") || [];
+              const localContracts = fileDb.get<any>("contracts") || [];
+              let targetFundId: string | null = null;
+              if (row.fund_id && localFunds.some((f: any) => f?.id === row.fund_id)) {
+                targetFundId = row.fund_id;
+              } else if (row.contract_id) {
+                const c = localContracts.find((x: any) => x?.id === row.contract_id);
+                const lid = c?.listId || c?.list_id;
+                const lm = lid ? localLists.find((l: any) => l?.id === lid) : null;
+                if (lm?.fundId || lm?.fund_id) targetFundId = lm.fundId || lm.fund_id;
+              }
+              if (!targetFundId && localFunds.length > 0) {
+                targetFundId = localFunds[0].id;
+              }
+              if (!targetFundId) {
+                targetFundId = await resolveFundIdForPayment(row.fund_id, row.contract_id, row.customer_name);
+              }
               if (targetFundId) {
-                await recordPaymentFundAdjustment(
-                  row.id,
-                  targetFundId,
-                  row.amount,
-                  row.customer_name || '',
-                  row.rep_name || '',
-                  row.payment_date || '',
-                  false
-                ).catch(() => {});
+                (row as any)._resolvedFundId = targetFundId;
+                fileDb.upsert("fund_transactions", {
+                  id: `ft_pay_${row.id}`,
+                  fundId: targetFundId,
+                  type: 'installment',
+                  amount: row.amount,
+                  note: `تسديد قسط زبون: ${row.customer_name || ''}`,
+                  repName: row.rep_name || '',
+                  createdAt: row.payment_date ? new Date(row.payment_date).toISOString() : (row.created_at || new Date().toISOString()),
+                });
               }
             }
           }
 
-          for (const act of paymentActions) {
-            if (act?.id) processedIds.push(act.id);
+          const beaconFtRows = dedupedPaymentRows
+            .filter((r: any) => r.amount > 0 && (r._resolvedFundId || r.fund_id))
+            .map((r: any) => ({
+              id: `ft_pay_${r.id}`,
+              fund_id: String(r._resolvedFundId || r.fund_id),
+              type: 'installment',
+              amount: r.amount,
+              note: `تسديد قسط زبون: ${r.customer_name || ''}`,
+              rep_name: r.rep_name || '',
+              created_at: r.payment_date ? new Date(r.payment_date).toISOString() : (r.created_at || new Date().toISOString()),
+            }));
+          if (beaconFtRows.length > 0 && isPgConfigured()) {
+            const touchedFunds = Array.from(new Set(beaconFtRows.map((x) => x.fund_id).filter(Boolean)));
+            await executePg(`
+              INSERT INTO fund_transactions (id, fund_id, type, amount, note, rep_name, created_at)
+              SELECT x.id, x.fund_id, x.type, x.amount, x.note, x.rep_name, x.created_at
+              FROM jsonb_to_recordset($1::jsonb) AS x(
+                id text, fund_id text, type text, amount double precision, note text, rep_name text, created_at text
+              )
+              ON CONFLICT (id) DO UPDATE SET
+                amount = EXCLUDED.amount, fund_id = EXCLUDED.fund_id, note = EXCLUDED.note, rep_name = EXCLUDED.rep_name, created_at = EXCLUDED.created_at
+            `, [JSON.stringify(beaconFtRows)])
+              .then(() =>
+                executePg(`
+                  UPDATE cash_funds cf
+                  SET balance = GREATEST(0, COALESCE((
+                    SELECT SUM(
+                      CASE
+                        WHEN ft.type IN ('deposit', 'installment', 'transfer_in', 'employee_repay', 'manual_adjustment', 'initial') AND ft.fund_id = cf.id THEN ft.amount
+                        WHEN ft.type = 'transfer' AND ft.target_fund_id = cf.id THEN ft.amount
+                        WHEN ft.type IN ('withdraw', 'transfer_out', 'transfer', 'expense', 'employee_loan') AND ft.fund_id = cf.id THEN -ft.amount
+                        ELSE 0
+                      END
+                    )
+                    FROM fund_transactions ft
+                    WHERE (ft.fund_id = cf.id OR ft.target_fund_id = cf.id)
+                      AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = ft.id)
+                  ), 0))
+                  WHERE cf.id = ANY($1)
+                `, [touchedFunds])
+              )
+              .catch(() => {});
           }
+        }
+
+        for (const act of paymentActions) {
+          if (act?.id) processedIds.push(act.id);
         }
       }
 
@@ -9004,7 +9292,8 @@ async function startServer() {
       if (contractActions.length > 0) {
         const contractRows = contractActions.map((act) => {
           const c = act.payload || {};
-          if (c.id && (String(c.id).startsWith('pay_') || String(c.id).startsWith('ft_') || String(c.id).startsWith('emptx_') || String(c.id).startsWith('conflict_'))) {
+          const cId = String(c.id || '').trim();
+          if (!cId || cId.startsWith('pay_') || cId.startsWith('ft_') || cId.startsWith('emptx_') || cId.startsWith('conflict_')) {
             return null;
           }
           const totalPrice = Number(c.totalPrice ?? c.total_price) || 0;
@@ -9014,11 +9303,12 @@ async function startServer() {
           const daily = Number(c.dailyInstallment ?? c.daily_installment) || 0;
           const stat = rem <= 0 ? 'completed' : (c.status || 'active');
 
-          if (c.id) affectedContractIds.add(c.id);
+          affectedContractIds.add(cId);
 
           try {
             fileDb.upsert("contracts", {
               ...c,
+              id: cId,
               totalPrice,
               advancePayment: adv,
               totalPaid: paid,
@@ -9029,7 +9319,7 @@ async function startServer() {
           } catch (e) {}
 
           return {
-            id: String(c.id),
+            id: cId,
             customer_name: String(c.customerName ?? c.customer_name ?? ''),
             customer_phone: String(c.customerPhone ?? c.customer_phone ?? ''),
             customer_address: c.customerAddress ?? c.customer_address ?? null,
@@ -9054,7 +9344,7 @@ async function startServer() {
             updated_at: c.updatedAt ?? c.updated_at ?? new Date().toISOString(),
             is_edited: Boolean(c.isEdited ?? c.is_edited),
           };
-        }).filter((r) => r.id);
+        }).filter((r): r is NonNullable<typeof r> => Boolean(r && r.id));
 
         const uniqueContractRowsMap = new Map<string, any>();
         for (const row of contractRows) {
@@ -9064,7 +9354,7 @@ async function startServer() {
         }
         const dedupedContractRows = Array.from(uniqueContractRowsMap.values());
 
-        if (dedupedContractRows.length > 0) {
+        if (dedupedContractRows.length > 0 && isPgConfigured()) {
           try {
             await executePg(`
               INSERT INTO sales (
@@ -9117,31 +9407,39 @@ async function startServer() {
           } catch (bulkContractErr) {
             console.warn('[Beacon Sync] Bulk contract upsert PG warning, saved in fileDb:', (bulkContractErr as any)?.message || bulkContractErr);
           }
+        }
 
-          for (const act of contractActions) {
-            if (act?.id) processedIds.push(act.id);
-          }
+        for (const act of contractActions) {
+          if (act?.id) processedIds.push(act.id);
         }
       }
 
-      // 4. Process other actions
+      // 4. Process other actions in parallel chunks of 10
       if (otherActions.length > 0) {
-        for (const act of otherActions) {
-          try {
-            const ok = await processSingleSyncAction(act, true);
-            if (ok && act?.id) processedIds.push(act.id);
-            const relatedContractId = act?.payload?.contractId || act?.payload?.contract_id || (act?.type?.includes('CONTRACT') ? act?.payload?.id : null);
-            if (relatedContractId) affectedContractIds.add(relatedContractId);
-          } catch (actErr) {
-            console.warn('Beacon action item warning:', act?.id, actErr);
-          }
+        const CONC = 10;
+        for (let i = 0; i < otherActions.length; i += CONC) {
+          const chunk = otherActions.slice(i, i + CONC);
+          await Promise.all(chunk.map(async (act) => {
+            try {
+              const ok = await processSingleSyncAction(act, true, true);
+              if (ok && act?.id) processedIds.push(act.id);
+              const relatedContractId = act?.payload?.contractId || act?.payload?.contract_id || (act?.type?.includes('CONTRACT') ? act?.payload?.id : null);
+              if (relatedContractId) affectedContractIds.add(relatedContractId);
+            } catch (actErr) {
+              console.warn('Beacon action item warning:', act?.id, actErr);
+            }
+          }));
         }
       }
 
-      if (affectedContractIds.size > 0) {
+      if (needsFundRecalc) {
+        void recalculateAllFundBalancesInPg().catch(() => {});
+      }
+
+      if (affectedContractIds.size > 0 && isPgConfigured()) {
         const cIds = Array.from(affectedContractIds).filter(Boolean);
-        try {
-          await executePg(`
+        await Promise.all([
+          executePg(`
             UPDATE sales c
             SET
               total_paid = LEAST(GREATEST(0, c.total_price - c.advance_payment), COALESCE(p.sum_paid, 0)),
@@ -9157,17 +9455,16 @@ async function startServer() {
               GROUP BY contract_id
             ) p
             WHERE c.id = p.contract_id AND c.id = ANY($1)
-          `, [cIds]).catch(() => {});
-
-          await executePg(`
+          `, [cIds]).catch(() => {}),
+          executePg(`
             UPDATE sales
             SET
               total_paid = 0,
               remaining_balance = GREATEST(0, total_price - advance_payment),
               status = CASE WHEN (total_price - advance_payment) <= 0 THEN 'completed' ELSE 'active' END
             WHERE id = ANY($1) AND NOT EXISTS (SELECT 1 FROM payments WHERE contract_id = sales.id)
-          `, [cIds]).catch(() => {});
-        } catch (balErr) {}
+          `, [cIds]).catch(() => {}),
+        ]);
       }
 
       bumpSyncVersion();
@@ -9206,9 +9503,11 @@ async function startServer() {
   });
 
   process.on("SIGTERM", () => {
+    fileDb.flushAll();
     server.close(() => process.exit(0));
   });
   process.on("SIGINT", () => {
+    fileDb.flushAll();
     server.close(() => process.exit(0));
   });
 }

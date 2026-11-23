@@ -3835,8 +3835,32 @@ export default function App() {
         onManualSync={async () => {
           setIsSyncing(true);
           try {
+            const flushRes = await flushPendingQueue();
+            if (flushRes.flushed > 0 && flushRes.remaining === 0) {
+              setPendingCount(0);
+              showToast(
+                isAr
+                  ? `تم رفع ${flushRes.flushed} عملية معلقة بنجاح!`
+                  : `Uploaded ${flushRes.flushed} pending actions!`
+              );
+              // Reconcile full snapshot asynchronously so the pending upload completes immediately
+              reconcileAllLocalWithDatabase({ force: true, forcePushAll: true }).catch(() => {});
+              return;
+            }
             const res = await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true });
-            if (res.success) {
+            if (flushRes.remaining > 0 && !res.success) {
+              showToast(
+                isAr
+                  ? `تم رفع ${flushRes.flushed} عملية وبقيت ${flushRes.remaining} بانتظار استقرار الاتصال`
+                  : `Uploaded ${flushRes.flushed}, ${flushRes.remaining} still pending`
+              );
+            } else if (flushRes.flushed > 0) {
+              showToast(
+                isAr
+                  ? `تم رفع ${flushRes.flushed} عملية معلقة ومطابقة كافة البيانات بنجاح`
+                  : `Uploaded ${flushRes.flushed} pending actions and reconciled successfully`
+              );
+            } else if (res.success) {
               showToast(isAr ? 'تمت المطابقة الشاملة ورفع البيانات للسيرفر بنجاح' : 'All data reconciled and synced to server successfully');
             } else {
               showToast(isAr ? (res.message || 'تمت محاولة المزامنة') : 'Sync attempted');
@@ -3844,7 +3868,7 @@ export default function App() {
           } catch (e) {
             showToast(isAr ? 'تعذر الاتصال بالخادم للمزامنة' : 'Sync connection failed');
           } finally {
-            setTimeout(() => setIsSyncing(false), 500);
+            setTimeout(() => setIsSyncing(false), 300);
           }
         }}
       />

@@ -86,6 +86,34 @@ export function openIndexedDb(dbName = DB_NAME, storeName = STORE_NAME): Promise
 /**
  * Get all actions directly from Primary IndexedDB
  */
+function isValidOfflineAction(item: any, permanentlySynced?: Set<string>): boolean {
+  if (!item || !item.id || !item.type) return false;
+  const idStr = String(item.id);
+  if (idStr.startsWith('__meta_') || item.type === '__META_CONFIG__') return false;
+  if (permanentlySynced && permanentlySynced.has(idStr)) return false;
+
+  const p = item.payload;
+  const type = String(item.type);
+
+  if (type === 'CREATE_PAYMENT' || type === 'UPDATE_PAYMENT' || type === 'RECORD_PAYMENT' || type === 'ADD_PAYMENT') {
+    if (!p || typeof p !== 'object') return false;
+    const pId = String(p.id || '').trim();
+    const amt = Number(p.amountPaid ?? p.amount_paid ?? p.amount ?? 0);
+    if (!pId || isNaN(amt) || amt <= 0) return false;
+    if (pId.startsWith('contract_') || pId.startsWith('emp_') || pId.startsWith('item_') || pId.startsWith('fund_')) return false;
+  }
+
+  if (type === 'CREATE_CONTRACT' || type === 'UPDATE_CONTRACT') {
+    if (!p || typeof p !== 'object') return false;
+    const cId = String(p.id || '').trim();
+    if (!cId || cId.startsWith('pay_') || cId.startsWith('ft_') || cId.startsWith('emptx_') || cId.startsWith('conflict_') || cId.startsWith('fund_')) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export async function getActionsFromIndexedDb(): Promise<PendingAction[]> {
   try {
     const dbPromise = openIndexedDb(DB_NAME, STORE_NAME);
@@ -100,22 +128,17 @@ export async function getActionsFromIndexedDb(): Promise<PendingAction[]> {
         req.onsuccess = () => {
           const results: any[] = req.result || [];
           const now = Date.now();
+          const permanentlySynced = getPermanentlySyncedIds();
           const validActions: PendingAction[] = results
-            .filter((item) => {
-              if (!item || !item.id || item.id.startsWith('__meta_') || item.type === '__META_CONFIG__') return false;
-              if ((item.type === 'CREATE_PAYMENT' || item.type === 'UPDATE_PAYMENT') && item.payload) {
-                const amt = Number(item.payload.amountPaid ?? item.payload.amount ?? 0);
-                if (amt <= 0) return false;
-              }
-              return true;
-            })
+            .filter((item) => isValidOfflineAction(item, permanentlySynced))
             .map((item) => ({
               id: item.id,
+              nonce: item.nonce,
               type: item.type,
               payload: item.payload,
               timestamp: Number(item.timestamp) || now,
-              // If marked syncing but over 8s old, un-freeze back to pending
-              status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 8000 ? 'syncing' : 'pending')) as ActionStatus,
+              // If marked syncing but over 30s old, un-freeze back to pending
+              status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 30000 ? 'syncing' : 'pending')) as ActionStatus,
               retryCount: Number(item.retryCount) || 0,
               error: item.error || null,
               syncedAt: item.syncedAt || null,
@@ -228,6 +251,36 @@ export async function deleteActionFromIndexedDb(id: string): Promise<void> {
   };
 
   await withTimeout(Promise.all([delPrimary(), delSecondary()]), 2500, null);
+}
+
+/**
+ * Remove a batch of action IDs from IndexedDB using a single transaction per DB (sub-5ms for 100+ items)
+ */
+async function deleteActionsBatchFromIndexedDb(ids: string[]): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  const delBatch = async (dbName: string, storeName: string) => {
+    try {
+      const db = await openIndexedDb(dbName, storeName);
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      for (const id of ids) {
+        if (id) store.delete(id);
+      }
+      await new Promise((resolve) => {
+        tx.oncomplete = resolve;
+        tx.onerror = resolve;
+        tx.onabort = resolve;
+      });
+    } catch (e) {}
+  };
+  await withTimeout(
+    Promise.all([
+      delBatch(DB_NAME, STORE_NAME),
+      delBatch(SECONDARY_DB_NAME, SECONDARY_STORE_NAME),
+    ]),
+    2500,
+    null
+  );
 }
 
 /**
@@ -405,15 +458,17 @@ export function getPendingQueueSync(): PendingAction[] {
     if (!Array.isArray(list)) return [];
     const now = Date.now();
     
-    // Deduplicate by entity/payload ID (keep latest action per record)
+    // Deduplicate by action type group + entity/payload ID (keep latest action per record)
     const entityMap = new Map<string, any>();
     for (const item of list) {
-      if (!item || item.id?.startsWith('__meta_') || item.type === '__META_CONFIG__' || permanentlySynced.has(item.id)) continue;
+      if (!isValidOfflineAction(item, permanentlySynced)) continue;
+      if (item.status === 'synced') continue;
       const entityId = item.payload?.id || (typeof item.payload === 'string' ? item.payload : item.id);
       if (entityId) {
-        const existing = entityMap.get(entityId);
+        const key = `${item.type?.includes('PAYMENT') ? 'pay' : item.type?.includes('CONTRACT') ? 'con' : item.type}_${entityId}`;
+        const existing = entityMap.get(key);
         if (!existing || Number(item.timestamp || 0) > Number(existing.timestamp || 0)) {
-          entityMap.set(entityId, item);
+          entityMap.set(key, item);
         }
       } else {
         entityMap.set(item.id, item);
@@ -422,10 +477,11 @@ export function getPendingQueueSync(): PendingAction[] {
 
     return Array.from(entityMap.values()).map((item) => ({
       id: item.id,
+      nonce: item.nonce,
       type: item.type,
       payload: item.payload,
       timestamp: Number(item.timestamp) || now,
-      status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 10000 ? 'syncing' : 'pending')) as ActionStatus,
+      status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 30000 ? 'syncing' : 'pending') as ActionStatus,
       retryCount: Number(item.retryCount) || 0,
       error: item.error || null,
       syncedAt: item.syncedAt || null,
@@ -441,6 +497,8 @@ export function getPendingQueueSync(): PendingAction[] {
  */
 export async function getPendingQueue(): Promise<PendingAction[]> {
   try {
+    const permanentlySynced = getPermanentlySyncedIds();
+
     // 1. Read from IndexedDB
     const idbActions = await getActionsFromIndexedDb();
 
@@ -461,7 +519,10 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
       }
     } catch (e) {}
 
-    const swSyncedSet = new Set(swSyncedIds);
+    if (swSyncedIds.length > 0) {
+      markActionIdsAsPermanentlySynced(swSyncedIds);
+      swSyncedIds.forEach((id) => permanentlySynced.add(id));
+    }
 
     // 2. Read from Native Android Bridge, Preferences and localStorage
     let nativeList: any[] = [];
@@ -491,19 +552,24 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
       if (local) localList = JSON.parse(local);
     } catch (e) {}
 
-    const mergedMap = new Map<string, PendingAction>();
     const entityLatestMap = new Map<string, any>();
+    const droppedInvalidIds: string[] = [];
     const now = Date.now();
 
     const addAction = (item: any) => {
-      if (!item || !item.id || item.id.startsWith('__meta_') || item.type === '__META_CONFIG__') return;
-      if (swSyncedSet.has(item.id)) return; // Already uploaded by Service Worker while app was closed
-      
+      if (!item || !item.id || String(item.id).startsWith('__meta_') || item.type === '__META_CONFIG__') return;
+      if (permanentlySynced.has(item.id) || item.status === 'synced') return;
+      if (!isValidOfflineAction(item, permanentlySynced)) {
+        droppedInvalidIds.push(item.id);
+        return;
+      }
+
       const entityId = item.payload?.id || (typeof item.payload === 'string' ? item.payload : item.id);
       if (entityId) {
-        const existingEntity = entityLatestMap.get(entityId);
+        const key = `${item.type?.includes('PAYMENT') ? 'pay' : item.type?.includes('CONTRACT') ? 'con' : item.type}_${entityId}`;
+        const existingEntity = entityLatestMap.get(key);
         if (!existingEntity || Number(item.timestamp || 0) > Number(existingEntity.timestamp || 0)) {
-          entityLatestMap.set(entityId, item);
+          entityLatestMap.set(key, item);
         }
       } else {
         entityLatestMap.set(item.id, item);
@@ -515,28 +581,31 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
     if (Array.isArray(prefList)) prefList.forEach(addAction);
     if (Array.isArray(localList)) localList.forEach(addAction);
 
-    const filteredActions = Array.from(entityLatestMap.values());
-    for (const item of filteredActions) {
-      mergedMap.set(item.id, {
-        id: item.id,
-        nonce: item.nonce,
-        type: item.type,
-        payload: item.payload,
-        timestamp: Number(item.timestamp) || now,
-        status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 10000 ? 'syncing' : 'pending')) as ActionStatus,
-        retryCount: Number(item.retryCount) || 0,
-        error: item.error || null,
-        syncedAt: item.syncedAt || null,
-        lastAttemptAt: item.lastAttemptAt || null,
-      });
+    if (droppedInvalidIds.length > 0) {
+      markActionIdsAsPermanentlySynced(droppedInvalidIds);
+      droppedInvalidIds.forEach((id) => deleteActionFromIndexedDb(id).catch(() => {}));
     }
 
-    const merged = Array.from(mergedMap.values());
+    const merged: PendingAction[] = Array.from(entityLatestMap.values()).map((item) => ({
+      id: item.id,
+      nonce: item.nonce,
+      type: item.type,
+      payload: item.payload,
+      timestamp: Number(item.timestamp) || now,
+      status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 30000 ? 'syncing' : 'pending') as ActionStatus,
+      retryCount: Number(item.retryCount) || 0,
+      error: item.error || null,
+      syncedAt: item.syncedAt || null,
+      lastAttemptAt: item.lastAttemptAt || null,
+    }));
+
     const jsonStr = JSON.stringify(merged);
     secureStorageSetSync(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(merged);
 
-    if (swSyncedIds.length > 0 || (idbActions.length === 0 && merged.length > 0)) {
+    if (swSyncedIds.length > 0 || droppedInvalidIds.length > 0) {
+      syncToNativeAndroid(merged);
+      syncQueueToIndexedDb(merged).catch(() => {});
+    } else if (idbActions.length === 0 && merged.length > 0) {
       syncQueueToIndexedDb(merged).catch(() => {});
     }
 
@@ -688,12 +757,12 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
     }
   }, 0);
 
-  // 3. Trigger debounced background network flush if online (gives time for saveToPostgres to complete and remove action)
+  // 3. Trigger fast background network flush immediately when online
   if (typeof navigator !== 'undefined' && navigator.onLine) {
     if (bgFlushTimer) clearTimeout(bgFlushTimer);
     bgFlushTimer = setTimeout(() => {
       flushPendingQueue().catch(() => {});
-    }, 1500);
+    }, 250);
   }
 
   // 4. Schedule idle verification re-query so when user stops typing/saving (سكون), it audits matches against server
@@ -726,6 +795,11 @@ export async function removeFromPendingQueue(id: string): Promise<void> {
  */
 export async function clearPendingQueue(): Promise<void> {
   try {
+    const existing = await getPendingQueue().catch(() => getPendingQueueSync());
+    const idsToPerm = existing.map((a) => a.id).filter(Boolean);
+    if (idsToPerm.length > 0) {
+      markActionIdsAsPermanentlySynced(idsToPerm);
+    }
     secureStorageRemoveSync(QUEUE_KEY);
     syncToNativeAndroid([]);
     await syncQueueToIndexedDb([]);
@@ -865,7 +939,7 @@ export async function updateActionStatus(
   }
 }
 
-async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok: boolean; authError?: boolean }> {
+async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok: boolean; authError?: boolean; permanentError?: boolean; errorMsg?: string }> {
   try {
     const { type, payload } = action;
     if (!payload) return { ok: true };
@@ -889,6 +963,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
 
       case 'CREATE_PAYMENT':
+      case 'RECORD_PAYMENT':
+      case 'ADD_PAYMENT':
         endpoint = '/api/payments';
         method = 'POST';
         break;
@@ -935,6 +1011,10 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         endpoint = docId ? `/api/funds/${docId}` : '/api/funds';
         method = 'PUT';
         break;
+      case 'REORDER_FUNDS':
+        endpoint = '/api/funds/reorder';
+        method = 'POST';
+        break;
       case 'DELETE_FUND':
         endpoint = docId ? `/api/funds/${docId}` : '';
         method = 'DELETE';
@@ -947,6 +1027,10 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       case 'UPDATE_CUSTOMER_LIST':
         endpoint = docId ? `/api/customer-lists/${docId}` : '/api/customer-lists';
         method = 'PUT';
+        break;
+      case 'REORDER_CUSTOMER_LISTS':
+        endpoint = '/api/customer-lists/reorder';
+        method = 'POST';
         break;
       case 'DELETE_CUSTOMER_LIST':
         endpoint = docId ? `/api/customer-lists/${docId}` : '';
@@ -1042,22 +1126,34 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
         break;
 
       default:
-        return { ok: false };
+        // Unknown historical/obsolete action type -> clear instead of blocking the queue forever
+        return { ok: true };
     }
 
-    if (!endpoint) return { ok: false };
+    if (!endpoint) return { ok: true };
 
     const res = await fetchWithFallback(endpoint, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : undefined,
-    }, 8000);
+    }, 10000);
 
-    if (res && res.status === 409) {
-      // Already recorded in database -> mark as synced so offline queue item is cleared
+    if (!res) {
+      return { ok: false };
+    }
+    // 409 = already recorded, 404 on DELETE = already deleted
+    if (res.status === 409 || (method === 'DELETE' && res.status === 404)) {
       return { ok: true };
     }
-    if (!res || !res.ok || res.status < 200 || res.status >= 300) {
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, authError: true, errorMsg: `HTTP ${res.status}` };
+    }
+    // 400 / 422 / 404 on PUT = unrecoverable validation/missing target after retries
+    if (res.status === 400 || res.status === 422 || (method === 'PUT' && res.status === 404)) {
+      const errData = await res.json().catch(() => null);
+      return { ok: false, permanentError: true, errorMsg: errData?.error || `HTTP ${res.status}` };
+    }
+    if (!res.ok || res.status < 200 || res.status >= 300) {
       return { ok: false };
     }
     const ct = res.headers?.get('content-type') || '';
@@ -1076,199 +1172,231 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
 
 let isFlushing = false;
 let lastFlushStartTime = 0;
+let activeFlushPromise: Promise<{ flushed: number; remaining: number }> | null = null;
+let followUpFlushTimer: any = null;
+
+async function commitSyncedIds(syncedIds: string[]): Promise<void> {
+  if (!syncedIds || syncedIds.length === 0) return;
+  const syncedSet = new Set(syncedIds);
+  markActionIdsAsPermanentlySynced(syncedIds);
+
+  try {
+    const raw = secureStorageGetSync(QUEUE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    const remaining = Array.isArray(parsed)
+      ? parsed.filter((item: any) => item && item.id && !syncedSet.has(item.id) && item.status !== 'synced')
+      : [];
+    secureStorageSetSync(QUEUE_KEY, JSON.stringify(remaining));
+    notifyQueueListeners(remaining.length);
+    syncToNativeAndroid(remaining);
+  } catch (e) {}
+
+  await deleteActionsBatchFromIndexedDb(syncedIds).catch(() => {});
+}
 
 /**
  * Flush all pending offline actions using explicit transaction states (pending -> syncing -> synced)
- * with reliable multi-path upload (REST Batch + Individual REST Endpoints) and per-record verification.
+ * with single-flight locking, fast concurrent 100-item bulk SQL chunks, single-tx IndexedDB commits, and REST fallback.
  */
 export async function flushPendingQueue(): Promise<{ flushed: number; remaining: number }> {
   const now = Date.now();
-  if (isFlushing) {
-    // Watchdog check: If flushing has been active for more than 12 seconds, force-reset the lock to prevent deadlock
-    if (now - lastFlushStartTime < 12000) {
-      const q = getPendingQueueSync();
-      return { flushed: 0, remaining: q.filter((i) => i.status !== 'synced').length };
+  if (activeFlushPromise) {
+    // Allow generous 60s before stale-promise guard releases so large queues finish all batches cleanly
+    if (now - lastFlushStartTime < 60000) {
+      return activeFlushPromise;
     }
-    console.warn('[Offline Sync Engine] Previous flush lock timed out (>12s). Resetting lock to unfreeze sync.');
-    isFlushing = false;
+    console.warn('[Offline Sync Engine] Previous flush exceeded 60s limit. Starting fresh flush.');
   }
 
-  isFlushing = true;
-  lastFlushStartTime = Date.now();
-  const verifiedSyncedIds: string[] = [];
+  const runFlush = async (): Promise<{ flushed: number; remaining: number }> => {
+    isFlushing = true;
+    lastFlushStartTime = Date.now();
+    const verifiedSyncedIds: string[] = [];
 
-  try {
-    const queue = await getPendingQueue();
+    try {
+      const queue = await getPendingQueue();
 
-    // 1. Select ALL un-synced actions (both 'pending' and recovering 'syncing' items)
-    const actionsToSync = queue.filter((item) => item.status !== 'synced');
+      // 1. Select ALL un-synced valid actions
+      const actionsToSync = queue.filter((item) => item.status !== 'synced');
 
-    if (actionsToSync.length === 0) {
-      isFlushing = false;
-      return { flushed: 0, remaining: 0 };
-    }
-
-    console.log(`[Offline Sync Engine] Initiating upload for ${actionsToSync.length} offline actions...`);
-
-    const timestampNow = Date.now();
-    // 2. Mark candidate actions as 'syncing' and save synchronously to memory/localStorage immediately
-    for (const action of actionsToSync) {
-      action.status = 'syncing';
-      action.lastAttemptAt = timestampNow;
-    }
-    secureStorageSetSync(QUEUE_KEY, JSON.stringify(queue));
-    // Save to IndexedDB asynchronously in background without blocking immediate batch network fetch
-    actionsToSync.forEach((a) => saveActionToIndexedDb(a).catch(() => {}));
-
-    // 3. Path A: Send Batch Request to /api/sync/batch in chunks of 200 (with fast 12s timeout)
-    let processedIdsFromBatch: string[] = [];
-    const BATCH_CHUNK = 200;
-    for (let b = 0; b < actionsToSync.length; b += BATCH_CHUNK) {
-      const batchSlice = actionsToSync.slice(b, b + BATCH_CHUNK);
-      try {
-        const response = await fetchWithFallback(
-          '/api/sync/batch',
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ actions: batchSlice }),
-          },
-          12000
-        );
-
-        if (response && response.ok && response.status >= 200 && response.status < 300) {
-          const ct = response.headers?.get('content-type') || '';
-          if (ct.includes('application/json') && !ct.includes('text/html')) {
-            const data = await response.json().catch(() => ({}));
-            if (data && Array.isArray(data.processedIds)) {
-              processedIdsFromBatch.push(...data.processedIds);
-            } else if (data && data.success) {
-              processedIdsFromBatch.push(...batchSlice.map((a) => a.id));
-            }
-            if (data && Array.isArray(data.rejectedReplayIds) && data.rejectedReplayIds.length > 0) {
-              processedIdsFromBatch.push(...data.rejectedReplayIds);
-            }
-          }
-        }
-      } catch (netErr: any) {
-        console.log('[Offline Sync Engine] Batch endpoint chunk notice, falling back:', netErr?.message || netErr);
+      if (actionsToSync.length === 0) {
+        notifyQueueListeners(0);
+        return { flushed: 0, remaining: 0 };
       }
-    }
 
-    const batchConfirmedSet = new Set(processedIdsFromBatch);
-    const pendingFallbackActions: PendingAction[] = [];
+      console.log(`[Offline Sync Engine] Initiating high-speed upload for ${actionsToSync.length} offline actions...`);
 
-    // 4. Process batch confirmed items immediately in parallel
-    const deletePromises: Promise<void>[] = [];
-    for (const action of actionsToSync) {
-      if (batchConfirmedSet.has(action.id)) {
-        action.status = 'synced';
-        action.syncedAt = Date.now();
-        action.error = null;
-        verifiedSyncedIds.push(action.id);
-        deletePromises.push(deleteActionFromIndexedDb(action.id).catch(() => {}));
-      } else {
-        pendingFallbackActions.push(action);
+      const timestampNow = Date.now();
+      for (const action of actionsToSync) {
+        action.status = 'syncing';
+        action.lastAttemptAt = timestampNow;
       }
-    }
-    if (deletePromises.length > 0) {
-      await Promise.all(deletePromises);
-    }
+      secureStorageSetSync(QUEUE_KEY, JSON.stringify(queue));
 
-    // 5. Fallback path for unconfirmed actions (parallel chunks of 8)
-    if (pendingFallbackActions.length > 0) {
-      const CHUNK_SIZE = 8;
-      for (let i = 0; i < pendingFallbackActions.length; i += CHUNK_SIZE) {
-        const chunk = pendingFallbackActions.slice(i, i + CHUNK_SIZE);
+      // 2. Path A: Send Bulk Batch Requests in fast slices of 100 items with up to 3 concurrent requests
+      const batchConfirmedSet = new Set<string>();
+      const BATCH_CHUNK = 100;
+      const BATCH_CONCURRENCY = 3;
+      const slices: PendingAction[][] = [];
+      for (let b = 0; b < actionsToSync.length; b += BATCH_CHUNK) {
+        slices.push(actionsToSync.slice(b, b + BATCH_CHUNK));
+      }
+
+      for (let s = 0; s < slices.length; s += BATCH_CONCURRENCY) {
+        const windowSlices = slices.slice(s, s + BATCH_CONCURRENCY);
         await Promise.all(
-          chunk.map(async (action) => {
-            // First fallback: REST endpoint directly
-            const restResult = await executeActionViaRestEndpoint(action);
-            if (restResult.ok) {
-              action.status = 'synced';
-              action.syncedAt = Date.now();
-              action.error = null;
-              verifiedSyncedIds.push(action.id);
-              await deleteActionFromIndexedDb(action.id).catch(() => {});
-              return;
+          windowSlices.map(async (batchSlice) => {
+            const sliceConfirmedIds: string[] = [];
+            try {
+              const response = await fetchWithFallback(
+                '/api/sync/batch',
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ actions: batchSlice }),
+                },
+                25000
+              );
+
+              if (response && response.ok && response.status >= 200 && response.status < 300) {
+                const ct = response.headers?.get('content-type') || '';
+                if (ct.includes('application/json') && !ct.includes('text/html')) {
+                  const data = await response.json().catch(() => ({}));
+                  if (data && Array.isArray(data.processedIds)) {
+                    sliceConfirmedIds.push(...data.processedIds);
+                  } else if (data && data.success) {
+                    sliceConfirmedIds.push(...batchSlice.map((a) => a.id));
+                  }
+                  if (data && Array.isArray(data.rejectedReplayIds) && data.rejectedReplayIds.length > 0) {
+                    sliceConfirmedIds.push(...data.rejectedReplayIds);
+                  }
+                }
+              }
+            } catch (netErr: any) {
+              console.log('[Offline Sync Engine] Batch slice fallback notice:', netErr?.message || netErr);
             }
 
-            // Otherwise revert to pending for next retry
-            action.status = 'pending';
-            action.retryCount = (action.retryCount || 0) + 1;
-            action.error = 'Pending connection to sync server';
-            await saveActionToIndexedDb(action).catch(() => {});
+            if (sliceConfirmedIds.length > 0) {
+              const newIds: string[] = [];
+              for (const id of sliceConfirmedIds) {
+                if (!batchConfirmedSet.has(id)) {
+                  batchConfirmedSet.add(id);
+                  verifiedSyncedIds.push(id);
+                  newIds.push(id);
+                }
+              }
+              if (newIds.length > 0) {
+                await commitSyncedIds(newIds);
+              }
+            }
           })
         );
       }
-    }
 
-    // 6. Clean up synced items and update global snapshot without dropping any actions added during sync
-    const verifiedSet = new Set(verifiedSyncedIds);
-    markActionIdsAsPermanentlySynced(verifiedSyncedIds);
+      // 3. Fallback path for unconfirmed actions (parallel chunks of 10 via individual REST endpoints)
+      const pendingFallbackActions = actionsToSync.filter((action) => !batchConfirmedSet.has(action.id));
+      if (pendingFallbackActions.length > 0) {
+        const CHUNK_SIZE = 10;
+        for (let i = 0; i < pendingFallbackActions.length; i += CHUNK_SIZE) {
+          const chunk = pendingFallbackActions.slice(i, i + CHUNK_SIZE);
+          const chunkSynced: string[] = [];
 
-    // Also delete verified items from IndexedDB
-    for (const vid of verifiedSyncedIds) {
-      await deleteActionFromIndexedDb(vid).catch(() => {});
-    }
+          await Promise.all(
+            chunk.map(async (action) => {
+              const restResult = await executeActionViaRestEndpoint(action);
+              if (restResult.ok) {
+                action.status = 'synced';
+                action.syncedAt = Date.now();
+                action.error = null;
+                chunkSynced.push(action.id);
+                return;
+              }
 
-    const freshQueue = await getPendingQueue();
-    const remainingQueue = freshQueue
-      .filter((item) => !verifiedSet.has(item.id) && item.status !== 'synced')
-      .map((item) => {
-        if (item.status === 'syncing') {
-          return { ...item, status: 'pending' as const };
-        }
-        return item;
-      });
-    const jsonStr = JSON.stringify(remainingQueue);
-    secureStorageSetSync(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(remainingQueue);
+              action.retryCount = (action.retryCount || 0) + 1;
+              if (restResult.permanentError && action.retryCount >= 3) {
+                // Unrecoverable client validation failure after multiple attempts -> clear so it doesn't jam queue forever
+                console.warn(`[Offline Sync Engine] Clearing unrecoverable action after ${action.retryCount} failed attempts:`, action.type, action.id, restResult.errorMsg);
+                chunkSynced.push(action.id);
+                return;
+              }
 
-    await syncQueueToIndexedDb(remainingQueue);
-    notifyQueueListeners(remainingQueue.length);
+              action.status = 'pending';
+              action.error = restResult.errorMsg || 'Pending connection to sync server';
+              await saveActionToIndexedDb(action).catch(() => {});
+            })
+          );
 
-    if (verifiedSyncedIds.length > 0) {
-      console.log(`[Offline Sync Engine] Successfully synchronized & uploaded ${verifiedSyncedIds.length} records.`);
-      try {
-        const raw = localStorage.getItem('sami_offline_payments');
-        if (raw) {
-          const list = JSON.parse(raw);
-          if (Array.isArray(list)) {
-            let changed = false;
-            for (const p of list) {
-              if (p && (verifiedSet.has(p.id) || (!remainingQueue.some((r) => r.payload?.id === p.id) && p._syncStatus === 'pending'))) {
-                p._syncStatus = 'synced';
-                p._unsynced = false;
-                changed = true;
+          if (chunkSynced.length > 0) {
+            for (const id of chunkSynced) {
+              if (!batchConfirmedSet.has(id)) {
+                batchConfirmedSet.add(id);
+                verifiedSyncedIds.push(id);
               }
             }
-            if (changed) {
-              localStorage.setItem('sami_offline_payments', JSON.stringify(list));
-            }
+            await commitSyncedIds(chunkSynced);
           }
         }
-      } catch (e) {}
-      notifySyncSuccessListeners();
-    }
+      }
 
-    // If there are still un-synced items and we made progress, trigger immediate follow-up flush
-    if (remainingQueue.length > 0 && verifiedSyncedIds.length > 0) {
-      setTimeout(() => {
-        flushPendingQueue().catch(() => {});
-      }, 400);
-    }
-  } catch (err) {
-    console.warn('[Offline Sync Engine] Flush queue exception:', err);
-  } finally {
-    isFlushing = false;
-  }
+      // 4. Final reconciliation of queue state across localStorage / IndexedDB / Preferences
+      const verifiedSet = new Set(verifiedSyncedIds);
+      const freshQueue = await getPendingQueue();
+      const remainingQueue = freshQueue
+        .filter((item) => !verifiedSet.has(item.id) && item.status !== 'synced')
+        .map((item) => (item.status === 'syncing' ? { ...item, status: 'pending' as const } : item));
 
-  const finalQueue = await getPendingQueue();
-  const permSet = getPermanentlySyncedIds();
-  const verifiedSet = new Set(verifiedSyncedIds);
-  const activeRemaining = finalQueue.filter((i) => i.status !== 'synced' && !verifiedSet.has(i.id) && !permSet.has(i.id)).length;
-  return { flushed: verifiedSyncedIds.length, remaining: activeRemaining };
+      const jsonStr = JSON.stringify(remainingQueue);
+      secureStorageSetSync(QUEUE_KEY, jsonStr);
+      syncToNativeAndroid(remainingQueue);
+      await syncQueueToIndexedDb(remainingQueue);
+      notifyQueueListeners(remainingQueue.length);
+
+      if (verifiedSyncedIds.length > 0) {
+        console.log(`[Offline Sync Engine] Successfully synchronized & uploaded ${verifiedSyncedIds.length} records.`);
+        try {
+          const raw = localStorage.getItem('sami_offline_payments');
+          if (raw) {
+            const list = JSON.parse(raw);
+            if (Array.isArray(list)) {
+              let changed = false;
+              for (const p of list) {
+                if (p && (verifiedSet.has(p.id) || (!remainingQueue.some((r) => r.payload?.id === p.id) && p._syncStatus === 'pending'))) {
+                  p._syncStatus = 'synced';
+                  p._unsynced = false;
+                  changed = true;
+                }
+              }
+              if (changed) {
+                localStorage.setItem('sami_offline_payments', JSON.stringify(list));
+              }
+            }
+          }
+        } catch (e) {}
+        notifySyncSuccessListeners();
+      }
+
+      // If more items remain AND we uploaded some, schedule a single debounced follow-up flush
+      if (remainingQueue.length > 0 && verifiedSyncedIds.length > 0) {
+        if (followUpFlushTimer) clearTimeout(followUpFlushTimer);
+        followUpFlushTimer = setTimeout(() => {
+          flushPendingQueue().catch(() => {});
+        }, 500);
+      }
+
+      return { flushed: verifiedSyncedIds.length, remaining: remainingQueue.length };
+    } catch (err) {
+      console.warn('[Offline Sync Engine] Flush queue exception:', err);
+      const permSet = getPermanentlySyncedIds();
+      const q = getPendingQueueSync().filter((i) => i.status !== 'synced' && !permSet.has(i.id));
+      return { flushed: verifiedSyncedIds.length, remaining: q.length };
+    } finally {
+      isFlushing = false;
+      activeFlushPromise = null;
+    }
+  };
+
+  activeFlushPromise = runFlush();
+  return activeFlushPromise;
 }
 
 export const syncOfflineData = flushPendingQueue;

@@ -20,18 +20,35 @@ function getFilePath(tableName: string) {
   return `${tableName}.json`;
 }
 
+// In-memory table cache + debounced async flush to prevent blocking the event loop
+// when batch endpoints upsert/update dozens or hundreds of records sequentially.
+const tableCache = new Map<string, any[]>();
+const dirtyTables = new Set<string>();
+const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 function loadTable<T = any>(tableName: string): T[] {
+  if (tableCache.has(tableName)) {
+    return tableCache.get(tableName) as T[];
+  }
   try {
     if (isNode && fs.existsSync) {
       const file = getFilePath(tableName);
       if (!fs.existsSync(file)) {
-        return [];
+        const empty: T[] = [];
+        tableCache.set(tableName, empty);
+        return empty;
       }
       const content = fs.readFileSync(file, 'utf-8');
-      return JSON.parse(content) || [];
+      const parsed = JSON.parse(content);
+      const arr = Array.isArray(parsed) ? parsed : [];
+      tableCache.set(tableName, arr);
+      return arr as T[];
     } else if (typeof localStorage !== 'undefined') {
       const stored = localStorage.getItem(`filedb_${tableName}`);
-      return stored ? JSON.parse(stored) : [];
+      const parsed = stored ? JSON.parse(stored) : [];
+      const arr = Array.isArray(parsed) ? parsed : [];
+      tableCache.set(tableName, arr);
+      return arr as T[];
     }
   } catch {
     return [];
@@ -39,11 +56,27 @@ function loadTable<T = any>(tableName: string): T[] {
   return [];
 }
 
-function saveTable<T = any>(tableName: string, data: T[]) {
+async function flushTableToDisk(tableName: string): Promise<void> {
+  if (!isNode || !fs.promises) return;
+  if (!dirtyTables.has(tableName)) return;
+  dirtyTables.delete(tableName);
+  const data = tableCache.get(tableName) || [];
+  try {
+    const file = getFilePath(tableName);
+    await fs.promises.writeFile(file, JSON.stringify(data), 'utf-8');
+  } catch (e) {
+    console.error(`Error async saving table ${tableName}:`, e);
+  }
+}
+
+function flushTableSync(tableName: string): void {
+  if (!dirtyTables.has(tableName)) return;
+  dirtyTables.delete(tableName);
+  const data = tableCache.get(tableName) || [];
   try {
     if (isNode && fs.writeFileSync) {
       const file = getFilePath(tableName);
-      fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
+      fs.writeFileSync(file, JSON.stringify(data), 'utf-8');
     } else if (typeof localStorage !== 'undefined') {
       localStorage.setItem(`filedb_${tableName}`, JSON.stringify(data));
     }
@@ -52,29 +85,66 @@ function saveTable<T = any>(tableName: string, data: T[]) {
   }
 }
 
+function scheduleTableFlush(tableName: string) {
+  dirtyTables.add(tableName);
+  if (!isNode) {
+    flushTableSync(tableName);
+    return;
+  }
+  const existingTimer = flushTimers.get(tableName);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(() => {
+    flushTimers.delete(tableName);
+    flushTableToDisk(tableName).catch(() => {});
+  }, 120);
+  if (typeof (timer as any).unref === 'function') {
+    (timer as any).unref();
+  }
+  flushTimers.set(tableName, timer);
+}
+
+export function flushAllFileDbSync(): void {
+  for (const timer of flushTimers.values()) {
+    clearTimeout(timer);
+  }
+  flushTimers.clear();
+  for (const tableName of Array.from(dirtyTables)) {
+    flushTableSync(tableName);
+  }
+}
+
+if (isNode && typeof process !== 'undefined' && typeof process.on === 'function') {
+  process.on('beforeExit', flushAllFileDbSync);
+}
+
 export const fileDb = {
   get: <T = any>(tableName: string): T[] => {
-    return loadTable<T>(tableName);
+    return [...loadTable<T>(tableName)];
   },
 
   upsert: <T extends { id: string }>(tableName: string, record: T): T => {
     const records = loadTable<T>(tableName);
-    const index = records.findIndex((r) => r.id === record.id);
+    const index = records.findIndex((r) => r && r.id === record.id);
+    let saved: T;
     if (index >= 0) {
-      records[index] = { ...records[index], ...record };
+      saved = { ...records[index], ...record };
+      records[index] = saved;
     } else {
-      records.push(record);
+      saved = { ...record };
+      records.push(saved);
     }
-    saveTable(tableName, records);
-    return record;
+    tableCache.set(tableName, records);
+    scheduleTableFlush(tableName);
+    return saved;
   },
 
   update: <T extends { id: string }>(tableName: string, id: string, updates: Partial<T>): boolean => {
     const records = loadTable<T>(tableName);
-    const index = records.findIndex((r) => r.id === id);
+    const index = records.findIndex((r) => r && r.id === id);
     if (index >= 0) {
       records[index] = { ...records[index], ...updates };
-      saveTable(tableName, records);
+      tableCache.set(tableName, records);
+      scheduleTableFlush(tableName);
       return true;
     }
     return false;
@@ -82,12 +152,19 @@ export const fileDb = {
 
   delete: (tableName: string, id: string): boolean => {
     const records = loadTable<{ id: string }>(tableName);
-    const filtered = records.filter((r) => r.id !== id);
-    saveTable(tableName, filtered);
+    const filtered = records.filter((r) => r && r.id !== id);
+    if (filtered.length !== records.length) {
+      tableCache.set(tableName, filtered);
+      scheduleTableFlush(tableName);
+    }
     return true;
   },
 
   setAll: <T = any>(tableName: string, data: T[]): void => {
-    saveTable(tableName, data);
-  }
+    tableCache.set(tableName, Array.isArray(data) ? [...data] : []);
+    scheduleTableFlush(tableName);
+  },
+
+  flushAll: flushAllFileDbSync,
 };
+
