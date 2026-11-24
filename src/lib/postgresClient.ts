@@ -1169,28 +1169,71 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
     }
 
     // Fallback: If IndexedDB snapshot was empty (e.g. freshly installed APK on mobile),
-    // load bundled initial snapshot so Customer Locations and Appointments are NEVER empty/zeroed on launch!
+    // load bundled initial snapshot so Contracts, Customers, Payments, Funds & Appointments are NEVER empty on launch!
     try {
-      const snapRes = await fetch('/initial_snapshot.json').catch(() => null);
+      let snapRes = await fetch('./initial_snapshot.json').catch(() => null);
+      if (!snapRes || !snapRes.ok) {
+        snapRes = await fetch('/initial_snapshot.json').catch(() => null);
+      }
       if (snapRes && snapRes.ok) {
         const bundled = await snapRes.json().catch(() => null);
         if (bundled && typeof bundled === 'object') {
+          const bundledPaymentsRaw = Array.isArray(bundled.payments) ? bundled.payments : [];
+          const mappedPayments = bundledPaymentsRaw.map((p: any) => mapRow('payments', p));
+          if (mappedPayments.length > 0 && getLocalCache('payments').length === 0) {
+            setLocalCache('payments', mappedPayments);
+          }
+
+          if (Array.isArray(bundled.customers) && getLocalCache('customers').length === 0) {
+            setLocalCache('customers', bundled.customers.map((cu: any) => mapRow('customers', cu)));
+          }
+
           if (Array.isArray(bundled.contracts) && getLocalCache('contracts').length === 0) {
-            setLocalCache('contracts', bundled.contracts);
+            const mappedContracts = bundled.contracts.map((c: any) => mapRow('contracts', c));
+            const currentPayments = getLocalCache<any>('payments');
+            const recalculated = recalculateAllContractsFromPayments(mappedContracts, currentPayments, false);
+            setLocalCache('contracts', recalculated);
           }
+
           if (Array.isArray(bundled.appointments) && getLocalCache('appointments').length === 0) {
-            setLocalCache('appointments', bundled.appointments);
+            setLocalCache('appointments', bundled.appointments.map((a: any) => mapRow('appointments', a)));
           }
-          if (Array.isArray(bundled.customerLists) && getLocalCache('customer_lists').length === 0) {
-            setLocalCache('customer_lists', bundled.customerLists);
+
+          const rawLists = bundled.customer_lists || bundled.customerLists;
+          if (Array.isArray(rawLists) && getLocalCache('customer_lists').length === 0) {
+            setLocalCache('customer_lists', rawLists.map((l: any) => mapRow('customer_lists', l)));
           }
-          if (Array.isArray(bundled.funds) && getLocalCache('funds').length === 0) {
-            setLocalCache('funds', bundled.funds);
+
+          const rawFunds = bundled.cash_funds || bundled.funds;
+          if (Array.isArray(rawFunds) && getLocalCache('funds').length === 0) {
+            setLocalCache('funds', rawFunds.map((f: any) => mapRow('funds', f)));
           }
+
+          const rawInventory = bundled.inventory_items || bundled.inventory;
+          if (Array.isArray(rawInventory) && getLocalCache('inventory').length === 0) {
+            setLocalCache('inventory', rawInventory.map((inv: any) => mapRow('inventory', inv)));
+          }
+
+          if (Array.isArray(bundled.employees) && getLocalCache('employees').length === 0) {
+            setLocalCache('employees', bundled.employees.map((e: any) => mapRow('employees', e)));
+          }
+
+          const rawFundTx = bundled.fund_transactions || bundled.fundTx;
+          if (Array.isArray(rawFundTx) && getLocalCache('fund_transactions').length === 0) {
+            setLocalCache('fund_transactions', rawFundTx.map((tx: any) => mapRow('fund_transactions', tx)));
+          }
+
+          const rawEmpTx = bundled.employee_transactions || bundled.empTx;
+          if (Array.isArray(rawEmpTx) && getLocalCache('employee_transactions').length === 0) {
+            setLocalCache('employee_transactions', rawEmpTx.map((tx: any) => mapRow('employee_transactions', tx)));
+          }
+
           if (Array.isArray(bundled.reps) && getLocalCache('reps').length === 0) {
-            setLocalCache('reps', bundled.reps);
+            setLocalCache('reps', bundled.reps.map((r: any) => mapRow('reps', r)));
           }
+
           applyServerClearedLocations();
+          mirrorLocalSnapshotToIndexedDb(false).catch(() => {});
           notifySubscribersRefresh();
           return true;
         }
@@ -4344,13 +4387,17 @@ export const fetchAppointmentsFromPostgres = async (): Promise<AppointmentRecord
   // If local cache is still empty, load from bundled initial snapshot (first-time APK launch)
   if (!local || local.length === 0) {
     try {
-      const snapRes = await fetch('/initial_snapshot.json').catch(() => null);
+      let snapRes = await fetch('./initial_snapshot.json').catch(() => null);
+      if (!snapRes || !snapRes.ok) {
+        snapRes = await fetch('/initial_snapshot.json').catch(() => null);
+      }
       if (snapRes && snapRes.ok) {
         const snap = await snapRes.json().catch(() => null);
         if (snap && Array.isArray(snap.appointments) && snap.appointments.length > 0) {
-          setLocalCache('appointments', snap.appointments);
+          const mappedAppts = snap.appointments.map((a: any) => mapRow('appointments', a));
+          setLocalCache('appointments', mappedAppts);
           mirrorLocalSnapshotToIndexedDb(false);
-          return snap.appointments;
+          return mappedAppts;
         }
       }
     } catch (e) {}

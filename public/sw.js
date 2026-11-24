@@ -153,6 +153,7 @@ async function getCandidateServerOrigins() {
   // Fallback candidate origins for Cloud PostgreSQL server
   const defaults = [
     'http://72.62.158.128',
+    'http://72.62.158.128:3000',
     'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     'http://localhost:3000',

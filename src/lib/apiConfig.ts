@@ -10,6 +10,9 @@ export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128';
 
 export const CANDIDATE_SERVERS: string[] = [
   'http://72.62.158.128',
+  'http://72.62.158.128:3000',
+  'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
+  'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
 ];
 
 const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128';
@@ -49,34 +52,96 @@ let activeWorkingServer = '';
 try {
   if (typeof localStorage !== 'undefined') {
     const saved = localStorage.getItem(SERVER_URL_STORAGE_KEY);
-    if (saved && (saved.startsWith('http://') || saved.startsWith('https://'))) {
+    if (
+      saved &&
+      (saved.startsWith('http://') || saved.startsWith('https://')) &&
+      !saved.includes('localhost') &&
+      !saved.includes('127.0.0.1')
+    ) {
       activeWorkingServer = saved.replace(/\/+$/, '');
     }
   }
 } catch (e) {}
 
-export async function autoDetectActiveServer(): Promise<string> {
-  if (activeWorkingServer) return activeWorkingServer;
-  for (const server of CANDIDATE_SERVERS) {
+async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  let timer: any;
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          controller.abort();
+        } catch (e) {}
+        reject(new DOMException('Timeout', 'AbortError'));
+      }, timeoutMs);
+    });
+    const fetchPromise = fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    return await Promise.race([fetchPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let activeDetectPromise: Promise<string> | null = null;
+
+export async function autoDetectActiveServer(forceProbe = false): Promise<string> {
+  if (activeWorkingServer && !forceProbe) {
+    // Still verify in background without blocking if not forced, or return immediately
+    return activeWorkingServer;
+  }
+  if (activeDetectPromise) return activeDetectPromise;
+
+  activeDetectPromise = (async () => {
+    const serversToProbe: string[] = [];
+    const custom = getCustomServerUrl();
+    if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
+      serversToProbe.push(custom);
+    }
+    for (const s of CANDIDATE_SERVERS) {
+      if (!serversToProbe.includes(s)) serversToProbe.push(s);
+    }
+
+    const probeOne = async (server: string): Promise<string> => {
+      const res = await fetchWithRaceTimeout(
+        `${server}/api/health`,
+        {
+          method: 'GET',
+          headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+        },
+        4000
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('text/html')) throw new Error('HTML response');
+      return server;
+    };
+
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(`${server}/api/reports/totals`, {
-        signal: controller.signal,
-        headers: { 'Cache-Control': 'no-cache' }
-      });
-      clearTimeout(timer);
-      if (res.ok) {
-        setActiveWorkingServer(server);
-        return server;
+      // Check first candidate quickly before broadcasting or race all candidates in parallel
+      const winner = await Promise.any(serversToProbe.map((s) => probeOne(s)));
+      if (winner) {
+        setActiveWorkingServer(winner);
+        return winner;
       }
     } catch (e) {}
-  }
-  return DEFAULT_REMOTE_SERVER;
+    return activeWorkingServer || DEFAULT_REMOTE_SERVER;
+  })().finally(() => {
+    activeDetectPromise = null;
+  });
+
+  return activeDetectPromise;
 }
 
 export function setActiveWorkingServer(url: string) {
-  if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+  if (
+    url &&
+    (url.startsWith('http://') || url.startsWith('https://')) &&
+    !url.includes('localhost') &&
+    !url.includes('127.0.0.1')
+  ) {
     const clean = url.replace(/\/+$/, '');
     activeWorkingServer = clean;
     try {
@@ -194,13 +259,6 @@ export async function fetchWithFallback(
         urlsToTry.push(candidateUrl);
       }
     }
-    if (typeof window !== 'undefined' && window.location.origin && window.location.origin.startsWith('http')) {
-      const originUrl = `${window.location.origin}${cleanEndpoint}`;
-      if (!urlsToTry.includes(originUrl)) urlsToTry.push(originUrl);
-    }
-    if (!urlsToTry.includes(cleanEndpoint)) {
-      urlsToTry.push(cleanEndpoint);
-    }
   } else {
     const hasHttpOrigin =
       typeof window !== 'undefined' &&
@@ -240,21 +298,28 @@ export async function fetchWithFallback(
   let lastError: any = null;
   const skipSigning = cleanEndpoint.startsWith('/api/auth/login') || cleanEndpoint.startsWith('/api/auth/logout');
 
-  for (const url of urlsToTry) {
+  for (let idx = 0; idx < urlsToTry.length; idx++) {
+    const url = urlsToTry[idx];
     try {
-      const controller = new AbortController();
-      const perUrlTimeout = timeoutMs || (isNative ? 10000 : 7000);
-      const timer = setTimeout(() => controller.abort(), perUrlTimeout);
-      const res = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/plain, */*',
-          ...(options?.headers || {}),
+      // Keep fallback probing fast when multiple candidate URLs remain
+      const baseTimeout = timeoutMs || (isNative ? 10000 : 7000);
+      const perUrlTimeout =
+        urlsToTry.length > 1 && idx < urlsToTry.length - 1
+          ? Math.min(baseTimeout, 6000)
+          : baseTimeout;
+
+      const res = await fetchWithRaceTimeout(
+        url,
+        {
+          ...options,
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/plain, */*',
+            ...(options?.headers || {}),
+          },
         },
-      });
-      clearTimeout(timer);
+        perUrlTimeout
+      );
 
       if (res.ok) {
         const contentType = res.headers.get('content-type') || '';
@@ -289,6 +354,10 @@ export async function fetchWithFallback(
       }
     } catch (err: any) {
       lastError = err;
+      if (isNative && activeWorkingServer && url.startsWith(activeWorkingServer)) {
+        // Clear dead cached server in memory so fallback candidates can take over cleanly
+        activeWorkingServer = '';
+      }
     }
   }
 
@@ -308,13 +377,11 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
   const targetUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    const res = await fetch(targetUrl, {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' }
-    });
-    clearTimeout(timer);
+    const res = await fetchWithRaceTimeout(
+      targetUrl,
+      { headers: { 'Accept': 'application/json' } },
+      6000
+    );
     const latencyMs = Date.now() - start;
 
     if (res.ok) {
@@ -340,4 +407,9 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
       error: err.name === 'AbortError' ? 'انتهت مهلة الاتصال بالخادم (Timeout)' : (err.message || 'تعذر الاتصال بالخادم'),
     };
   }
+}
+
+// Automatically probe live candidate servers in parallel on APK startup
+if (typeof window !== 'undefined' && isNativeOrApkEnvironment()) {
+  autoDetectActiveServer(true).catch(() => {});
 }

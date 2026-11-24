@@ -55,6 +55,7 @@ public class ForegroundSyncService extends Service {
 
     private static final String[] CANDIDATE_SYNC_URLS = {
         "http://72.62.158.128/api/sync/batch",
+        "http://72.62.158.128:3000/api/sync/batch",
         "https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api/sync/batch",
         "https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api/sync/batch"
     };
@@ -569,8 +570,8 @@ public class ForegroundSyncService extends Service {
                         conn.setRequestMethod("POST");
                         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                         conn.setRequestProperty("Accept", "application/json");
-                        conn.setConnectTimeout(10000);
-                        conn.setReadTimeout(25000);
+                        conn.setConnectTimeout(4000);
+                        conn.setReadTimeout(20000);
                         conn.setDoOutput(true);
 
                         OutputStream os = conn.getOutputStream();
@@ -617,6 +618,7 @@ public class ForegroundSyncService extends Service {
 
                             if (chunkVerifiedIds.size() > 0) {
                                 activeBaseUrl = targetUrl.replaceAll("/api/sync/batch.*", "");
+                                EncryptedOfflineDbHelper.putValue(context, KEY_SERVER_URL, activeBaseUrl);
                                 Log.i(TAG, "Chunk sync verified via " + targetUrl + " (" + code + "), count: " + chunkVerifiedIds.size());
                                 conn.disconnect();
                                 break;
@@ -701,7 +703,7 @@ public class ForegroundSyncService extends Service {
                                 sConn.setRequestMethod(reqMethod);
                                 sConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                                 sConn.setRequestProperty("Accept", "application/json");
-                                sConn.setConnectTimeout(6000);
+                                sConn.setConnectTimeout(4000);
                                 sConn.setReadTimeout(10000);
 
                                 byte[] rowBytes = isDelete ? new byte[0] : payload.toString().getBytes("UTF-8");

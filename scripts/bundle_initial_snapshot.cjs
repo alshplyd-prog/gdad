@@ -7,10 +7,13 @@ const outputFile = path.join(__dirname, '../public/initial_snapshot.json');
 const files = [
   'contracts.json',
   'payments.json',
+  'customers.json',
   'appointments.json',
   'cash_funds.json',
   'customer_lists.json',
   'employees.json',
+  'fund_transactions.json',
+  'employee_transactions.json',
   'inventory_items.json',
   'reps.json'
 ];
@@ -32,5 +35,5 @@ for (const f of files) {
   }
 }
 
-fs.writeFileSync(outputFile, JSON.stringify(snapshot, null, 2), 'utf8');
+fs.writeFileSync(outputFile, JSON.stringify(snapshot), 'utf8');
 console.log('[Snapshot Bundler] Successfully bundled initial snapshot.');

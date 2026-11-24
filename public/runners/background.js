@@ -7,6 +7,8 @@ addEventListener('syncOfflineQueue', async (resolve, _reject, _args) => {
 
     // 1. Read stored server config (both http and https) or use candidate cloud servers
     let candidateServers = [
+      'http://72.62.158.128',
+      'http://72.62.158.128:3000',
       'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
       'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     ];

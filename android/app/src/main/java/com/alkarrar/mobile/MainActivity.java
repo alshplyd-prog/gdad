@@ -195,6 +195,9 @@ public class MainActivity extends BridgeActivity {
                 settings.setAllowFileAccessFromFileURLs(false);
                 settings.setAllowUniversalAccessFromFileURLs(false);
                 settings.setMediaPlaybackRequiresUserGesture(false);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                }
 
                 if (!webViewInterfaceAttached) {
                     PrinterJavascriptInterface nativeInterface = new PrinterJavascriptInterface();
