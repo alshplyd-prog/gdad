@@ -141,23 +141,7 @@ try {
   });
 } catch (e) {}
 
-// Auto-clear old customer cache once to match current server state
-try {
-  if (typeof window !== 'undefined' && localStorage) {
-    const CLEARED_KEY = 'alkarrar_cust_cleared_v5_empty';
-    if (!localStorage.getItem(CLEARED_KEY)) {
-      localStorage.removeItem('sami_cache_contracts');
-      localStorage.removeItem('sami_cache_payments');
-      localStorage.removeItem('sami_cache_installment_contracts');
-      localStorage.removeItem('sami_cache_payment_conflicts');
-      localStorage.removeItem('alkarrar_cache_contracts');
-      localStorage.removeItem('alkarrar_cache_payments');
-      localStorage.setItem('sami_cache_contracts', '[]');
-      localStorage.setItem('sami_cache_payments', '[]');
-      localStorage.setItem(CLEARED_KEY, 'true');
-    }
-  }
-} catch (e) {}
+
 
 // Helper to track and persist deleted record IDs locally to avoid resurrecting deleted entities
 const DELETED_RECORD_IDS_KEY = 'sami_deleted_record_ids';
@@ -938,55 +922,59 @@ export function getLocalCache<T>(tableName: string): T[] {
     if (raw !== null && raw !== undefined && raw !== '') {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        if (tableName === 'appointments') {
-          return parsed.filter((a: any) => a && a.id && !String(a.id).startsWith('appt_init_')) as T[];
-        }
-        if (tableName === 'reps') {
-          try {
-            const REPS_MIGRATION_KEY = 'alkarrar_reps_synced_v2';
-            if (typeof window !== 'undefined' && localStorage && localStorage.getItem(REPS_MIGRATION_KEY) !== 'true') {
-              let migrated = false;
-              const defaultById = new Map(DEFAULT_REPS.map((dr) => [dr.id, dr]));
-              const updatedReps = parsed.map((r: any) => {
-                const def = r?.id ? defaultById.get(String(r.id)) : undefined;
-                if (!def) return r;
-                if (
-                  r.pinVersion !== def.pinVersion ||
-                  r.offlineVerifier !== def.offlineVerifier ||
-                  r.role !== def.role
-                ) {
-                  migrated = true;
-                  return {
-                    ...def,
-                    ...r,
-                    pinVersion: def.pinVersion,
-                    offlineVerifier: def.offlineVerifier,
-                    role: def.role,
-                    canEdit: def.canEdit,
-                    canDelete: def.canDelete,
-                    canMoveCustomer: def.canMoveCustomer,
-                    canSell: def.canSell,
-                    allowedListIds: def.allowedListIds,
-                    avatarUrl: r.avatarUrl || '',
-                  };
+        if (parsed.length === 0 && (tableName === 'contracts' || tableName === 'funds' || tableName === 'customer_lists' || tableName === 'inventory' || tableName === 'employees')) {
+          // Fall through to fallback seeding
+        } else {
+          if (tableName === 'appointments') {
+            return parsed.filter((a: any) => a && a.id && !String(a.id).startsWith('appt_init_')) as T[];
+          }
+          if (tableName === 'reps') {
+            try {
+              const REPS_MIGRATION_KEY = 'alkarrar_reps_synced_v2';
+              if (typeof window !== 'undefined' && localStorage && localStorage.getItem(REPS_MIGRATION_KEY) !== 'true') {
+                let migrated = false;
+                const defaultById = new Map(DEFAULT_REPS.map((dr) => [dr.id, dr]));
+                const updatedReps = parsed.map((r: any) => {
+                  const def = r?.id ? defaultById.get(String(r.id)) : undefined;
+                  if (!def) return r;
+                  if (
+                    r.pinVersion !== def.pinVersion ||
+                    r.offlineVerifier !== def.offlineVerifier ||
+                    r.role !== def.role
+                  ) {
+                    migrated = true;
+                    return {
+                      ...def,
+                      ...r,
+                      pinVersion: def.pinVersion,
+                      offlineVerifier: def.offlineVerifier,
+                      role: def.role,
+                      canEdit: def.canEdit,
+                      canDelete: def.canDelete,
+                      canMoveCustomer: def.canMoveCustomer,
+                      canSell: def.canSell,
+                      allowedListIds: def.allowedListIds,
+                      avatarUrl: r.avatarUrl || '',
+                    };
+                  }
+                  return r;
+                });
+                for (const def of DEFAULT_REPS) {
+                  if (!updatedReps.some((r: any) => r?.id === def.id)) {
+                    updatedReps.push(def);
+                    migrated = true;
+                  }
                 }
-                return r;
-              });
-              for (const def of DEFAULT_REPS) {
-                if (!updatedReps.some((r: any) => r?.id === def.id)) {
-                  updatedReps.push(def);
-                  migrated = true;
+                if (migrated) {
+                  secureStorageSetSync('sami_cache_reps', JSON.stringify(updatedReps));
                 }
+                localStorage.setItem(REPS_MIGRATION_KEY, 'true');
+                return updatedReps as T[];
               }
-              if (migrated) {
-                secureStorageSetSync('sami_cache_reps', JSON.stringify(updatedReps));
-              }
-              localStorage.setItem(REPS_MIGRATION_KEY, 'true');
-              return updatedReps as T[];
-            }
-          } catch (migErr) {}
+            } catch (migErr) {}
+          }
+          return parsed;
         }
-        return parsed;
       }
     }
   } catch (e) {}
