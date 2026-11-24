@@ -1033,40 +1033,55 @@ export async function mirrorLocalSnapshotToIndexedDb(immediate = false): Promise
       const appointments = getLocalCache<any>('appointments');
       const deletedIds = Array.from(getDeletedRecordIds());
 
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('alkarrar_sync_db', 2);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-      });
+      let db: IDBDatabase | null = null;
+      try {
+        db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const req = indexedDB.open('alkarrar_sync_db', 2);
+          req.onupgradeneeded = (ev: any) => {
+            try {
+              const upgradeDb = ev.target?.result;
+              if (upgradeDb && !upgradeDb.objectStoreNames.contains('pending_actions')) {
+                upgradeDb.createObjectStore('pending_actions', { keyPath: 'id' });
+              }
+            } catch (upErr) {}
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
 
-      if (db.objectStoreNames.contains('pending_actions')) {
-        const tx = db.transaction('pending_actions', 'readwrite');
-        const store = tx.objectStore('pending_actions');
-        store.put({
-          id: '__meta_local_snapshot__',
-          type: '__META_CONFIG__',
-          payload: {
-            contracts,
-            customers,
-            payments,
-            inventory,
-            reps,
-            funds,
-            customerLists,
-            employees,
-            fundTx,
-            empTx,
-            appointments,
-            deletedIds,
+        if (db.objectStoreNames.contains('pending_actions')) {
+          const tx = db.transaction('pending_actions', 'readwrite');
+          const store = tx.objectStore('pending_actions');
+          store.put({
+            id: '__meta_local_snapshot__',
+            type: '__META_CONFIG__',
+            payload: {
+              contracts,
+              customers,
+              payments,
+              inventory,
+              reps,
+              funds,
+              customerLists,
+              employees,
+              fundTx,
+              empTx,
+              appointments,
+              deletedIds,
+              timestamp: Date.now(),
+            },
+            status: 'synced',
             timestamp: Date.now(),
-          },
-          status: 'synced',
-          timestamp: Date.now(),
-        });
-        await new Promise((resolve) => {
-          tx.oncomplete = resolve;
-          tx.onerror = resolve;
-        });
+          });
+          await new Promise((resolve) => {
+            tx.oncomplete = resolve;
+            tx.onerror = resolve;
+          });
+        }
+      } finally {
+        try {
+          if (db) db.close();
+        } catch (closeErr) {}
       }
     } catch (err) {
       // ignore non-blocking
@@ -1117,55 +1132,77 @@ export async function saveCurrentRepToIndexedDb(rep: any): Promise<void> {
  * Loads snapshot from IndexedDB into localStorage safely without overwriting pending local modifications
  */
 export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
-  if (typeof indexedDB === 'undefined') return false;
   try {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('alkarrar_sync_db', 2);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+    if (typeof indexedDB !== 'undefined') {
+      let db: IDBDatabase | null = null;
+      try {
+        db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const req = indexedDB.open('alkarrar_sync_db', 2);
+          req.onupgradeneeded = (ev: any) => {
+            try {
+              const upgradeDb = ev.target?.result;
+              if (upgradeDb && !upgradeDb.objectStoreNames.contains('pending_actions')) {
+                upgradeDb.createObjectStore('pending_actions', { keyPath: 'id' });
+              }
+            } catch (upErr) {}
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
 
-    if (!db.objectStoreNames.contains('pending_actions')) return false;
+        if (db && db.objectStoreNames.contains('pending_actions')) {
+          const item = await new Promise<any>((resolve) => {
+            try {
+              const tx = db!.transaction('pending_actions', 'readonly');
+              const store = tx.objectStore('pending_actions');
+              const req = store.get('__meta_local_snapshot__');
+              req.onsuccess = () => resolve(req.result);
+              req.onerror = () => resolve(null);
+            } catch (txErr) {
+              resolve(null);
+            }
+          });
 
-    const item = await new Promise<any>((resolve) => {
-      const tx = db.transaction('pending_actions', 'readonly');
-      const store = tx.objectStore('pending_actions');
-      const req = store.get('__meta_local_snapshot__');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-    });
+          const snapshot = item?.payload || item?.snapshot;
+          if (snapshot && typeof snapshot === 'object' && ((Array.isArray(snapshot.contracts) && snapshot.contracts.length > 0) || (Array.isArray(snapshot.payments) && snapshot.payments.length > 0))) {
+            if (Array.isArray(snapshot.deletedIds) && snapshot.deletedIds.length > 0) {
+              markRecordAsDeleted(snapshot.deletedIds);
+            }
+            if (Array.isArray(snapshot.payments)) {
+              const merged = mergeRemoteWithPendingLocal('payments', snapshot.payments);
+              setLocalCache('payments', merged);
+            }
+            if (Array.isArray(snapshot.customers)) {
+              const mappedCusts = snapshot.customers.map((cu: any) => mapRow('customers', cu));
+              setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
+            }
+            if (Array.isArray(snapshot.contracts)) {
+              const merged = mergeRemoteWithPendingLocal('contracts', snapshot.contracts);
+              const currentPayments = getLocalCache<any>('payments');
+              const recalculated = recalculateAllContractsFromPayments(merged, currentPayments, false);
+              setLocalCache('contracts', recalculated);
+            }
+            applyServerClearedLocations(snapshot.clearedLocationContractIds, snapshot.deletedIds);
+            if (Array.isArray(snapshot.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', snapshot.inventory));
+            if (Array.isArray(snapshot.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', snapshot.reps));
+            if (Array.isArray(snapshot.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', snapshot.funds));
+            if (Array.isArray(snapshot.customerLists)) setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', snapshot.customerLists));
+            if (Array.isArray(snapshot.employees)) setLocalCache('employees', mergeRemoteWithPendingLocal('employees', snapshot.employees));
+            if (Array.isArray(snapshot.fundTx)) setLocalCache('fund_transactions', mergeRemoteWithPendingLocal('fund_transactions', snapshot.fundTx));
+            if (Array.isArray(snapshot.empTx)) setLocalCache('employee_transactions', mergeRemoteWithPendingLocal('employee_transactions', snapshot.empTx));
+            if (Array.isArray(snapshot.appointments)) setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', snapshot.appointments));
 
-    const snapshot = item?.payload || item?.snapshot;
-    if (snapshot && typeof snapshot === 'object') {
-      if (Array.isArray(snapshot.deletedIds) && snapshot.deletedIds.length > 0) {
-        markRecordAsDeleted(snapshot.deletedIds);
+            notifySubscribersRefresh(true);
+            return true;
+          }
+        }
+      } catch (idbErr) {
+        // Fall through cleanly to bundled initial_snapshot.json
+      } finally {
+        try {
+          if (db) db.close();
+        } catch (closeErr) {}
       }
-      if (Array.isArray(snapshot.payments)) {
-        const merged = mergeRemoteWithPendingLocal('payments', snapshot.payments);
-        setLocalCache('payments', merged);
-      }
-      if (Array.isArray(snapshot.customers)) {
-        const mappedCusts = snapshot.customers.map((cu: any) => mapRow('customers', cu));
-        setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
-      }
-      if (Array.isArray(snapshot.contracts)) {
-        const merged = mergeRemoteWithPendingLocal('contracts', snapshot.contracts);
-        const currentPayments = getLocalCache<any>('payments');
-        const recalculated = recalculateAllContractsFromPayments(merged, currentPayments, false);
-        setLocalCache('contracts', recalculated);
-      }
-      applyServerClearedLocations(snapshot.clearedLocationContractIds, snapshot.deletedIds);
-      if (Array.isArray(snapshot.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', snapshot.inventory));
-      if (Array.isArray(snapshot.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', snapshot.reps));
-      if (Array.isArray(snapshot.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', snapshot.funds));
-      if (Array.isArray(snapshot.customerLists)) setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', snapshot.customerLists));
-      if (Array.isArray(snapshot.employees)) setLocalCache('employees', mergeRemoteWithPendingLocal('employees', snapshot.employees));
-      if (Array.isArray(snapshot.fundTx)) setLocalCache('fund_transactions', mergeRemoteWithPendingLocal('fund_transactions', snapshot.fundTx));
-      if (Array.isArray(snapshot.empTx)) setLocalCache('employee_transactions', mergeRemoteWithPendingLocal('employee_transactions', snapshot.empTx));
-      if (Array.isArray(snapshot.appointments)) setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', snapshot.appointments));
-
-      notifySubscribersRefresh();
-      return true;
     }
 
     // Fallback: If IndexedDB snapshot was empty (e.g. freshly installed APK on mobile),
@@ -1178,63 +1215,75 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
       if (snapRes && snapRes.ok) {
         const bundled = await snapRes.json().catch(() => null);
         if (bundled && typeof bundled === 'object') {
+          const isFreshEmptyContracts = getLocalCache('contracts').length === 0;
+
           const bundledPaymentsRaw = Array.isArray(bundled.payments) ? bundled.payments : [];
           const mappedPayments = bundledPaymentsRaw.map((p: any) => mapRow('payments', p));
-          if (mappedPayments.length > 0 && getLocalCache('payments').length === 0) {
-            setLocalCache('payments', mappedPayments);
+          if (mappedPayments.length > 0 && (getLocalCache('payments').length === 0 || isFreshEmptyContracts)) {
+            setLocalCache('payments', mergeRemoteWithPendingLocal('payments', mappedPayments));
           }
 
-          if (Array.isArray(bundled.customers) && getLocalCache('customers').length === 0) {
-            setLocalCache('customers', bundled.customers.map((cu: any) => mapRow('customers', cu)));
+          if (Array.isArray(bundled.customers) && (getLocalCache('customers').length === 0 || isFreshEmptyContracts)) {
+            const mappedCusts = bundled.customers.map((cu: any) => mapRow('customers', cu));
+            setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
           }
 
-          if (Array.isArray(bundled.contracts) && getLocalCache('contracts').length === 0) {
+          if (Array.isArray(bundled.contracts) && isFreshEmptyContracts) {
             const mappedContracts = bundled.contracts.map((c: any) => mapRow('contracts', c));
+            const mergedContracts = mergeRemoteWithPendingLocal('contracts', mappedContracts);
             const currentPayments = getLocalCache<any>('payments');
-            const recalculated = recalculateAllContractsFromPayments(mappedContracts, currentPayments, false);
+            const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
             setLocalCache('contracts', recalculated);
           }
 
-          if (Array.isArray(bundled.appointments) && getLocalCache('appointments').length === 0) {
-            setLocalCache('appointments', bundled.appointments.map((a: any) => mapRow('appointments', a)));
+          if (Array.isArray(bundled.appointments) && (getLocalCache('appointments').length === 0 || isFreshEmptyContracts)) {
+            const mappedApts = bundled.appointments.map((a: any) => mapRow('appointments', a));
+            setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', mappedApts));
           }
 
           const rawLists = bundled.customer_lists || bundled.customerLists;
-          if (Array.isArray(rawLists) && getLocalCache('customer_lists').length === 0) {
-            setLocalCache('customer_lists', rawLists.map((l: any) => mapRow('customer_lists', l)));
+          if (Array.isArray(rawLists) && rawLists.length > 0 && (getLocalCache('customer_lists').length === 0 || isFreshEmptyContracts)) {
+            const mappedLists = rawLists.map((l: any) => mapRow('customer_lists', l));
+            setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', mappedLists));
           }
 
           const rawFunds = bundled.cash_funds || bundled.funds;
-          if (Array.isArray(rawFunds) && getLocalCache('funds').length === 0) {
-            setLocalCache('funds', rawFunds.map((f: any) => mapRow('funds', f)));
+          if (Array.isArray(rawFunds) && rawFunds.length > 0 && (getLocalCache('funds').length === 0 || isFreshEmptyContracts)) {
+            const mappedFunds = rawFunds.map((f: any) => mapRow('funds', f));
+            setLocalCache('funds', mergeRemoteWithPendingLocal('funds', mappedFunds));
           }
 
           const rawInventory = bundled.inventory_items || bundled.inventory;
-          if (Array.isArray(rawInventory) && getLocalCache('inventory').length === 0) {
-            setLocalCache('inventory', rawInventory.map((inv: any) => mapRow('inventory', inv)));
+          if (Array.isArray(rawInventory) && rawInventory.length > 0 && (getLocalCache('inventory').length === 0 || isFreshEmptyContracts)) {
+            const mappedInv = rawInventory.map((inv: any) => mapRow('inventory', inv));
+            setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', mappedInv));
           }
 
-          if (Array.isArray(bundled.employees) && getLocalCache('employees').length === 0) {
-            setLocalCache('employees', bundled.employees.map((e: any) => mapRow('employees', e)));
+          if (Array.isArray(bundled.employees) && bundled.employees.length > 0 && (getLocalCache('employees').length === 0 || isFreshEmptyContracts)) {
+            const mappedEmps = bundled.employees.map((e: any) => mapRow('employees', e));
+            setLocalCache('employees', mergeRemoteWithPendingLocal('employees', mappedEmps));
           }
 
           const rawFundTx = bundled.fund_transactions || bundled.fundTx;
-          if (Array.isArray(rawFundTx) && getLocalCache('fund_transactions').length === 0) {
-            setLocalCache('fund_transactions', rawFundTx.map((tx: any) => mapRow('fund_transactions', tx)));
+          if (Array.isArray(rawFundTx) && rawFundTx.length > 0 && (getLocalCache('fund_transactions').length === 0 || isFreshEmptyContracts)) {
+            const mappedFt = rawFundTx.map((tx: any) => mapRow('fund_transactions', tx));
+            setLocalCache('fund_transactions', mergeRemoteWithPendingLocal('fund_transactions', mappedFt));
           }
 
           const rawEmpTx = bundled.employee_transactions || bundled.empTx;
-          if (Array.isArray(rawEmpTx) && getLocalCache('employee_transactions').length === 0) {
-            setLocalCache('employee_transactions', rawEmpTx.map((tx: any) => mapRow('employee_transactions', tx)));
+          if (Array.isArray(rawEmpTx) && rawEmpTx.length > 0 && (getLocalCache('employee_transactions').length === 0 || isFreshEmptyContracts)) {
+            const mappedEt = rawEmpTx.map((tx: any) => mapRow('employee_transactions', tx));
+            setLocalCache('employee_transactions', mergeRemoteWithPendingLocal('employee_transactions', mappedEt));
           }
 
-          if (Array.isArray(bundled.reps) && getLocalCache('reps').length === 0) {
-            setLocalCache('reps', bundled.reps.map((r: any) => mapRow('reps', r)));
+          if (Array.isArray(bundled.reps) && bundled.reps.length > 0 && (getLocalCache('reps').length === 0 || isFreshEmptyContracts)) {
+            const mappedReps = bundled.reps.map((r: any) => mapRow('reps', r));
+            setLocalCache('reps', mergeRemoteWithPendingLocal('reps', mappedReps));
           }
 
           applyServerClearedLocations();
           mirrorLocalSnapshotToIndexedDb(false).catch(() => {});
-          notifySubscribersRefresh();
+          notifySubscribersRefresh(true);
           return true;
         }
       }

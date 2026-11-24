@@ -622,9 +622,9 @@ export default function App() {
       versionTick = (versionTick + 1) % 3;
       if (versionTick !== 0) return;
 
-      // Quick lightweight version verification (~every 15s when idle & queue empty)
+      // Immediate lightweight version verification on first tick (~3s) and then every 15s when idle
       try {
-        const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 4000).catch(() => null);
+        const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 4500).catch(() => null);
         if (res && res.ok) {
           setSyncError(false);
           const data = await res.json().catch(() => null);
@@ -635,11 +635,24 @@ export default function App() {
               reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
             }
           }
+        } else {
+          setSyncError(true);
         }
       } catch (e) {
-        // ignore transient health check
+        setSyncError(true);
       }
     }, 5000);
+
+    // Quick startup server reachability probe after 2.5s so header status reflects real backend connectivity
+    const startupHealthTimer = setTimeout(() => {
+      fetchWithFallback('/api/health', { method: 'GET', cache: 'no-store' }, 4500)
+        .then((res) => {
+          setSyncError(!(res && res.ok));
+        })
+        .catch(() => {
+          setSyncError(true);
+        });
+    }, 2500);
 
     let capAppStateHandle: any = null;
     let capPauseHandle: any = null;
@@ -670,6 +683,7 @@ export default function App() {
     }
 
     return () => {
+      clearTimeout(startupHealthTimer);
       clearInterval(connectionHeartbeatInterval);
       unsubscribeQueue();
       window.removeEventListener('online', handleOnline);
@@ -1022,6 +1036,7 @@ export default function App() {
       (err) => {
         console.warn('Contracts sync notice:', err);
         setIsSyncing(false);
+        setSyncError(true);
       }
     );
 

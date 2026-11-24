@@ -152,6 +152,8 @@ async function getCandidateServerOrigins() {
 
   // Fallback candidate origins for Cloud PostgreSQL server
   const defaults = [
+    'http://72.62.158.128',
+    'http://72.62.158.128:3000',
     'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     'http://localhost:3000',
@@ -164,39 +166,12 @@ async function getCandidateServerOrigins() {
   return origins;
 }
 
-// Helper: Read JWT & HMAC Key from IndexedDB and compute HMAC-SHA256 signature headers
-async function swBuildSignedHeaders(method, endpointPath, bodyStr = '') {
-  const headers = { 'Content-Type': 'application/json' };
-  try {
-    const db = await openSyncDatabase(DB_NAME, STORE_NAME);
-    const meta = await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).get('__meta_auth_session__');
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-    });
-    const token = meta?.payload?.token;
-    const hmacKey = meta?.payload?.hmacKey;
-    if (!token || token === 'offline_pending') return headers;
-
-    headers['Authorization'] = `Bearer ${token}`;
-    if (hmacKey && self.crypto && self.crypto.subtle) {
-      const enc = new TextEncoder();
-      const timestamp = String(Date.now());
-      const nonce = (self.crypto.randomUUID ? self.crypto.randomUUID() : `sw_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-      const bodyDigest = await self.crypto.subtle.digest('SHA-256', enc.encode(bodyStr || ''));
-      const bodyHash = Array.from(new Uint8Array(bodyDigest)).map((b) => b.toString(16).padStart(2, '0')).join('');
-      const cleanPath = String(endpointPath || '').split('?')[0];
-      const canonical = `${method.toUpperCase()}|${cleanPath}|${timestamp}|${nonce}|${bodyHash}`;
-      const key = await self.crypto.subtle.importKey('raw', enc.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-      const sigBuf = await self.crypto.subtle.sign('HMAC', key, enc.encode(canonical));
-      const signature = Array.from(new Uint8Array(sigBuf)).map((b) => b.toString(16).padStart(2, '0')).join('');
-      headers['X-Timestamp'] = timestamp;
-      headers['X-Nonce'] = nonce;
-      headers['X-Signature'] = signature;
-    }
-  } catch (e) {}
-  return headers;
+// Helper: Plain JSON headers without any HMAC signing or auth protection
+async function swBuildSignedHeaders(_method, _endpointPath, _bodyStr = '') {
+  return {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
 }
 
 // Upload a single action via individual REST endpoint as fallback
@@ -209,6 +184,7 @@ async function uploadSingleActionViaRest(action, origins) {
   switch (type) {
     case 'CREATE_PAYMENT':
     case 'RECORD_PAYMENT':
+    case 'ADD_PAYMENT':
       endpointPath = '/api/payments';
       method = 'POST';
       break;
@@ -268,6 +244,10 @@ async function uploadSingleActionViaRest(action, origins) {
       endpointPath = docId ? `/api/funds/${docId}` : '';
       method = 'DELETE';
       break;
+    case 'REORDER_FUNDS':
+      endpointPath = '/api/funds/reorder';
+      method = 'POST';
+      break;
     case 'CREATE_CUSTOMER_LIST':
       endpointPath = '/api/customer-lists';
       method = 'POST';
@@ -279,6 +259,10 @@ async function uploadSingleActionViaRest(action, origins) {
     case 'DELETE_CUSTOMER_LIST':
       endpointPath = docId ? `/api/customer-lists/${docId}` : '';
       method = 'DELETE';
+      break;
+    case 'REORDER_CUSTOMER_LISTS':
+      endpointPath = '/api/customer-lists/reorder';
+      method = 'POST';
       break;
     case 'CREATE_EMPLOYEE':
       endpointPath = '/api/employees';
@@ -298,6 +282,7 @@ async function uploadSingleActionViaRest(action, origins) {
       method = 'POST';
       break;
     case 'UPDATE_FUND_TRANSACTION':
+    case 'UPDATE_FUND_TX':
       endpointPath = docId ? `/api/fund-transactions/${docId}` : '/api/fund-transactions';
       method = 'PUT';
       break;
@@ -312,6 +297,7 @@ async function uploadSingleActionViaRest(action, origins) {
       method = 'POST';
       break;
     case 'UPDATE_EMPLOYEE_TRANSACTION':
+    case 'UPDATE_EMPLOYEE_TX':
       endpointPath = docId ? `/api/employee-transactions/${docId}` : '/api/employee-transactions';
       method = 'PUT';
       break;
@@ -360,13 +346,12 @@ async function uploadSingleActionViaRest(action, origins) {
 
   const bodyStr = method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : '';
   const signedHeaders = await swBuildSignedHeaders(method, endpointPath, bodyStr);
-  if (!signedHeaders['Authorization']) return false;
 
   for (const origin of origins) {
     try {
       const url = `${origin}${endpointPath}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
+      const timer = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(url, {
         method,
         headers: signedHeaders,
@@ -374,7 +359,7 @@ async function uploadSingleActionViaRest(action, origins) {
         signal: controller.signal,
       });
       clearTimeout(timer);
-      if (res && res.status === 409) {
+      if (res && (res.status === 409 || (method === 'DELETE' && res.status === 404))) {
         return true;
       }
       if (res && res.ok && res.status >= 200 && res.status < 300) {
@@ -410,13 +395,12 @@ async function flushPendingActionsInBackground() {
     const origins = await getCandidateServerOrigins();
     const processedIds = [];
 
-    // Path 1: Try batch sync endpoint in chunks of 200
-    const SW_BATCH_CHUNK = 200;
+    // Path 1: Try batch sync endpoint in fast 100-item chunks
+    const SW_BATCH_CHUNK = 100;
     for (let i = 0; i < actions.length; i += SW_BATCH_CHUNK) {
       const chunkActions = actions.slice(i, i + SW_BATCH_CHUNK);
       const chunkBody = JSON.stringify({ actions: chunkActions });
       const batchHeaders = await swBuildSignedHeaders('POST', '/api/sync/batch', chunkBody);
-      if (!batchHeaders['Authorization']) break;
       let chunkDone = false;
 
       for (const origin of origins) {
@@ -424,7 +408,7 @@ async function flushPendingActionsInBackground() {
         try {
           const batchUrl = `${origin}/api/sync/batch`;
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 6000);
+          const timer = setTimeout(() => controller.abort(), 25000);
           const attempt = await fetch(batchUrl, {
             method: 'POST',
             headers: batchHeaders,
@@ -473,31 +457,29 @@ async function flushPendingActionsInBackground() {
     if (remainingAfterRest.length > 0) {
       const beaconBody = JSON.stringify({ actions: remainingAfterRest });
       const beaconHeaders = await swBuildSignedHeaders('POST', '/api/sync/beacon', beaconBody);
-      if (beaconHeaders['Authorization']) {
-        for (const origin of origins) {
-          try {
-            const beaconUrl = `${origin}/api/sync/beacon`;
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 6000);
-            const bAttempt = await fetch(beaconUrl, {
-              method: 'POST',
-              headers: beaconHeaders,
-              body: beaconBody,
-              signal: controller.signal,
-            });
-            clearTimeout(timer);
-            if (bAttempt && bAttempt.ok) {
-              const bData = await bAttempt.json().catch(() => ({}));
-              if (Array.isArray(bData.processedIds)) {
-                processedIds.push(...bData.processedIds);
-                break;
-              } else if (bData.success) {
-                processedIds.push(...remainingAfterRest.map((a) => a.id));
-                break;
-              }
+      for (const origin of origins) {
+        try {
+          const beaconUrl = `${origin}/api/sync/beacon`;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 6000);
+          const bAttempt = await fetch(beaconUrl, {
+            method: 'POST',
+            headers: beaconHeaders,
+            body: beaconBody,
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (bAttempt && bAttempt.ok) {
+            const bData = await bAttempt.json().catch(() => ({}));
+            if (Array.isArray(bData.processedIds)) {
+              processedIds.push(...bData.processedIds);
+              break;
+            } else if (bData.success) {
+              processedIds.push(...remainingAfterRest.map((a) => a.id));
+              break;
             }
-          } catch (bErr) {}
-        }
+          }
+        } catch (bErr) {}
       }
     }
 

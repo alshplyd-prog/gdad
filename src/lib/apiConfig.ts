@@ -1,4 +1,4 @@
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { Network } from '@capacitor/network';
 
 /**
@@ -63,9 +63,97 @@ try {
   }
 } catch (e) {}
 
+function normalizeHeadersToRecord(headers?: HeadersInit): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headers) return out;
+  try {
+    if (headers instanceof Headers) {
+      headers.forEach((v, k) => {
+        out[k] = v;
+      });
+    } else if (Array.isArray(headers)) {
+      for (const [k, v] of headers) {
+        if (k) out[k] = v;
+      }
+    } else {
+      for (const [k, v] of Object.entries(headers)) {
+        if (k && v !== undefined && v !== null) out[k] = String(v);
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
+async function nativeCapacitorHttpRequest(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const method = (init?.method || 'GET').toUpperCase();
+  const reqHeaders = normalizeHeadersToRecord(init?.headers);
+  let requestData: any = undefined;
+
+  if (init?.body !== undefined && init?.body !== null && method !== 'GET' && method !== 'HEAD') {
+    if (typeof init.body === 'string') {
+      try {
+        requestData = JSON.parse(init.body);
+      } catch (e) {
+        requestData = init.body;
+      }
+    } else {
+      requestData = init.body;
+    }
+  }
+
+  const natRes = await CapacitorHttp.request({
+    url,
+    method,
+    headers: reqHeaders,
+    ...(requestData !== undefined ? { data: requestData } : {}),
+    connectTimeout: Math.min(timeoutMs, 4500),
+    readTimeout: timeoutMs,
+  });
+
+  const status = Number(natRes?.status || 0);
+  if (!status || status < 100 || status > 599) {
+    throw new Error(`Native HTTP invalid status: ${status}`);
+  }
+
+  const respHeaders = new Headers();
+  if (natRes?.headers && typeof natRes.headers === 'object') {
+    for (const [k, v] of Object.entries(natRes.headers)) {
+      if (k && k.toLowerCase() !== 'null' && v !== undefined && v !== null) {
+        try {
+          respHeaders.set(String(k), String(v));
+        } catch (e) {}
+      }
+    }
+  }
+
+  let bodyText: string | null = null;
+  if (status !== 204 && status !== 304 && natRes?.data !== undefined && natRes?.data !== null) {
+    if (typeof natRes.data === 'string') {
+      bodyText = natRes.data;
+    } else {
+      bodyText = JSON.stringify(natRes.data);
+      if (!respHeaders.get('content-type')) {
+        respHeaders.set('content-type', 'application/json; charset=utf-8');
+      }
+    }
+  }
+
+  return new Response(bodyText, {
+    status,
+    headers: respHeaders,
+  });
+}
+
 async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
+  const isExternalHttp = url.startsWith('http://') || url.startsWith('https://');
+  const canUseNativeHttp =
+    isExternalHttp &&
+    isNativeOrApkEnvironment() &&
+    CapacitorHttp &&
+    typeof CapacitorHttp.request === 'function';
+
   let timer: any;
+  const controller = new AbortController();
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -75,6 +163,19 @@ async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: n
         reject(new DOMException('Timeout', 'AbortError'));
       }, timeoutMs);
     });
+
+    if (canUseNativeHttp) {
+      try {
+        return await Promise.race([nativeCapacitorHttpRequest(url, init, timeoutMs), timeoutPromise]);
+      } catch (nativeErr: any) {
+        // Only fall back to browser fetch if CapacitorHttp plugin itself is unavailable
+        const msg = String(nativeErr?.message || '');
+        if (!msg.toLowerCase().includes('not implemented') && !msg.toLowerCase().includes('unavailable')) {
+          throw nativeErr;
+        }
+      }
+    }
+
     const fetchPromise = fetch(url, {
       ...init,
       signal: controller.signal,

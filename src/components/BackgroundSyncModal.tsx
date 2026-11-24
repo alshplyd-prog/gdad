@@ -44,7 +44,7 @@ import {
   run5DayPruneAndPollingInspection,
   reconcileAllLocalWithDatabase
 } from '../lib/postgresClient';
-import { getCustomServerUrl, setCustomServerUrl, checkServerHealth } from '../lib/apiConfig';
+import { getCustomServerUrl, setCustomServerUrl, checkServerHealth, getApiBaseUrl } from '../lib/apiConfig';
 
 interface BackgroundSyncModalProps {
   isOpen: boolean;
@@ -74,6 +74,9 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [pruneStatus, setPruneStatus] = useState(get5DayPruneAndPollStatus());
   const [isPruningNow, setIsPruningNow] = useState(false);
+  const [serverUrlInput, setServerUrlInput] = useState<string>(() => getCustomServerUrl() || getApiBaseUrl());
+  const [isCheckingServer, setIsCheckingServer] = useState(false);
+  const [serverStatusInfo, setServerStatusInfo] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -161,6 +164,35 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
       showToast(isAr ? `فشل المزامنة: ${err?.message || err}` : `Sync failed: ${err?.message || err}`);
     } finally {
       setIsSyncing(false);
+    }
+  };
+
+  const handleSaveAndTestServer = async () => {
+    const clean = serverUrlInput.trim().replace(/\/+$/, '');
+    setIsCheckingServer(true);
+    setServerStatusInfo(null);
+    try {
+      if (clean) {
+        setCustomServerUrl(clean);
+      }
+      const res = await checkServerHealth(clean || undefined);
+      if (res.ok) {
+        setServerStatusInfo({
+          ok: true,
+          msg: isAr ? `متصل بنجاح (${res.latencyMs}ms) - تم تحديث البيانات` : `Connected (${res.latencyMs}ms)`,
+        });
+        await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true }).catch(() => {});
+        await loadHealthAndQueue();
+      } else {
+        setServerStatusInfo({
+          ok: false,
+          msg: res.error || (isAr ? 'تعذر الوصول إلى السيرفر' : 'Server unreachable'),
+        });
+      }
+    } catch (e: any) {
+      setServerStatusInfo({ ok: false, msg: e?.message || 'خطأ في الاتصال بالسيرفر' });
+    } finally {
+      setIsCheckingServer(false);
     }
   };
 
@@ -294,6 +326,50 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 <span>{isAr ? 'اختبار النبضة' : 'Test Heartbeat'}</span>
               </button>
             </div>
+          </div>
+
+          {/* Server Connection & URL Editor Card */}
+          <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-black text-slate-700 dark:text-slate-200">
+                <Server className="w-4 h-4 text-teal-600" />
+                <span>{isAr ? 'عنوان السيرفر والمزامنة المباشرة' : 'Backend Server URL'}</span>
+              </div>
+              <span className="text-[10px] font-mono text-slate-500 truncate max-w-[180px]" dir="ltr">
+                {getApiBaseUrl()}
+              </span>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                dir="ltr"
+                value={serverUrlInput}
+                onChange={(e) => setServerUrlInput(e.target.value)}
+                placeholder="http://72.62.158.128"
+                className="flex-1 px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-xs font-mono text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+              <button
+                type="button"
+                onClick={handleSaveAndTestServer}
+                disabled={isCheckingServer}
+                className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black flex items-center justify-center gap-1.5 shadow-xs transition-all cursor-pointer shrink-0"
+              >
+                <Globe className={`w-3.5 h-3.5 ${isCheckingServer ? 'animate-spin' : ''}`} />
+                <span>{isAr ? (isCheckingServer ? 'جاري الفحص...' : 'فحص ومزامنة') : 'Test & Sync'}</span>
+              </button>
+            </div>
+            {serverStatusInfo && (
+              <div
+                className={`p-2 rounded-lg text-[11px] font-bold flex items-center gap-1.5 ${
+                  serverStatusInfo.ok
+                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800'
+                    : 'bg-rose-50 text-rose-700 border border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-800'
+                }`}
+              >
+                {serverStatusInfo.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0" />}
+                <span>{serverStatusInfo.msg}</span>
+              </div>
+            )}
           </div>
 
           {/* Test Result Box */}
