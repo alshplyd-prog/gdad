@@ -3,7 +3,7 @@ import { fileDb } from './fileDb.ts';
 import { initializeDatabaseSchema } from './init.ts';
 
 export const isPgConfigured = () => {
-  if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+  if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
     return true;
   }
   if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {

@@ -43,9 +43,25 @@ import {
 import {
   get5DayPruneAndPollStatus,
   run5DayPruneAndPollingInspection,
-  reconcileAllLocalWithDatabase
+  reconcileAllLocalWithDatabase,
+  forceRefreshAllDataFromPostgres
 } from '../lib/postgresClient';
-import { getCustomServerUrl, setCustomServerUrl, setActiveWorkingServer, checkServerHealth, getApiBaseUrl, isNetworkConnected, testBatchSyncEndpoint, CANDIDATE_SERVERS, isNativeOrApkEnvironment } from '../lib/apiConfig';
+import {
+  getCustomServerUrl,
+  setCustomServerUrl,
+  setActiveWorkingServer,
+  checkServerHealth,
+  getApiBaseUrl,
+  isNetworkConnected,
+  testBatchSyncEndpoint,
+  CANDIDATE_SERVERS,
+  isNativeOrApkEnvironment,
+  validateServerUrl,
+  probeAllCandidateServers,
+  repairAndResetServerUrl,
+  HOSTINGER_DEFAULT_SERVER,
+  ServerProbeResult,
+} from '../lib/apiConfig';
 
 interface BackgroundSyncModalProps {
   isOpen: boolean;
@@ -80,6 +96,7 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
   const [serverStatusInfo, setServerStatusInfo] = useState<{ ok: boolean; msg: string } | null>(null);
   const [batchTestInfo, setBatchTestInfo] = useState<{ ok: boolean; msg: string } | null>(null);
   const [isTestingBatch, setIsTestingBatch] = useState(false);
+  const [candidateProbes, setCandidateProbes] = useState<ServerProbeResult[] | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -105,6 +122,8 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
+      setServerUrlInput(getCustomServerUrl() || getApiBaseUrl());
+      setCandidateProbes(null);
       let autoFlushedOnOpen = false;
       loadHealthAndQueue().then(async (items) => {
         const online =
@@ -181,15 +200,32 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
     const clean = serverUrlInput.trim().replace(/\/+$/, '');
     setIsCheckingServer(true);
     setServerStatusInfo(null);
+    setCandidateProbes(null);
     try {
       if (clean) {
-        setCustomServerUrl(clean);
-        setActiveWorkingServer(clean);
+        const check = validateServerUrl(clean);
+        if (!check.valid) {
+          const probes = await probeAllCandidateServers().catch(() => null);
+          if (probes) setCandidateProbes(probes);
+          setServerStatusInfo({
+            ok: false,
+            msg: check.error || (isAr ? 'عنوان السيرفر غير مكتمل أو غير صالح' : 'Invalid server URL'),
+          });
+          return;
+        }
       }
-      const res = await checkServerHealth(clean || undefined);
+
+      const targetToTest = clean ? validateServerUrl(clean).cleanUrl : undefined;
+      const res = await checkServerHealth(targetToTest);
       if (res.ok) {
+        if (targetToTest) {
+          setCustomServerUrl(targetToTest);
+          setActiveWorkingServer(targetToTest);
+          setServerUrlInput(targetToTest);
+        }
         const flushRes = await flushPendingQueue().catch(() => ({ flushed: 0, remaining: queueItems.length }));
         await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true }).catch(() => {});
+        await forceRefreshAllDataFromPostgres().catch(() => {});
         const updatedQueue = await loadHealthAndQueue();
         const lastErr = updatedQueue.length > 0 ? getLastSyncUploadError() : null;
         setServerStatusInfo({
@@ -199,13 +235,50 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
             : `Connected (${res.latencyMs}ms) - uploaded ${flushRes.flushed}, remaining: ${updatedQueue.length}`,
         });
       } else {
+        const probes = await probeAllCandidateServers(targetToTest).catch(() => null);
+        if (probes) setCandidateProbes(probes);
         setServerStatusInfo({
           ok: false,
-          msg: res.error || (isAr ? 'تعذر الوصول إلى السيرفر' : 'Server unreachable'),
+          msg: res.error || (isAr ? 'تعذر الوصول إلى السيرفر (لم يتم حفظ العنوان غير المتصل)' : 'Server unreachable'),
         });
       }
     } catch (e: any) {
       setServerStatusInfo({ ok: false, msg: e?.message || 'خطأ في الاتصال بالسيرفر' });
+    } finally {
+      setIsCheckingServer(false);
+    }
+  };
+
+  const handleResetToDefaultServer = async () => {
+    setIsCheckingServer(true);
+    setServerStatusInfo(null);
+    setBatchTestInfo(null);
+    try {
+      const { activeUrl, probes } = await repairAndResetServerUrl();
+      setServerUrlInput(activeUrl || HOSTINGER_DEFAULT_SERVER);
+      setCandidateProbes(probes);
+      const anyOk = probes.find((p) => p.ok);
+      if (anyOk) {
+        const flushRes = await flushPendingQueue().catch(() => ({ flushed: 0, remaining: queueItems.length }));
+        await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true }).catch(() => {});
+        await forceRefreshAllDataFromPostgres().catch(() => {});
+        const updatedQueue = await loadHealthAndQueue();
+        setServerStatusInfo({
+          ok: true,
+          msg: isAr
+            ? `تمت استعادة الربط على (${anyOk.url}) بنجاح (${anyOk.latencyMs}ms) - تم رفع ${flushRes.flushed} معلق، المتبقي: ${updatedQueue.length}`
+            : `Connected to ${anyOk.url} (${anyOk.latencyMs}ms)`,
+        });
+      } else {
+        setServerStatusInfo({
+          ok: false,
+          msg: isAr
+            ? `تم ضبط العنوان الافتراضي (${HOSTINGER_DEFAULT_SERVER}) لكن لم يستجب أي خادم من القائمة أدناه`
+            : `Reset to ${HOSTINGER_DEFAULT_SERVER}, but all probes failed`,
+        });
+      }
+    } catch (e: any) {
+      setServerStatusInfo({ ok: false, msg: e?.message || 'تعذر إعادة الضبط' });
     } finally {
       setIsCheckingServer(false);
     }
@@ -216,7 +289,8 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
     setIsTestingBatch(true);
     setBatchTestInfo(null);
     try {
-      const res = await testBatchSyncEndpoint(clean || undefined);
+      const target = clean || undefined;
+      const res = await testBatchSyncEndpoint(target);
       if (res.ok) {
         setBatchTestInfo({
           ok: true,
@@ -396,6 +470,15 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 <Globe className={`w-3.5 h-3.5 ${isCheckingServer ? 'animate-spin' : ''}`} />
                 <span>{isAr ? (isCheckingServer ? 'جاري الفحص...' : 'فحص ومزامنة') : 'Test & Sync'}</span>
               </button>
+              <button
+                type="button"
+                onClick={handleResetToDefaultServer}
+                disabled={isCheckingServer}
+                className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black flex items-center justify-center gap-1.5 shadow-xs transition-all cursor-pointer shrink-0"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingServer ? 'animate-spin' : ''}`} />
+                <span>{isAr ? 'الافتراضي (72.62.158.128)' : 'Reset Default'}</span>
+              </button>
             </div>
             {serverStatusInfo && (
               <div
@@ -406,7 +489,19 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 }`}
               >
                 {serverStatusInfo.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0" />}
-                <span>{serverStatusInfo.msg}</span>
+                <span className="break-all">{serverStatusInfo.msg}</span>
+              </div>
+            )}
+
+            {candidateProbes && candidateProbes.length > 0 && (
+              <div className="p-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-1 text-[10px] font-mono" dir="ltr">
+                <div className="font-bold text-slate-600 dark:text-slate-300">Candidate Server Probe:</div>
+                {candidateProbes.map((p) => (
+                  <div key={p.url} className={`flex items-center justify-between gap-2 ${p.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                    <span className="truncate">{p.url}</span>
+                    <span className="shrink-0">{p.ok ? `OK (${p.latencyMs}ms)` : `${p.error || 'FAIL'} (${p.latencyMs}ms)`}</span>
+                  </div>
+                ))}
               </div>
             )}
 

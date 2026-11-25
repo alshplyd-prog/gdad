@@ -57,7 +57,7 @@ import {
   openBatteryOptimizationSettings,
   openAutoStartSettings,
 } from '../lib/offlineQueue';
-import { checkServerHealth, getHostingerServerUrl, setHostingerServerUrl } from '../lib/apiConfig';
+import { checkServerHealth, getHostingerServerUrl, setHostingerServerUrl, validateServerUrl, HOSTINGER_DEFAULT_SERVER } from '../lib/apiConfig';
 import { forceRefreshAllDataFromPostgres, reconcileAllLocalWithDatabase } from '../lib/postgresClient';
 
 interface PrinterSettingsModalProps {
@@ -118,16 +118,26 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
   const handleTestAndSaveHostingerUrl = async () => {
-    if (!hostingerUrlInput.trim()) {
-      setStatusMessage({ text: isAr ? 'يرجى إدخال رابط سيرفر هوستجر صالح' : 'Please enter valid Hostinger URL', type: 'error' });
+    const check = validateServerUrl(hostingerUrlInput);
+    if (!check.valid) {
+      setServerHealth({
+        tested: true,
+        ok: false,
+        message: check.error || (isAr ? 'يرجى إدخال رابط سيرفر هوستجر صالح' : 'Please enter valid Hostinger URL'),
+      });
+      setStatusMessage({
+        text: check.error || (isAr ? 'يرجى إدخال رابط سيرفر هوستجر صالح' : 'Please enter valid Hostinger URL'),
+        type: 'error',
+      });
       return;
     }
-    const cleanUrl = hostingerUrlInput.trim().replace(/\/+$/, '');
+    const cleanUrl = check.cleanUrl;
     setIsTestingServer(true);
     try {
-      setHostingerServerUrl(cleanUrl);
       const health = await checkServerHealth(cleanUrl);
       if (health.ok) {
+        setHostingerServerUrl(cleanUrl);
+        setHostingerUrlInput(cleanUrl);
         setServerHealth({
           tested: true,
           ok: true,
@@ -142,9 +152,9 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
         setServerHealth({
           tested: true,
           ok: false,
-          message: isAr ? `تنبيه الاتصال: ${health.error}` : `Connection notice: ${health.error}`,
+          message: isAr ? `فشل الاتصال بالسيرفر (${cleanUrl}): ${health.error}` : `Connection failed: ${health.error}`,
         });
-        setStatusMessage({ text: isAr ? `تم حفظ رابط هوستجر (تم اختبار الرابط): ${health.error}` : `Hostinger URL set: ${health.error}`, type: 'info' });
+        setStatusMessage({ text: isAr ? `لم يتم الحفظ لعدم استجابة السيرفر: ${health.error}` : `Not saved - server unreachable: ${health.error}`, type: 'error' });
       }
     } catch (e: any) {
       setStatusMessage({ text: e?.message || 'خطأ أثناء اختبار الاتصال', type: 'error' });
@@ -244,6 +254,7 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       loadSavedData();
+      setHostingerUrlInput(getHostingerServerUrl() || HOSTINGER_DEFAULT_SERVER);
       flushPendingQueue().catch(() => {});
       setStatusMessage(null);
       setPairedDevices(null);

@@ -5,7 +5,7 @@ import { getAuthSession } from './securityClient';
 
 /**
  * Centralized API & Server Endpoint Resolver for Web and Android APK
- * استبدل الرابط أدناه برابط سيرفرك الحقيقي في Hostinger (مثال: http://72.62.158.128 أو https://your-domain.com)
+ * الرابط الافتراضي لسيرفر Hostinger: http://72.62.158.128
  */
 
 export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128';
@@ -27,21 +27,131 @@ function isLocalWebViewUrl(url: string): boolean {
     !lower ||
     lower.includes('localhost') ||
     lower.includes('127.0.0.1') ||
+    lower.includes('0.0.0.0') ||
     lower.startsWith('capacitor://') ||
     lower.startsWith('ionic://') ||
-    lower.startsWith('file://')
+    lower.startsWith('file://') ||
+    lower.startsWith('content://')
   );
 }
+
+/**
+ * Strict validator for external HTTP/HTTPS server URLs.
+ * Rejects incomplete/truncated IPv4 addresses (like http://72.62.158 missing .128),
+ * single-label hostnames, and Capacitor local WebView origins.
+ */
+export function validateServerUrl(rawUrl: string): {
+  valid: boolean;
+  cleanUrl: string;
+  error?: string;
+} {
+  const trimmed = (rawUrl || '').trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    return { valid: false, cleanUrl: '', error: 'يرجى إدخال عنوان السيرفر' };
+  }
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return {
+      valid: false,
+      cleanUrl: trimmed,
+      error: 'يجب أن يبدأ العنوان بـ http:// أو https:// (مثال: http://72.62.158.128)',
+    };
+  }
+  if (isLocalWebViewUrl(trimmed)) {
+    return {
+      valid: false,
+      cleanUrl: trimmed,
+      error: 'لا يمكن استخدام عنوان محلي (localhost / capacitor) كسيرفر خارجي',
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch (_e) {
+    return {
+      valid: false,
+      cleanUrl: trimmed,
+      error: 'صيغة عنوان السيرفر غير صالحة',
+    };
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { valid: false, cleanUrl: trimmed, error: 'بروتوكول غير مدعوم' };
+  }
+
+  const hostname = (parsed.hostname || '').trim();
+  if (!hostname || isLocalWebViewUrl(hostname)) {
+    return { valid: false, cleanUrl: trimmed, error: 'اسم المضيف أو IP غير صالح' };
+  }
+
+  // If hostname looks like an IPv4 attempt (digits & dots only), strictly require 4 valid octets (0-255)
+  if (/^[0-9.]+$/.test(hostname)) {
+    const octets = hostname.split('.');
+    if (octets.length !== 4 || octets.some((o) => o === '' || !/^\d{1,3}$/.test(o) || Number(o) > 255)) {
+      return {
+        valid: false,
+        cleanUrl: trimmed,
+        error: `عنوان الـ IP غير مكتمل (${hostname}) — يجب أن يتكون من 4 أجزاء مثل 72.62.158.128`,
+      };
+    }
+  } else if (!hostname.includes('.')) {
+    return {
+      valid: false,
+      cleanUrl: trimmed,
+      error: `اسم النطاق غير مكتمل (${hostname})`,
+    };
+  }
+
+  const normalizedOrigin = `${parsed.protocol}//${parsed.host}`;
+  return { valid: true, cleanUrl: normalizedOrigin };
+}
+
+export function isValidServerUrl(rawUrl: string): boolean {
+  return validateServerUrl(rawUrl).valid;
+}
+
+function purgeInvalidStoredServerKeys() {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const k1 = localStorage.getItem(SERVER_URL_STORAGE_KEY);
+      if (k1 && !isValidServerUrl(k1)) {
+        localStorage.removeItem(SERVER_URL_STORAGE_KEY);
+      }
+      const k2 = localStorage.getItem(LEGACY_CUSTOM_SERVER_KEY);
+      if (k2 && !isValidServerUrl(k2)) {
+        localStorage.removeItem(LEGACY_CUSTOM_SERVER_KEY);
+      }
+    }
+  } catch (_e) {}
+
+  try {
+    Preferences.get({ key: SERVER_URL_STORAGE_KEY })
+      .then((res) => {
+        if (res?.value && !isValidServerUrl(res.value)) {
+          Preferences.remove({ key: SERVER_URL_STORAGE_KEY }).catch(() => {});
+          Preferences.remove({ key: LEGACY_CUSTOM_SERVER_KEY }).catch(() => {});
+          Preferences.remove({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}` }).catch(() => {});
+        }
+      })
+      .catch(() => {});
+  } catch (_e) {}
+}
+
+purgeInvalidStoredServerKeys();
 
 export function getCustomServerUrl(): string {
   try {
     const primary = localStorage.getItem(SERVER_URL_STORAGE_KEY);
-    if (primary && (primary.startsWith('http://') || primary.startsWith('https://')) && !isLocalWebViewUrl(primary)) {
-      return primary.replace(/\/+$/, '');
+    if (primary) {
+      const check = validateServerUrl(primary);
+      if (check.valid) return check.cleanUrl;
+      localStorage.removeItem(SERVER_URL_STORAGE_KEY);
     }
     const legacy = localStorage.getItem(LEGACY_CUSTOM_SERVER_KEY);
-    if (legacy && (legacy.startsWith('http://') || legacy.startsWith('https://')) && !isLocalWebViewUrl(legacy)) {
-      return legacy.replace(/\/+$/, '');
+    if (legacy) {
+      const check = validateServerUrl(legacy);
+      if (check.valid) return check.cleanUrl;
+      localStorage.removeItem(LEGACY_CUSTOM_SERVER_KEY);
     }
   } catch (e) {}
   return '';
@@ -55,8 +165,9 @@ export function getHostingerServerUrl(): string {
 
 function syncServerUrlPreference(url: string) {
   try {
-    if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return;
-    const clean = url.trim().replace(/\/+$/, '');
+    const check = validateServerUrl(url);
+    if (!check.valid) return;
+    const clean = check.cleanUrl;
     Preferences.set({ key: SERVER_URL_STORAGE_KEY, value: clean }).catch(() => {});
     Preferences.set({ key: LEGACY_CUSTOM_SERVER_KEY, value: clean }).catch(() => {});
     Preferences.set({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}`, value: clean }).catch(() => {});
@@ -80,18 +191,22 @@ function syncServerUrlPreference(url: string) {
 
 export function setCustomServerUrl(url: string) {
   try {
-    if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
-      const clean = url.trim().replace(/\/+$/, '');
-      localStorage.setItem(SERVER_URL_STORAGE_KEY, clean);
-      localStorage.setItem(LEGACY_CUSTOM_SERVER_KEY, clean);
-      syncServerUrlPreference(clean);
-    } else {
+    const trimmed = (url || '').trim();
+    if (!trimmed) {
       activeWorkingServer = '';
       localStorage.removeItem(SERVER_URL_STORAGE_KEY);
       localStorage.removeItem(LEGACY_CUSTOM_SERVER_KEY);
       Preferences.remove({ key: SERVER_URL_STORAGE_KEY }).catch(() => {});
       Preferences.remove({ key: LEGACY_CUSTOM_SERVER_KEY }).catch(() => {});
       Preferences.remove({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}` }).catch(() => {});
+      return;
+    }
+
+    const check = validateServerUrl(trimmed);
+    if (check.valid) {
+      localStorage.setItem(SERVER_URL_STORAGE_KEY, check.cleanUrl);
+      localStorage.setItem(LEGACY_CUSTOM_SERVER_KEY, check.cleanUrl);
+      syncServerUrlPreference(check.cleanUrl);
     }
   } catch (e) {}
 }
@@ -104,13 +219,13 @@ let activeWorkingServer = '';
 try {
   if (typeof localStorage !== 'undefined') {
     const saved = localStorage.getItem(SERVER_URL_STORAGE_KEY);
-    if (
-      saved &&
-      (saved.startsWith('http://') || saved.startsWith('https://')) &&
-      !saved.includes('localhost') &&
-      !saved.includes('127.0.0.1')
-    ) {
-      activeWorkingServer = saved.replace(/\/+$/, '');
+    if (saved) {
+      const check = validateServerUrl(saved);
+      if (check.valid) {
+        activeWorkingServer = check.cleanUrl;
+      } else {
+        localStorage.removeItem(SERVER_URL_STORAGE_KEY);
+      }
     }
   }
 } catch (e) {}
@@ -224,6 +339,7 @@ async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: n
 
   let timer: any;
   let timedOut = false;
+  let nativeErrMsg = '';
   const controller = new AbortController();
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -243,16 +359,26 @@ async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: n
         if (timedOut) {
           throw nativeErr;
         }
-        // Fallback cleanly to WebView fetch if CapacitorHttp fails (mixed content & CORS are enabled)
-        console.warn('[API] CapacitorHttp error, falling back to fetch:', url, nativeErr?.message || nativeErr);
+        nativeErrMsg = nativeErr?.message || String(nativeErr || 'CapacitorHttp failed');
+        // Fallback to WebView fetch so mixed content & CORS remain usable if native plugin fails,
+        // while preserving nativeErrMsg if WebView fetch also fails.
+        console.warn('[API] CapacitorHttp error, falling back to fetch:', url, nativeErrMsg);
       }
     }
 
-    const fetchPromise = fetch(url, {
-      ...init,
-      signal: controller.signal,
-    });
-    return await Promise.race([fetchPromise, timeoutPromise]);
+    try {
+      const fetchPromise = fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+      return await Promise.race([fetchPromise, timeoutPromise]);
+    } catch (fetchErr: any) {
+      if (nativeErrMsg && fetchErr?.name !== 'AbortError') {
+        const fetchMsg = fetchErr?.message || String(fetchErr || 'Failed to fetch');
+        throw new Error(`NativeHTTP: ${nativeErrMsg} | WebView: ${fetchMsg}`);
+      }
+      throw fetchErr;
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -261,7 +387,7 @@ async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: n
 let activeDetectPromise: Promise<string> | null = null;
 
 export async function autoDetectActiveServer(forceProbe = false): Promise<string> {
-  if (activeWorkingServer && !forceProbe) {
+  if (activeWorkingServer && isValidServerUrl(activeWorkingServer) && !forceProbe) {
     return activeWorkingServer;
   }
   if (activeDetectPromise) return activeDetectPromise;
@@ -286,9 +412,9 @@ export async function autoDetectActiveServer(forceProbe = false): Promise<string
       return server;
     };
 
-    // Priority 1: Saved custom server URL (if explicitly configured and non-CloudRun-fallback)
+    // Priority 1: Saved custom server URL (must pass strict URL/IP validation)
     const custom = getCustomServerUrl();
-    if (custom && !isLocalWebViewUrl(custom)) {
+    if (custom && isValidServerUrl(custom)) {
       try {
         const okCustom = await probeOne(custom);
         setActiveWorkingServer(okCustom);
@@ -320,7 +446,7 @@ export async function autoDetectActiveServer(forceProbe = false): Promise<string
       } catch (_e) {}
     }
 
-    return activeWorkingServer || DEFAULT_REMOTE_SERVER;
+    return (activeWorkingServer && isValidServerUrl(activeWorkingServer) ? activeWorkingServer : '') || DEFAULT_REMOTE_SERVER;
   })().finally(() => {
     activeDetectPromise = null;
   });
@@ -329,16 +455,12 @@ export async function autoDetectActiveServer(forceProbe = false): Promise<string
 }
 
 export function setActiveWorkingServer(url: string) {
-  if (
-    url &&
-    (url.startsWith('http://') || url.startsWith('https://')) &&
-    !url.includes('localhost') &&
-    !url.includes('127.0.0.1')
-  ) {
-    const clean = url.replace(/\/+$/, '');
-    activeWorkingServer = clean;
+  const check = validateServerUrl(url);
+  if (check.valid) {
+    activeWorkingServer = check.cleanUrl;
     try {
       localStorage.setItem(SERVER_URL_STORAGE_KEY, activeWorkingServer);
+      localStorage.setItem(LEGACY_CUSTOM_SERVER_KEY, activeWorkingServer);
     } catch (e) {}
     syncServerUrlPreference(activeWorkingServer);
   }
@@ -366,17 +488,18 @@ export function isNativeOrApkEnvironment(): boolean {
 export function getApiBaseUrl(): string {
   const isNative = isNativeOrApkEnvironment();
   let base = '';
-  if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
+  if (activeWorkingServer && isValidServerUrl(activeWorkingServer)) {
     base = activeWorkingServer;
-  } else if (!isNative && typeof window !== 'undefined' && window.location.origin &&
-      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) &&
-      !window.location.origin.includes('localhost') &&
-      !window.location.origin.includes('127.0.0.1') &&
-      !window.location.origin.includes('file://')) {
+  } else if (
+    !isNative &&
+    typeof window !== 'undefined' &&
+    window.location.origin &&
+    isValidServerUrl(window.location.origin)
+  ) {
     base = window.location.origin;
   } else {
     const custom = getCustomServerUrl();
-    if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
+    if (custom && isValidServerUrl(custom)) {
       base = custom;
     } else {
       base = DEFAULT_REMOTE_SERVER;
@@ -387,18 +510,17 @@ export function getApiBaseUrl(): string {
 
 export function getPublicShareBaseUrl(): string {
   const custom = getCustomServerUrl();
-  if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
-    return custom.replace(/\/+$/, '');
+  if (custom && isValidServerUrl(custom)) {
+    return custom;
   }
-  if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
-    return activeWorkingServer.replace(/\/+$/, '');
+  if (activeWorkingServer && isValidServerUrl(activeWorkingServer)) {
+    return activeWorkingServer;
   }
-  if (typeof window !== 'undefined' && window.location.origin &&
-      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) &&
-      !window.location.origin.includes('localhost') &&
-      !window.location.origin.includes('127.0.0.1') &&
-      !window.location.origin.includes('capacitor://') &&
-      !window.location.origin.includes('file://')) {
+  if (
+    typeof window !== 'undefined' &&
+    window.location.origin &&
+    isValidServerUrl(window.location.origin)
+  ) {
     return window.location.origin.replace(/\/+$/, '');
   }
   return DEFAULT_REMOTE_SERVER;
@@ -438,12 +560,12 @@ export async function fetchWithFallback(
   const urlsToTry: string[] = [];
 
   if (isNative) {
-    if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
+    if (activeWorkingServer && isValidServerUrl(activeWorkingServer)) {
       const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
       if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
     }
     const custom = getCustomServerUrl();
-    if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
+    if (custom && isValidServerUrl(custom)) {
       const customUrl = `${custom}${cleanEndpoint}`;
       if (!urlsToTry.includes(customUrl)) urlsToTry.push(customUrl);
     }
@@ -472,7 +594,7 @@ export async function fetchWithFallback(
       if (!urlsToTry.includes(cleanEndpoint)) {
         urlsToTry.push(cleanEndpoint);
       }
-      if (activeWorkingServer) {
+      if (activeWorkingServer && isValidServerUrl(activeWorkingServer)) {
         const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
         if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
       }
@@ -512,8 +634,6 @@ export async function fetchWithFallback(
   for (let idx = 0; idx < urlsToTry.length; idx++) {
     const url = urlsToTry[idx];
     try {
-      // Grant full timeout to primary candidate (idx === 0) so batch POSTs never prematurely abort at 6s;
-      // keep secondary fallback candidates fast unless this is the final URL.
       const baseTimeout = timeoutMs || (isNative ? 15000 : 10000);
       const perUrlTimeout =
         idx === 0 || idx === urlsToTry.length - 1
@@ -577,19 +697,48 @@ export async function universalApiFetch(
 
 export async function checkServerHealth(url?: string): Promise<{ ok: boolean; status?: string; database?: string; latencyMs: number; error?: string }> {
   const start = Date.now();
-  const baseUrl = url ? url.trim().replace(/\/+$/, '') : getApiBaseUrl();
+  let baseUrl = '';
+  if (url !== undefined && url.trim() !== '') {
+    const check = validateServerUrl(url);
+    if (!check.valid) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        error: check.error || 'عنوان السيرفر غير صالح',
+      };
+    }
+    baseUrl = check.cleanUrl;
+  } else {
+    baseUrl = getApiBaseUrl();
+  }
+
   const targetUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
 
   try {
     const res = await fetchWithRaceTimeout(
       targetUrl,
-      { headers: { 'Accept': 'application/json' } },
+      { headers: { 'Accept': 'application/json', 'Cache-Control': 'no-cache' } },
       6000
     );
     const latencyMs = Date.now() - start;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
 
     if (res.ok) {
-      const data = await res.json().catch(() => ({}));
+      if (ct.includes('text/html')) {
+        return {
+          ok: false,
+          latencyMs,
+          error: 'الخادم أعاد صفحة HTML بدلاً من API (/api/health غير موجه)',
+        };
+      }
+      const data = await res.json().catch(() => null);
+      if (!data || (data.status !== 'ok' && data.ok !== true && !data.database)) {
+        return {
+          ok: false,
+          latencyMs,
+          error: 'استجابة غير متوقعة من /api/health',
+        };
+      }
       return {
         ok: true,
         status: data.status || 'ok',
@@ -600,7 +749,7 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
       return {
         ok: false,
         latencyMs,
-        error: `HTTP ${res.status}: ${res.statusText}`,
+        error: `HTTP ${res.status}: ${res.statusText || 'Error'}`,
       };
     }
   } catch (err: any) {
@@ -615,7 +764,21 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
 
 export async function testBatchSyncEndpoint(url?: string): Promise<{ ok: boolean; status?: number; latencyMs: number; responsePreview?: string; error?: string }> {
   const start = Date.now();
-  const baseUrl = url ? url.trim().replace(/\/+$/, '') : getApiBaseUrl();
+  let baseUrl = '';
+  if (url !== undefined && url.trim() !== '') {
+    const check = validateServerUrl(url);
+    if (!check.valid) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        error: check.error || 'عنوان السيرفر غير صالح',
+      };
+    }
+    baseUrl = check.cleanUrl;
+  } else {
+    baseUrl = getApiBaseUrl();
+  }
+
   const targetUrl = baseUrl ? `${baseUrl}/api/sync/batch` : '/api/sync/batch';
   try {
     const res = await fetchWithRaceTimeout(
@@ -644,6 +807,51 @@ export async function testBatchSyncEndpoint(url?: string): Promise<{ ok: boolean
       error: err?.name === 'AbortError' ? 'Timeout (7000ms)' : (err?.message || 'Network error'),
     };
   }
+}
+
+export interface ServerProbeResult {
+  url: string;
+  ok: boolean;
+  latencyMs: number;
+  database?: string;
+  error?: string;
+}
+
+export async function probeAllCandidateServers(extraUrl?: string): Promise<ServerProbeResult[]> {
+  const targets: string[] = [];
+  if (extraUrl) {
+    const v = validateServerUrl(extraUrl);
+    if (v.valid && !targets.includes(v.cleanUrl)) targets.push(v.cleanUrl);
+  }
+  for (const s of CANDIDATE_SERVERS) {
+    if (!targets.includes(s)) targets.push(s);
+  }
+  return Promise.all(
+    targets.map(async (target) => {
+      const h = await checkServerHealth(target);
+      return {
+        url: target,
+        ok: h.ok,
+        latencyMs: h.latencyMs,
+        database: h.database,
+        error: h.error,
+      };
+    })
+  );
+}
+
+export async function repairAndResetServerUrl(): Promise<{
+  activeUrl: string;
+  probes: ServerProbeResult[];
+}> {
+  setCustomServerUrl('');
+  const [detected, probes] = await Promise.all([
+    autoDetectActiveServer(true).catch(() => HOSTINGER_DEFAULT_SERVER),
+    probeAllCandidateServers(),
+  ]);
+  const working = probes.find((p) => p.ok)?.url || detected || HOSTINGER_DEFAULT_SERVER;
+  setActiveWorkingServer(working);
+  return { activeUrl: working, probes };
 }
 
 // Automatically probe priority candidate servers on APK startup

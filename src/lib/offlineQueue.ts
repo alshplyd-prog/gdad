@@ -3,7 +3,7 @@ import { BackgroundTask } from '@capawesome/capacitor-background-task';
 import { BackgroundRunner } from '@capacitor/background-runner';
 import { Preferences } from '@capacitor/preferences';
 import { Network } from '@capacitor/network';
-import { getApiBaseUrl, getFullApiUrl, fetchWithFallback, CANDIDATE_SERVERS, getCustomServerUrl, isNativeOrApkEnvironment, isNetworkConnected } from './apiConfig';
+import { getApiBaseUrl, getFullApiUrl, fetchWithFallback, CANDIDATE_SERVERS, getCustomServerUrl, isNativeOrApkEnvironment, isNetworkConnected, isValidServerUrl, HOSTINGER_DEFAULT_SERVER } from './apiConfig';
 import {
   secureStorageGetSync,
   secureStorageSetSync,
@@ -640,7 +640,8 @@ export async function syncToNativeAndroid(queue: PendingAction[], triggerImmedia
   if (typeof window === 'undefined') return;
   try {
     const jsonStr = JSON.stringify(queue);
-    const serverUrl = getApiBaseUrl() || window.location.origin;
+    const rawBase = getApiBaseUrl();
+    const serverUrl = isValidServerUrl(rawBase) ? rawBase : HOSTINGER_DEFAULT_SERVER;
 
     // 1. Direct Native JavascriptInterface Bridge
     const bridge =
@@ -668,7 +669,7 @@ export async function syncToNativeAndroid(queue: PendingAction[], triggerImmedia
         Preferences.set({ key: `CapacitorPreferences.${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
         Preferences.set({ key: `_cap_${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
       ];
-      if (serverUrl) {
+      if (serverUrl && isValidServerUrl(serverUrl)) {
         prefPromises.push(
           Preferences.set({ key: 'alkarrar_backend_server_url', value: serverUrl }).catch(() => {}),
           Preferences.set({ key: 'CapacitorStorage.alkarrar_backend_server_url', value: serverUrl }).catch(() => {})

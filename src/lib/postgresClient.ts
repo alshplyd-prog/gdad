@@ -1203,7 +1203,11 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
       if (snapRes && snapRes.ok) {
         const bundled = await snapRes.json().catch(() => null);
         if (bundled && typeof bundled === 'object') {
-          const isFreshEmptyContracts = getLocalCache('contracts').length === 0;
+          const existingContracts = getLocalCache<any>('contracts');
+          const isOnlyDemoContracts =
+            existingContracts.length <= 2 &&
+            existingContracts.every((c: any) => c?.id === 'contract-1' || c?.id === 'contract-2');
+          const isFreshEmptyContracts = existingContracts.length === 0 || isOnlyDemoContracts;
 
           const bundledPaymentsRaw = Array.isArray(bundled.payments) ? bundled.payments : [];
           const mappedPayments = bundledPaymentsRaw.map((p: any) => mapRow('payments', p));
@@ -1211,17 +1215,18 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
             setLocalCache('payments', mergeRemoteWithPendingLocal('payments', mappedPayments));
           }
 
-          if (Array.isArray(bundled.customers) && (getLocalCache('customers').length === 0 || isFreshEmptyContracts)) {
+          if (Array.isArray(bundled.customers) && bundled.customers.length > 0 && (getLocalCache('customers').length === 0 || isFreshEmptyContracts)) {
             const mappedCusts = bundled.customers.map((cu: any) => mapRow('customers', cu));
             setLocalCache('customers', mergeRemoteWithPendingLocal('customers', mappedCusts));
           }
 
-          if (Array.isArray(bundled.contracts) && isFreshEmptyContracts) {
+          if (Array.isArray(bundled.contracts) && bundled.contracts.length > 0 && isFreshEmptyContracts) {
             const mappedContracts = bundled.contracts.map((c: any) => mapRow('contracts', c));
             const mergedContracts = mergeRemoteWithPendingLocal('contracts', mappedContracts);
             const currentPayments = getLocalCache<any>('payments');
             const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
-            setLocalCache('contracts', recalculated);
+            const enriched = enrichContractsWithCustomerLocations(recalculated, getLocalCache<any>('customers'));
+            setLocalCache('contracts', enriched);
           }
 
           if (Array.isArray(bundled.appointments) && (getLocalCache('appointments').length === 0 || isFreshEmptyContracts)) {
@@ -1270,6 +1275,7 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
           }
 
           applyServerClearedLocations();
+          recalculateLocalFundBalances(true);
           mirrorLocalSnapshotToIndexedDb(false).catch(() => {});
           notifySubscribersRefresh(true);
           return true;

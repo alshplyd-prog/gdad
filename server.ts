@@ -6,6 +6,7 @@ import fs from "fs";
 import webpush from "web-push";
 import { createServer as createViteServer } from "vite";
 import { fileDb } from "./src/db/fileDb.ts";
+import { getResolvedDbTargetInfo } from "./src/db/index.ts";
 import { executePg, executePgWithContext, isPgConfigured, type PgSecurityContext } from "./src/db/dbExecutor.ts";
 import { initializeDatabaseSchema } from "./src/db/init.ts";
 import { cleanupDuplicateEntities } from "./src/db/cleanupDuplicates.ts";
@@ -1497,13 +1498,19 @@ async function startServer() {
     })
     .catch((err) => console.warn("Background DB initialization notice:", err));
 
-  console.log("SERVER DB CONFIG:", isPgConfigured() ? "PostgreSQL + FileDB" : "Local FileDB Engine");
+  const dbTargetInfo = getResolvedDbTargetInfo();
+  console.log(
+    "SERVER DB CONFIG:",
+    isPgConfigured()
+      ? `PostgreSQL (host=${dbTargetInfo?.host || "127.0.0.1"}, ssl=${Boolean(dbTargetInfo?.ssl)}) + FileDB`
+      : "Local FileDB Engine"
+  );
 
   // CORS middleware for Web, APK, Capacitor, and remote clients
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, X-Timestamp, X-Nonce, X-Signature");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, X-Timestamp, X-Nonce, X-Signature, X-Rep-Id, Cache-Control, Pragma");
     res.header("Access-Control-Expose-Headers", "Content-Length, Content-Range");
     if (req.method === "OPTIONS") {
       return res.sendStatus(200);
@@ -1704,16 +1711,27 @@ async function startServer() {
   // Health check API route
   app.get("/api/health", async (req, res) => {
     let deletedCount = 0;
+    let pgConnected = false;
+    let pgError: string | undefined;
+    const dbTarget = getResolvedDbTargetInfo();
     try {
       if (isPgConfigured()) {
-        const dRes = await executePg("SELECT COUNT(*) as count FROM deleted_records").catch(() => []);
+        const dRes = await executePg("SELECT COUNT(*) as count FROM deleted_records");
+        pgConnected = true;
         if (dRes && dRes[0]?.count) deletedCount = Number(dRes[0].count);
       }
-    } catch (e) {}
+    } catch (e: any) {
+      pgConnected = false;
+      pgError = e?.message || "pg connection error";
+    }
 
     res.json({
       status: "ok",
       database: isPgConfigured() ? "postgresql" : "filedb",
+      pgConnected,
+      dbHost: dbTarget?.host || (isPgConfigured() ? "127.0.0.1" : "filedb"),
+      dbSsl: Boolean(dbTarget?.ssl),
+      ...(pgError ? { pgError } : {}),
       persistent: true,
       syncVersion: globalSyncVersion,
       deletedCount,
