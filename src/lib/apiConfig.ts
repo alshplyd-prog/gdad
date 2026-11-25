@@ -1,5 +1,7 @@
 import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { Network } from '@capacitor/network';
+import { Preferences } from '@capacitor/preferences';
+import { getAuthSession } from './securityClient';
 
 /**
  * Centralized API & Server Endpoint Resolver for Web and Android APK
@@ -34,10 +36,37 @@ export function getHostingerServerUrl(): string {
   return HOSTINGER_DEFAULT_SERVER;
 }
 
+function syncServerUrlPreference(url: string) {
+  try {
+    if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return;
+    const clean = url.trim().replace(/\/+$/, '');
+    Preferences.set({ key: SERVER_URL_STORAGE_KEY, value: clean }).catch(() => {});
+    Preferences.set({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}`, value: clean }).catch(() => {});
+    const bridge =
+      typeof window !== 'undefined'
+        ? (window as any).AndroidInterface ||
+          (window as any).AndroidPrinter ||
+          (window as any).Android ||
+          (window as any).AndroidBridge
+        : null;
+    if (bridge && typeof bridge.syncPendingQueueToNative === 'function') {
+      // Keep native SQLite server URL synchronized if empty or updated
+      try {
+        const existingNative = typeof bridge.getPendingQueueFromNative === 'function' ? bridge.getPendingQueueFromNative() : null;
+        if (existingNative && existingNative.startsWith('[')) {
+          bridge.syncPendingQueueToNative(existingNative, clean);
+        }
+      } catch (_e) {}
+    }
+  } catch (_e) {}
+}
+
 export function setCustomServerUrl(url: string) {
   try {
     if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
-      localStorage.setItem(SERVER_URL_STORAGE_KEY, url.trim().replace(/\/+$/, ''));
+      const clean = url.trim().replace(/\/+$/, '');
+      localStorage.setItem(SERVER_URL_STORAGE_KEY, clean);
+      syncServerUrlPreference(clean);
     } else {
       localStorage.removeItem(SERVER_URL_STORAGE_KEY);
     }
@@ -63,21 +92,31 @@ try {
   }
 } catch (e) {}
 
+function canonicalizeHeaderName(key: string): string {
+  const lower = key.trim().toLowerCase();
+  if (lower === 'content-type') return 'Content-Type';
+  if (lower === 'accept') return 'Accept';
+  if (lower === 'authorization') return 'Authorization';
+  if (lower === 'cache-control') return 'Cache-Control';
+  if (lower === 'x-rep-id') return 'X-Rep-Id';
+  return key.trim();
+}
+
 function normalizeHeadersToRecord(headers?: HeadersInit): Record<string, string> {
   const out: Record<string, string> = {};
   if (!headers) return out;
   try {
     if (headers instanceof Headers) {
       headers.forEach((v, k) => {
-        out[k] = v;
+        if (k) out[canonicalizeHeaderName(k)] = v;
       });
     } else if (Array.isArray(headers)) {
       for (const [k, v] of headers) {
-        if (k) out[k] = v;
+        if (k) out[canonicalizeHeaderName(k)] = v;
       }
     } else {
       for (const [k, v] of Object.entries(headers)) {
-        if (k && v !== undefined && v !== null) out[k] = String(v);
+        if (k && v !== undefined && v !== null) out[canonicalizeHeaderName(k)] = String(v);
       }
     }
   } catch (e) {}
@@ -99,6 +138,9 @@ async function nativeCapacitorHttpRequest(url: string, init: RequestInit, timeou
     } else {
       requestData = init.body;
     }
+    if (!reqHeaders['Content-Type'] && !(typeof FormData !== 'undefined' && init.body instanceof FormData)) {
+      reqHeaders['Content-Type'] = 'application/json';
+    }
   }
 
   const natRes = await CapacitorHttp.request({
@@ -106,7 +148,7 @@ async function nativeCapacitorHttpRequest(url: string, init: RequestInit, timeou
     method,
     headers: reqHeaders,
     ...(requestData !== undefined ? { data: requestData } : {}),
-    connectTimeout: Math.min(timeoutMs, 4500),
+    connectTimeout: Math.min(Math.max(timeoutMs, 4000), 8000),
     readTimeout: timeoutMs,
   });
 
@@ -130,6 +172,11 @@ async function nativeCapacitorHttpRequest(url: string, init: RequestInit, timeou
   if (status !== 204 && status !== 304 && natRes?.data !== undefined && natRes?.data !== null) {
     if (typeof natRes.data === 'string') {
       bodyText = natRes.data;
+      const trimmed = bodyText.trim();
+      const ct = (respHeaders.get('content-type') || '').toLowerCase();
+      if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && (!ct || ct.includes('text/plain'))) {
+        respHeaders.set('content-type', 'application/json; charset=utf-8');
+      }
     } else {
       bodyText = JSON.stringify(natRes.data);
       if (!respHeaders.get('content-type')) {
@@ -153,10 +200,12 @@ async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: n
     typeof CapacitorHttp.request === 'function';
 
   let timer: any;
+  let timedOut = false;
   const controller = new AbortController();
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        timedOut = true;
         try {
           controller.abort();
         } catch (e) {}
@@ -168,11 +217,11 @@ async function fetchWithRaceTimeout(url: string, init: RequestInit, timeoutMs: n
       try {
         return await Promise.race([nativeCapacitorHttpRequest(url, init, timeoutMs), timeoutPromise]);
       } catch (nativeErr: any) {
-        // Only fall back to browser fetch if CapacitorHttp plugin itself is unavailable
-        const msg = String(nativeErr?.message || '');
-        if (!msg.toLowerCase().includes('not implemented') && !msg.toLowerCase().includes('unavailable')) {
+        if (timedOut) {
           throw nativeErr;
         }
+        // Fallback cleanly to WebView fetch if CapacitorHttp fails (mixed content & CORS are enabled)
+        console.warn('[API] CapacitorHttp error, falling back to fetch:', url, nativeErr?.message || nativeErr);
       }
     }
 
@@ -248,6 +297,7 @@ export function setActiveWorkingServer(url: string) {
     try {
       localStorage.setItem(SERVER_URL_STORAGE_KEY, activeWorkingServer);
     } catch (e) {}
+    syncServerUrlPreference(activeWorkingServer);
   }
 }
 
@@ -398,32 +448,46 @@ export async function fetchWithFallback(
 
   let lastError: any = null;
   const skipSigning = cleanEndpoint.startsWith('/api/auth/login') || cleanEndpoint.startsWith('/api/auth/logout');
+  const methodUpper = (options?.method || 'GET').toUpperCase();
+
+  let sessionHeaders: Record<string, string> = {};
+  if (!skipSigning) {
+    try {
+      const session = getAuthSession();
+      if (session?.token) sessionHeaders['Authorization'] = `Bearer ${session.token}`;
+      if (session?.rep?.id) sessionHeaders['X-Rep-Id'] = String(session.rep.id);
+    } catch (_e) {}
+  }
+
+  const mergedHeaders = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/plain, */*',
+    ...sessionHeaders,
+    ...normalizeHeadersToRecord(options?.headers),
+  };
 
   for (let idx = 0; idx < urlsToTry.length; idx++) {
     const url = urlsToTry[idx];
     try {
-      // Keep fallback probing fast when multiple candidate URLs remain
-      const baseTimeout = timeoutMs || (isNative ? 10000 : 7000);
+      // Grant full timeout to primary candidate (idx === 0) so batch POSTs never prematurely abort at 6s;
+      // keep secondary fallback candidates fast unless this is the final URL.
+      const baseTimeout = timeoutMs || (isNative ? 15000 : 10000);
       const perUrlTimeout =
-        urlsToTry.length > 1 && idx < urlsToTry.length - 1
-          ? Math.min(baseTimeout, 6000)
-          : baseTimeout;
+        idx === 0 || idx === urlsToTry.length - 1
+          ? baseTimeout
+          : Math.min(baseTimeout, methodUpper === 'GET' ? 6000 : 10000);
 
       const res = await fetchWithRaceTimeout(
         url,
         {
           ...options,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json, text/plain, */*',
-            ...(options?.headers || {}),
-          },
+          headers: mergedHeaders,
         },
         perUrlTimeout
       );
 
       if (res.ok) {
-        const contentType = res.headers.get('content-type') || '';
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
         if (contentType.includes('text/html')) {
           continue;
         }
@@ -448,17 +512,13 @@ export async function fetchWithFallback(
             window.dispatchEvent(new CustomEvent('alkarrar:auth-401', { detail: { endpoint: cleanEndpoint } }));
           } catch (e) {}
         }
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json') || res.status === 404) {
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.includes('text/html') || res.status === 404) {
           return res;
         }
       }
     } catch (err: any) {
       lastError = err;
-      if (isNative && activeWorkingServer && url.startsWith(activeWorkingServer)) {
-        // Clear dead cached server in memory so fallback candidates can take over cleanly
-        activeWorkingServer = '';
-      }
     }
   }
 

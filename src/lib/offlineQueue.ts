@@ -605,7 +605,7 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
     secureStorageSetSync(QUEUE_KEY, jsonStr);
 
     if (swSyncedIds.length > 0 || droppedInvalidIds.length > 0) {
-      syncToNativeAndroid(merged);
+      await syncToNativeAndroid(merged);
       syncQueueToIndexedDb(merged).catch(() => {});
     } else if (idbActions.length === 0 && merged.length > 0) {
       syncQueueToIndexedDb(merged).catch(() => {});
@@ -620,7 +620,7 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
 /**
  * Synchronize pending actions directly to Native Android storage & SharedPreferences
  */
-export function syncToNativeAndroid(queue: PendingAction[], triggerImmediateNativeSync: boolean = false) {
+export async function syncToNativeAndroid(queue: PendingAction[], triggerImmediateNativeSync: boolean = false): Promise<void> {
   if (typeof window === 'undefined') return;
   try {
     const jsonStr = JSON.stringify(queue);
@@ -644,16 +644,21 @@ export function syncToNativeAndroid(queue: PendingAction[], triggerImmediateNati
       }
     }
 
-    // 2. Multi-prefix Capacitor Preferences storage
+    // 2. Multi-prefix Capacitor Preferences storage (awaited with short timeout to avoid stale reads)
     try {
-      Preferences.set({ key: QUEUE_KEY, value: jsonStr }).catch(() => {});
-      Preferences.set({ key: `CapacitorStorage.${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
-      Preferences.set({ key: `CapacitorPreferences.${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
-      Preferences.set({ key: `_cap_${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
+      const prefPromises: Promise<any>[] = [
+        Preferences.set({ key: QUEUE_KEY, value: jsonStr }).catch(() => {}),
+        Preferences.set({ key: `CapacitorStorage.${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
+        Preferences.set({ key: `CapacitorPreferences.${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
+        Preferences.set({ key: `_cap_${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
+      ];
       if (serverUrl) {
-        Preferences.set({ key: 'alkarrar_backend_server_url', value: serverUrl }).catch(() => {});
-        Preferences.set({ key: 'CapacitorStorage.alkarrar_backend_server_url', value: serverUrl }).catch(() => {});
+        prefPromises.push(
+          Preferences.set({ key: 'alkarrar_backend_server_url', value: serverUrl }).catch(() => {}),
+          Preferences.set({ key: 'CapacitorStorage.alkarrar_backend_server_url', value: serverUrl }).catch(() => {})
+        );
       }
+      await withTimeout(Promise.all(prefPromises), 1500, null);
     } catch (e) {}
   } catch (e) {}
 }
@@ -759,12 +764,20 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
     }
   }, 0);
 
-  // 3. Trigger fast background network flush immediately when online
-  if (typeof navigator !== 'undefined' && navigator.onLine) {
+  // 3. Trigger fast background network flush immediately when online (or check native network state)
+  if (typeof navigator === 'undefined' || navigator.onLine !== false) {
     if (bgFlushTimer) clearTimeout(bgFlushTimer);
     bgFlushTimer = setTimeout(() => {
       flushPendingQueue().catch(() => {});
     }, 250);
+  } else {
+    isNetworkConnected()
+      .then((online) => {
+        if (online) {
+          flushPendingQueue().catch(() => {});
+        }
+      })
+      .catch(() => {});
   }
 
   // 4. Schedule idle verification re-query so when user stops typing/saving (سكون), it audits matches against server
@@ -1156,19 +1169,19 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<{ ok
       return { ok: false, permanentError: true, errorMsg: errData?.error || `HTTP ${res.status}` };
     }
     if (!res.ok || res.status < 200 || res.status >= 300) {
-      return { ok: false };
+      return { ok: false, errorMsg: `HTTP ${res.status}` };
     }
-    const ct = res.headers?.get('content-type') || '';
-    if (ct.includes('text/html') || !ct.includes('application/json')) {
-      return { ok: false };
+    const ct = (res.headers?.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html')) {
+      return { ok: false, errorMsg: 'HTML response instead of API JSON' };
     }
     const data = await res.json().catch(() => null);
     if (!data || (data.error && !data.idempotent)) {
-      return { ok: false };
+      return { ok: false, errorMsg: data?.error || 'Invalid server response' };
     }
     return { ok: true };
-  } catch (e) {
-    return { ok: false };
+  } catch (e: any) {
+    return { ok: false, errorMsg: e?.message || 'Network error' };
   }
 }
 
@@ -1176,6 +1189,11 @@ let isFlushing = false;
 let lastFlushStartTime = 0;
 let activeFlushPromise: Promise<{ flushed: number; remaining: number }> | null = null;
 let followUpFlushTimer: any = null;
+let lastSyncUploadError: string | null = null;
+
+export function getLastSyncUploadError(): string | null {
+  return lastSyncUploadError;
+}
 
 async function commitSyncedIds(syncedIds: string[]): Promise<void> {
   if (!syncedIds || syncedIds.length === 0) return;
@@ -1190,7 +1208,7 @@ async function commitSyncedIds(syncedIds: string[]): Promise<void> {
       : [];
     secureStorageSetSync(QUEUE_KEY, JSON.stringify(remaining));
     notifyQueueListeners(remaining.length);
-    syncToNativeAndroid(remaining);
+    await syncToNativeAndroid(remaining);
   } catch (e) {}
 
   await deleteActionsBatchFromIndexedDb(syncedIds).catch(() => {});
@@ -1198,7 +1216,7 @@ async function commitSyncedIds(syncedIds: string[]): Promise<void> {
 
 /**
  * Flush all pending offline actions using explicit transaction states (pending -> syncing -> synced)
- * with single-flight locking, fast concurrent 100-item bulk SQL chunks, single-tx IndexedDB commits, and REST fallback.
+ * with single-flight locking, reliable 20-item bulk SQL chunks, single-tx IndexedDB commits, and REST fallback.
  */
 export async function flushPendingQueue(): Promise<{ flushed: number; remaining: number }> {
   const now = Date.now();
@@ -1214,6 +1232,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
     isFlushing = true;
     lastFlushStartTime = Date.now();
     const verifiedSyncedIds: string[] = [];
+    let batchFailureReason: string | null = null;
 
     try {
       const queue = await getPendingQueue();
@@ -1222,6 +1241,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       const actionsToSync = queue.filter((item) => item.status !== 'synced');
 
       if (actionsToSync.length === 0) {
+        lastSyncUploadError = null;
         notifyQueueListeners(0);
         return { flushed: 0, remaining: 0 };
       }
@@ -1235,10 +1255,10 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       }
       secureStorageSetSync(QUEUE_KEY, JSON.stringify(queue));
 
-      // 2. Path A: Send Bulk Batch Requests in fast slices of 100 items with up to 3 concurrent requests
+      // 2. Path A: Send Bulk Batch Requests in reliable slices of 20 items with up to 2 concurrent requests
       const batchConfirmedSet = new Set<string>();
-      const BATCH_CHUNK = 100;
-      const BATCH_CONCURRENCY = 3;
+      const BATCH_CHUNK = 20;
+      const BATCH_CONCURRENCY = 2;
       const slices: PendingAction[][] = [];
       for (let b = 0; b < actionsToSync.length; b += BATCH_CHUNK) {
         slices.push(actionsToSync.slice(b, b + BATCH_CHUNK));
@@ -1261,9 +1281,9 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
               );
 
               if (response && response.ok && response.status >= 200 && response.status < 300) {
-                const ct = response.headers?.get('content-type') || '';
-                if (ct.includes('application/json') && !ct.includes('text/html')) {
-                  const data = await response.json().catch(() => ({}));
+                const ct = (response.headers?.get('content-type') || '').toLowerCase();
+                if (!ct.includes('text/html')) {
+                  const data = await response.json().catch(() => null);
                   if (data && Array.isArray(data.processedIds)) {
                     sliceConfirmedIds.push(...data.processedIds);
                   } else if (data && data.success) {
@@ -1272,10 +1292,19 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
                   if (data && Array.isArray(data.rejectedReplayIds) && data.rejectedReplayIds.length > 0) {
                     sliceConfirmedIds.push(...data.rejectedReplayIds);
                   }
+                  if (sliceConfirmedIds.length === 0 && batchSlice.length > 0) {
+                    batchFailureReason = `Batch returned 0 processedIds (totalCount=${data?.totalCount ?? 'unknown'})`;
+                  }
+                } else {
+                  batchFailureReason = 'Server returned HTML instead of JSON';
                 }
+              } else if (response) {
+                const errJson = await response.json().catch(() => null);
+                batchFailureReason = errJson?.error || `HTTP ${response.status}`;
               }
             } catch (netErr: any) {
-              console.log('[Offline Sync Engine] Batch slice fallback notice:', netErr?.message || netErr);
+              batchFailureReason = netErr?.message || 'Network failure';
+              console.log('[Offline Sync Engine] Batch slice fallback notice:', batchFailureReason);
             }
 
             if (sliceConfirmedIds.length > 0) {
@@ -1295,10 +1324,10 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         );
       }
 
-      // 3. Fallback path for unconfirmed actions (parallel chunks of 10 via individual REST endpoints)
+      // 3. Fallback path for unconfirmed actions (parallel chunks of 8 via individual REST endpoints)
       const pendingFallbackActions = actionsToSync.filter((action) => !batchConfirmedSet.has(action.id));
       if (pendingFallbackActions.length > 0) {
-        const CHUNK_SIZE = 10;
+        const CHUNK_SIZE = 8;
         for (let i = 0; i < pendingFallbackActions.length; i += CHUNK_SIZE) {
           const chunk = pendingFallbackActions.slice(i, i + CHUNK_SIZE);
           const chunkSynced: string[] = [];
@@ -1323,7 +1352,8 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
               }
 
               action.status = 'pending';
-              action.error = restResult.errorMsg || 'Pending connection to sync server';
+              action.error = restResult.errorMsg || batchFailureReason || 'Pending connection to sync server';
+              lastSyncUploadError = action.error;
               await saveActionToIndexedDb(action).catch(() => {});
             })
           );
@@ -1345,11 +1375,21 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       const freshQueue = await getPendingQueue();
       const remainingQueue = freshQueue
         .filter((item) => !verifiedSet.has(item.id) && item.status !== 'synced')
-        .map((item) => (item.status === 'syncing' ? { ...item, status: 'pending' as const } : item));
+        .map((item) =>
+          item.status === 'syncing'
+            ? { ...item, status: 'pending' as const, error: item.error || batchFailureReason || null }
+            : item
+        );
+
+      if (remainingQueue.length === 0) {
+        lastSyncUploadError = null;
+      } else if (!lastSyncUploadError && batchFailureReason) {
+        lastSyncUploadError = batchFailureReason;
+      }
 
       const jsonStr = JSON.stringify(remainingQueue);
       secureStorageSetSync(QUEUE_KEY, jsonStr);
-      syncToNativeAndroid(remainingQueue);
+      await syncToNativeAndroid(remainingQueue);
       await syncQueueToIndexedDb(remainingQueue);
       notifyQueueListeners(remainingQueue.length);
 
@@ -1386,7 +1426,8 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       }
 
       return { flushed: verifiedSyncedIds.length, remaining: remainingQueue.length };
-    } catch (err) {
+    } catch (err: any) {
+      lastSyncUploadError = err?.message || 'Flush queue error';
       console.warn('[Offline Sync Engine] Flush queue exception:', err);
       const permSet = getPermanentlySyncedIds();
       const q = getPendingQueueSync().filter((i) => i.status !== 'synced' && !permSet.has(i.id));
@@ -1460,8 +1501,8 @@ export function sendBeaconOnExit() {
     const isNative = isNativeOrApkEnvironment();
     const batchUrl = isNative ? getFullApiUrl('/api/sync/batch') : '/api/sync/batch';
 
-    // 5. Send direct keepalive Fetch synchronously
-    const BEACON_CHUNK = 100;
+    // 5. Send direct keepalive Fetch synchronously in smaller 25-item chunks
+    const BEACON_CHUNK = 25;
     for (let i = 0; i < pendingToSync.length; i += BEACON_CHUNK) {
       const chunk = pendingToSync.slice(i, i + BEACON_CHUNK);
       const payloadJson = JSON.stringify({ actions: chunk });
@@ -1469,15 +1510,15 @@ export function sendBeaconOnExit() {
       if (typeof fetch === 'function') {
         fetch(batchUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: payloadJson,
           keepalive: true,
         })
           .then((res) => {
             if (res && res.ok) {
               res.json().then((data) => {
-                if (data && Array.isArray(data.processedIds)) {
-                  data.processedIds.forEach((pid: string) => deleteActionFromIndexedDb(pid).catch(() => {}));
+                if (data && Array.isArray(data.processedIds) && data.processedIds.length > 0) {
+                  commitSyncedIds(data.processedIds).catch(() => {});
                 }
               }).catch(() => {});
             }

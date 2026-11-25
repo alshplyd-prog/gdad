@@ -548,7 +548,7 @@ public class ForegroundSyncService extends Service {
             String activeBaseUrl = targetUrls.size() > 0
                 ? targetUrls.get(0).replaceAll("/api/sync/batch.*", "")
                 : "https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app";
-            int CHUNK_SIZE = 100;
+            int CHUNK_SIZE = 25;
 
             for (int b = 0; b < pendingItems.length(); b += CHUNK_SIZE) {
                 JSONArray chunk = new JSONArray();
@@ -570,8 +570,8 @@ public class ForegroundSyncService extends Service {
                         conn.setRequestMethod("POST");
                         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                         conn.setRequestProperty("Accept", "application/json");
-                        conn.setConnectTimeout(4000);
-                        conn.setReadTimeout(20000);
+                        conn.setConnectTimeout(8000);
+                        conn.setReadTimeout(25000);
                         conn.setDoOutput(true);
 
                         OutputStream os = conn.getOutputStream();
@@ -581,7 +581,7 @@ public class ForegroundSyncService extends Service {
 
                         int code = conn.getResponseCode();
                         String contentType = conn.getContentType();
-                        if (code >= 200 && code < 300 && contentType != null && contentType.contains("application/json")) {
+                        if (code >= 200 && code < 300 && (contentType == null || !contentType.contains("text/html"))) {
                             java.io.InputStream is = conn.getInputStream();
                             java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
                             byte[] buf = new byte[1024];
@@ -659,8 +659,10 @@ public class ForegroundSyncService extends Service {
                         boolean isDelete = actionType.startsWith("DELETE_") || actionType.startsWith("RESOLVE_") || actionType.startsWith("REJECT_");
                         boolean isUpdate = actionType.startsWith("UPDATE_") && !actionType.contains("REORDER");
 
-                        if (actionType.contains("CONTRACT") || actionType.contains("CUSTOMER") && !actionType.contains("LIST")) {
+                        if (actionType.contains("CONTRACT")) {
                             table = "contracts";
+                        } else if (actionType.contains("CUSTOMER") && !actionType.contains("LIST")) {
+                            table = "customers";
                         } else if ((actionType.contains("PAYMENT") || "RECORD_PAYMENT".equals(actionType) || "ADD_PAYMENT".equals(actionType)) && !actionType.contains("CONFLICT")) {
                             table = "payments";
                         } else if (actionType.contains("INVENTORY")) {

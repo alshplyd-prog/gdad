@@ -36,6 +36,7 @@ import {
   isKeepAliveModeEnabled,
   getPendingQueue,
   flushPendingQueue,
+  getLastSyncUploadError,
   subscribeToQueueChange,
   clearPendingQueue,
 } from '../lib/offlineQueue';
@@ -44,7 +45,7 @@ import {
   run5DayPruneAndPollingInspection,
   reconcileAllLocalWithDatabase
 } from '../lib/postgresClient';
-import { getCustomServerUrl, setCustomServerUrl, checkServerHealth, getApiBaseUrl } from '../lib/apiConfig';
+import { getCustomServerUrl, setCustomServerUrl, setActiveWorkingServer, checkServerHealth, getApiBaseUrl } from '../lib/apiConfig';
 
 interface BackgroundSyncModalProps {
   isOpen: boolean;
@@ -155,10 +156,13 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
     try {
       const res = await flushPendingQueue();
       await loadHealthAndQueue();
+      const lastErr = res.remaining > 0 ? getLastSyncUploadError() : null;
       showToast(
         isAr
-          ? `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية، المتبقي: ${res.remaining}`
-          : `Synced! ${res.flushed} uploaded, remaining: ${res.remaining}`
+          ? res.remaining > 0
+            ? `تم رفع ${res.flushed} عملية، المتبقي: ${res.remaining}${lastErr ? ` (${lastErr})` : ''}`
+            : `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية`
+          : `Synced! ${res.flushed} uploaded, remaining: ${res.remaining}${lastErr ? ` (${lastErr})` : ''}`
       );
     } catch (err: any) {
       showToast(isAr ? `فشل المزامنة: ${err?.message || err}` : `Sync failed: ${err?.message || err}`);
@@ -174,15 +178,20 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
     try {
       if (clean) {
         setCustomServerUrl(clean);
+        setActiveWorkingServer(clean);
       }
       const res = await checkServerHealth(clean || undefined);
       if (res.ok) {
+        const flushRes = await flushPendingQueue().catch(() => ({ flushed: 0, remaining: queueItems.length }));
+        await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true }).catch(() => {});
+        const updatedQueue = await loadHealthAndQueue();
+        const lastErr = updatedQueue.length > 0 ? getLastSyncUploadError() : null;
         setServerStatusInfo({
           ok: true,
-          msg: isAr ? `متصل بنجاح (${res.latencyMs}ms) - تم تحديث البيانات` : `Connected (${res.latencyMs}ms)`,
+          msg: isAr
+            ? `متصل بنجاح (${res.latencyMs}ms) - تم رفع ${flushRes.flushed} معلق، المتبقي: ${updatedQueue.length}${lastErr ? ` (${lastErr})` : ''}`
+            : `Connected (${res.latencyMs}ms) - uploaded ${flushRes.flushed}, remaining: ${updatedQueue.length}`,
         });
-        await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true }).catch(() => {});
-        await loadHealthAndQueue();
       } else {
         setServerStatusInfo({
           ok: false,
@@ -673,6 +682,11 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                       <div className="text-[10px] text-slate-400 font-mono">
                         {item.timestamp ? new Date(item.timestamp).toLocaleTimeString('en-US') : ''}
                       </div>
+                      {item.error && (
+                        <div className="text-[10px] text-rose-500 font-bold mt-0.5 truncate max-w-[240px]" dir="ltr">
+                          {item.error}
+                        </div>
+                      )}
                     </div>
                     {item.payload?.amount ? (
                       <span className="font-black text-emerald-600 dark:text-emerald-400 font-mono">

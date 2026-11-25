@@ -56,9 +56,9 @@ addEventListener('syncOfflineQueue', async (resolve, _reject, _args) => {
     console.log(`[BackgroundRunner] Uploading ${pendingActions.length} pending items...`);
     const processedSet = new Set();
 
-    // Path 1: Batch sync in fast slices of 100 items
+    // Path 1: Batch sync in reliable slices of 25 items
     let activeWorkingServer = candidateServers[0];
-    const CHUNK_SIZE = 100;
+    const CHUNK_SIZE = 25;
     for (let b = 0; b < pendingActions.length; b += CHUNK_SIZE) {
       const slice = pendingActions.slice(b, b + CHUNK_SIZE);
       for (const sUrl of candidateServers) {
@@ -69,6 +69,8 @@ addEventListener('syncOfflineQueue', async (resolve, _reject, _args) => {
             body: JSON.stringify({ actions: slice, timestamp: Date.now() }),
           });
           if (batchResp && batchResp.ok) {
+            const ct = (batchResp.headers?.get('content-type') || '').toLowerCase();
+            if (ct.includes('text/html')) continue;
             activeWorkingServer = sUrl;
             const batchJson = await batchResp.json().catch(() => ({}));
             if (Array.isArray(batchJson.processedIds)) {

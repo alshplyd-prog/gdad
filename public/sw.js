@@ -363,8 +363,8 @@ async function uploadSingleActionViaRest(action, origins) {
         return true;
       }
       if (res && res.ok && res.status >= 200 && res.status < 300) {
-        const ct = res.headers ? res.headers.get('content-type') || '' : '';
-        if (ct.includes('application/json') && !ct.includes('text/html')) {
+        const ct = (res.headers ? res.headers.get('content-type') || '' : '').toLowerCase();
+        if (!ct.includes('text/html')) {
           const data = await res.json().catch(() => null);
           if (data && !data.error) return true;
         }
@@ -395,8 +395,8 @@ async function flushPendingActionsInBackground() {
     const origins = await getCandidateServerOrigins();
     const processedIds = [];
 
-    // Path 1: Try batch sync endpoint in fast 100-item chunks
-    const SW_BATCH_CHUNK = 100;
+    // Path 1: Try batch sync endpoint in reliable 25-item chunks
+    const SW_BATCH_CHUNK = 25;
     for (let i = 0; i < actions.length; i += SW_BATCH_CHUNK) {
       const chunkActions = actions.slice(i, i + SW_BATCH_CHUNK);
       const chunkBody = JSON.stringify({ actions: chunkActions });
@@ -417,8 +417,8 @@ async function flushPendingActionsInBackground() {
           });
           clearTimeout(timer);
           if (attempt && attempt.ok && attempt.status >= 200 && attempt.status < 300) {
-            const ct = attempt.headers ? attempt.headers.get('content-type') || '' : '';
-            if (ct.includes('application/json') && !ct.includes('text/html')) {
+            const ct = (attempt.headers ? attempt.headers.get('content-type') || '' : '').toLowerCase();
+            if (!ct.includes('text/html')) {
               const data = await attempt.json().catch(() => ({}));
               if (Array.isArray(data.processedIds)) {
                 processedIds.push(...data.processedIds);

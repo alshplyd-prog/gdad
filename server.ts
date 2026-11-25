@@ -1519,6 +1519,23 @@ async function startServer() {
   }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   app.use(express.text({ type: ['text/*', 'text/plain', 'application/json'], limit: '50mb' }));
+  // Parse JSON payloads delivered with text/plain or missing Content-Type
+  app.use((req, _res, next) => {
+    try {
+      if (Buffer.isBuffer(req.body)) {
+        const str = req.body.toString('utf8').trim();
+        if (str.startsWith('{') || str.startsWith('[')) {
+          req.body = JSON.parse(str);
+        }
+      } else if (typeof req.body === 'string') {
+        const trimmed = req.body.trim();
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          req.body = JSON.parse(trimmed);
+        }
+      }
+    } catch (_e) {}
+    next();
+  });
   app.use("/api", extractAuthUser);
 
   // Server-Authoritative Authentication Endpoints (JWT + Ephemeral Session HMAC Key)
@@ -7920,7 +7937,13 @@ async function startServer() {
 
   app.post("/api/sync/batch", requireAuth, async (req, res) => {
     try {
-      const actions = Array.isArray(req.body?.actions) ? req.body.actions : (Array.isArray(req.body) ? req.body : []);
+      let bodyObj: any = req.body;
+      if (Buffer.isBuffer(bodyObj)) {
+        try { bodyObj = JSON.parse(bodyObj.toString('utf8')); } catch (_e) {}
+      } else if (typeof bodyObj === 'string') {
+        try { bodyObj = JSON.parse(bodyObj.trim()); } catch (_e) {}
+      }
+      const actions = Array.isArray(bodyObj?.actions) ? bodyObj.actions : (Array.isArray(bodyObj) ? bodyObj : []);
       if (actions.length === 0) {
         return res.json({ success: true, processedIds: [], totalCount: 0 });
       }
