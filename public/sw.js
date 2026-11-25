@@ -117,11 +117,22 @@ async function removeProcessedFromIndexedDB(processedIds) {
 }
 
 // Helper: Get candidate sync batch endpoint URLs
+function isLocalCapacitorOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return true;
+  const lower = origin.trim().toLowerCase();
+  return (
+    lower === 'null' ||
+    lower.startsWith('capacitor://') ||
+    lower.startsWith('ionic://') ||
+    lower.startsWith('file://') ||
+    ((lower.startsWith('https://localhost') || lower.startsWith('http://localhost')) &&
+      !lower.includes(':3000') &&
+      !lower.includes(':5173'))
+  );
+}
+
 async function getCandidateServerOrigins() {
   const origins = [];
-  if (self.location && self.location.origin && self.location.origin !== 'null') {
-    origins.push(self.location.origin);
-  }
 
   try {
     const db = await openSyncDatabase(DB_NAME, STORE_NAME);
@@ -133,22 +144,28 @@ async function getCandidateServerOrigins() {
       req.onerror = () => resolve(null);
     });
     if (meta && meta.payload) {
+      if (meta.payload.serverUrl && typeof meta.payload.serverUrl === 'string') {
+        try {
+          const u = new URL(meta.payload.serverUrl, self.location.origin);
+          if (u && u.origin && !isLocalCapacitorOrigin(u.origin) && !origins.includes(u.origin)) {
+            origins.push(u.origin);
+          }
+        } catch (e) {}
+      }
       if (Array.isArray(meta.payload.origins)) {
         for (const o of meta.payload.origins) {
           if (o && typeof o === 'string') {
             const clean = o.trim().replace(/\/+$/, '');
-            if (clean && !origins.includes(clean)) origins.push(clean);
+            if (clean && !isLocalCapacitorOrigin(clean) && !origins.includes(clean)) origins.push(clean);
           }
         }
       }
-      if (meta.payload.serverUrl && typeof meta.payload.serverUrl === 'string') {
-        try {
-          const u = new URL(meta.payload.serverUrl, self.location.origin);
-          if (u && u.origin && !origins.includes(u.origin)) origins.push(u.origin);
-        } catch (e) {}
-      }
     }
   } catch (e) {}
+
+  if (self.location && self.location.origin && !isLocalCapacitorOrigin(self.location.origin) && !origins.includes(self.location.origin)) {
+    origins.unshift(self.location.origin);
+  }
 
   // Fallback candidate origins for Cloud PostgreSQL server
   const defaults = [

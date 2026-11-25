@@ -19,12 +19,29 @@ export const CANDIDATE_SERVERS: string[] = [
 
 const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
+const LEGACY_CUSTOM_SERVER_KEY = 'alkarrar_custom_server_url';
+
+function isLocalWebViewUrl(url: string): boolean {
+  const lower = (url || '').trim().toLowerCase();
+  return (
+    !lower ||
+    lower.includes('localhost') ||
+    lower.includes('127.0.0.1') ||
+    lower.startsWith('capacitor://') ||
+    lower.startsWith('ionic://') ||
+    lower.startsWith('file://')
+  );
+}
 
 export function getCustomServerUrl(): string {
   try {
-    const custom = localStorage.getItem(SERVER_URL_STORAGE_KEY);
-    if (custom && (custom.startsWith('http://') || custom.startsWith('https://'))) {
-      return custom.replace(/\/+$/, '');
+    const primary = localStorage.getItem(SERVER_URL_STORAGE_KEY);
+    if (primary && (primary.startsWith('http://') || primary.startsWith('https://')) && !isLocalWebViewUrl(primary)) {
+      return primary.replace(/\/+$/, '');
+    }
+    const legacy = localStorage.getItem(LEGACY_CUSTOM_SERVER_KEY);
+    if (legacy && (legacy.startsWith('http://') || legacy.startsWith('https://')) && !isLocalWebViewUrl(legacy)) {
+      return legacy.replace(/\/+$/, '');
     }
   } catch (e) {}
   return '';
@@ -41,6 +58,7 @@ function syncServerUrlPreference(url: string) {
     if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return;
     const clean = url.trim().replace(/\/+$/, '');
     Preferences.set({ key: SERVER_URL_STORAGE_KEY, value: clean }).catch(() => {});
+    Preferences.set({ key: LEGACY_CUSTOM_SERVER_KEY, value: clean }).catch(() => {});
     Preferences.set({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}`, value: clean }).catch(() => {});
     const bridge =
       typeof window !== 'undefined'
@@ -50,7 +68,6 @@ function syncServerUrlPreference(url: string) {
           (window as any).AndroidBridge
         : null;
     if (bridge && typeof bridge.syncPendingQueueToNative === 'function') {
-      // Keep native SQLite server URL synchronized if empty or updated
       try {
         const existingNative = typeof bridge.getPendingQueueFromNative === 'function' ? bridge.getPendingQueueFromNative() : null;
         if (existingNative && existingNative.startsWith('[')) {
@@ -66,9 +83,15 @@ export function setCustomServerUrl(url: string) {
     if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
       const clean = url.trim().replace(/\/+$/, '');
       localStorage.setItem(SERVER_URL_STORAGE_KEY, clean);
+      localStorage.setItem(LEGACY_CUSTOM_SERVER_KEY, clean);
       syncServerUrlPreference(clean);
     } else {
+      activeWorkingServer = '';
       localStorage.removeItem(SERVER_URL_STORAGE_KEY);
+      localStorage.removeItem(LEGACY_CUSTOM_SERVER_KEY);
+      Preferences.remove({ key: SERVER_URL_STORAGE_KEY }).catch(() => {});
+      Preferences.remove({ key: LEGACY_CUSTOM_SERVER_KEY }).catch(() => {});
+      Preferences.remove({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}` }).catch(() => {});
     }
   } catch (e) {}
 }
@@ -239,21 +262,11 @@ let activeDetectPromise: Promise<string> | null = null;
 
 export async function autoDetectActiveServer(forceProbe = false): Promise<string> {
   if (activeWorkingServer && !forceProbe) {
-    // Still verify in background without blocking if not forced, or return immediately
     return activeWorkingServer;
   }
   if (activeDetectPromise) return activeDetectPromise;
 
   activeDetectPromise = (async () => {
-    const serversToProbe: string[] = [];
-    const custom = getCustomServerUrl();
-    if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
-      serversToProbe.push(custom);
-    }
-    for (const s of CANDIDATE_SERVERS) {
-      if (!serversToProbe.includes(s)) serversToProbe.push(s);
-    }
-
     const probeOne = async (server: string): Promise<string> => {
       const res = await fetchWithRaceTimeout(
         `${server}/api/health`,
@@ -261,22 +274,52 @@ export async function autoDetectActiveServer(forceProbe = false): Promise<string
           method: 'GET',
           headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
         },
-        4000
+        4500
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const ct = res.headers.get('content-type') || '';
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('text/html')) throw new Error('HTML response');
+      const data = await res.json().catch(() => null);
+      if (!data || (data.status !== 'ok' && data.ok !== true && !data.database)) {
+        throw new Error('Invalid health payload');
+      }
       return server;
     };
 
-    try {
-      // Check first candidate quickly before broadcasting or race all candidates in parallel
-      const winner = await Promise.any(serversToProbe.map((s) => probeOne(s)));
-      if (winner) {
-        setActiveWorkingServer(winner);
-        return winner;
-      }
-    } catch (e) {}
+    // Priority 1: Saved custom server URL (if explicitly configured and non-CloudRun-fallback)
+    const custom = getCustomServerUrl();
+    if (custom && !isLocalWebViewUrl(custom)) {
+      try {
+        const okCustom = await probeOne(custom);
+        setActiveWorkingServer(okCustom);
+        return okCustom;
+      } catch (_e) {}
+    }
+
+    // Priority 2: Primary Hostinger VPS endpoints (port 80 and port 3000) BEFORE any Cloud Run URLs
+    const hostingerServers = CANDIDATE_SERVERS.filter((s) => !s.includes('run.app'));
+    if (hostingerServers.length > 0) {
+      try {
+        const winner = await Promise.any(hostingerServers.map((s) => probeOne(s)));
+        if (winner) {
+          setActiveWorkingServer(winner);
+          return winner;
+        }
+      } catch (_e) {}
+    }
+
+    // Priority 3: Fallback Cloud Run endpoints only if Hostinger is unreachable
+    const cloudRunServers = CANDIDATE_SERVERS.filter((s) => s.includes('run.app'));
+    for (const s of cloudRunServers) {
+      try {
+        const winner = await probeOne(s);
+        if (winner) {
+          setActiveWorkingServer(winner);
+          return winner;
+        }
+      } catch (_e) {}
+    }
+
     return activeWorkingServer || DEFAULT_REMOTE_SERVER;
   })().finally(() => {
     activeDetectPromise = null;
@@ -513,7 +556,7 @@ export async function fetchWithFallback(
           } catch (e) {}
         }
         const contentType = (res.headers.get('content-type') || '').toLowerCase();
-        if (!contentType.includes('text/html') || res.status === 404) {
+        if (!contentType.includes('text/html') || idx === urlsToTry.length - 1) {
           return res;
         }
       }
@@ -570,7 +613,40 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
   }
 }
 
-// Automatically probe live candidate servers in parallel on APK startup
+export async function testBatchSyncEndpoint(url?: string): Promise<{ ok: boolean; status?: number; latencyMs: number; responsePreview?: string; error?: string }> {
+  const start = Date.now();
+  const baseUrl = url ? url.trim().replace(/\/+$/, '') : getApiBaseUrl();
+  const targetUrl = baseUrl ? `${baseUrl}/api/sync/batch` : '/api/sync/batch';
+  try {
+    const res = await fetchWithRaceTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ actions: [] }),
+      },
+      7000
+    );
+    const latencyMs = Date.now() - start;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const rawText = await res.text().catch(() => '');
+    if (!res.ok) {
+      return { ok: false, status: res.status, latencyMs, error: `HTTP ${res.status}: ${rawText.slice(0, 120)}` };
+    }
+    if (ct.includes('text/html') || rawText.trim().startsWith('<')) {
+      return { ok: false, status: res.status, latencyMs, error: 'HTML response instead of JSON' };
+    }
+    return { ok: true, status: res.status, latencyMs, responsePreview: rawText.slice(0, 140) };
+  } catch (err: any) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - start,
+      error: err?.name === 'AbortError' ? 'Timeout (7000ms)' : (err?.message || 'Network error'),
+    };
+  }
+}
+
+// Automatically probe priority candidate servers on APK startup
 if (typeof window !== 'undefined' && isNativeOrApkEnvironment()) {
   autoDetectActiveServer(true).catch(() => {});
 }

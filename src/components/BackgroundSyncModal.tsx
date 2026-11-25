@@ -45,7 +45,7 @@ import {
   run5DayPruneAndPollingInspection,
   reconcileAllLocalWithDatabase
 } from '../lib/postgresClient';
-import { getCustomServerUrl, setCustomServerUrl, setActiveWorkingServer, checkServerHealth, getApiBaseUrl } from '../lib/apiConfig';
+import { getCustomServerUrl, setCustomServerUrl, setActiveWorkingServer, checkServerHealth, getApiBaseUrl, isNetworkConnected, testBatchSyncEndpoint, CANDIDATE_SERVERS, isNativeOrApkEnvironment } from '../lib/apiConfig';
 
 interface BackgroundSyncModalProps {
   isOpen: boolean;
@@ -78,6 +78,8 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
   const [serverUrlInput, setServerUrlInput] = useState<string>(() => getCustomServerUrl() || getApiBaseUrl());
   const [isCheckingServer, setIsCheckingServer] = useState(false);
   const [serverStatusInfo, setServerStatusInfo] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [batchTestInfo, setBatchTestInfo] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [isTestingBatch, setIsTestingBatch] = useState(false);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -104,8 +106,12 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       let autoFlushedOnOpen = false;
-      loadHealthAndQueue().then((items) => {
-        if (!autoFlushedOnOpen && items.length > 0 && typeof navigator !== 'undefined' && navigator.onLine !== false) {
+      loadHealthAndQueue().then(async (items) => {
+        const online =
+          typeof navigator === 'undefined' || navigator.onLine !== false
+            ? true
+            : await isNetworkConnected().catch(() => false);
+        if (!autoFlushedOnOpen && items.length > 0 && online) {
           autoFlushedOnOpen = true;
           handleManualFlush();
         }
@@ -202,6 +208,30 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
       setServerStatusInfo({ ok: false, msg: e?.message || 'خطأ في الاتصال بالسيرفر' });
     } finally {
       setIsCheckingServer(false);
+    }
+  };
+
+  const handleTestBatchEndpoint = async () => {
+    const clean = serverUrlInput.trim().replace(/\/+$/, '');
+    setIsTestingBatch(true);
+    setBatchTestInfo(null);
+    try {
+      const res = await testBatchSyncEndpoint(clean || undefined);
+      if (res.ok) {
+        setBatchTestInfo({
+          ok: true,
+          msg: `POST /api/sync/batch -> HTTP ${res.status} (${res.latencyMs}ms): ${res.responsePreview || 'OK'}`,
+        });
+      } else {
+        setBatchTestInfo({
+          ok: false,
+          msg: `POST /api/sync/batch فشل (${res.latencyMs}ms): ${res.error}`,
+        });
+      }
+    } catch (e: any) {
+      setBatchTestInfo({ ok: false, msg: e?.message || 'Batch test failed' });
+    } finally {
+      setIsTestingBatch(false);
     }
   };
 
@@ -379,6 +409,49 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 <span>{serverStatusInfo.msg}</span>
               </div>
             )}
+
+            {/* Sync Keys & Batch Upload Verification Block */}
+            <div className="pt-2 mt-2 border-t border-slate-200 dark:border-slate-700 space-y-1.5 text-[10px]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-black text-slate-600 dark:text-slate-300">
+                  {isAr ? 'مفاتيح المزامنة النشطة للمطابقة:' : 'Active Sync Keys & Diagnostics:'}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleTestBatchEndpoint}
+                  disabled={isTestingBatch}
+                  className="px-2.5 py-1 rounded-lg bg-teal-600 hover:bg-teal-700 text-white font-bold cursor-pointer disabled:opacity-60"
+                >
+                  {isTestingBatch ? 'جاري الفحص...' : isAr ? 'فحص مسار الرفع (batch)' : 'Test Batch Upload'}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 font-mono text-[10px] text-slate-600 dark:text-slate-400" dir="ltr">
+                <div className="truncate">alkarrar_backend_server_url: {getCustomServerUrl() || '(default)'}</div>
+                <div className="truncate">activeBase: {getApiBaseUrl()}</div>
+                <div className="truncate">queueKey: alkarrar_offline_pending_queue ({queueItems.length})</div>
+                <div className="truncate">env: {isNativeOrApkEnvironment() ? 'APK/Native' : 'Web'} | nav.onLine: {typeof navigator !== 'undefined' ? String(navigator.onLine) : 'n/a'}</div>
+              </div>
+              <div className="text-[10px] text-slate-500 font-mono truncate" dir="ltr">
+                candidates: {CANDIDATE_SERVERS.join(' | ')}
+              </div>
+              {getLastSyncUploadError() && (
+                <div className="p-1.5 rounded bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 font-mono break-all" dir="ltr">
+                  lastError: {getLastSyncUploadError()}
+                </div>
+              )}
+              {batchTestInfo && (
+                <div
+                  className={`p-1.5 rounded font-mono break-all ${
+                    batchTestInfo.ok
+                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                      : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300'
+                  }`}
+                  dir="ltr"
+                >
+                  {batchTestInfo.msg}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Test Result Box */}

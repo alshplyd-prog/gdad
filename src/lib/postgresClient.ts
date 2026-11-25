@@ -1,6 +1,6 @@
 // PostgreSQL client wrapper (With bulletproof offline cache & persistence for APK)
 import { addToPendingQueue, removeFromPendingQueue, flushPendingQueue, getPendingQueueSync, onSyncSuccess, clearPendingQueue, clearPendingActionsByFilter, scheduleIdleVerification, isUiEntryOrSearchProtected, scrubLocationFromPendingQueue } from './offlineQueue';
-import { getFullApiUrl, fetchWithFallback } from './apiConfig';
+import { getFullApiUrl, fetchWithFallback, isNetworkConnected } from './apiConfig';
 import { normalizeArabicPersonName } from './nameHelpers';
 import {
   secureStorageGetSync,
@@ -2823,8 +2823,12 @@ function startUnifiedPollingLoop() {
   if (unifiedPollingTimer) return;
   // Background version poller runs smoothly every 60s
   // Skips execution if user is editing in inputs or has modal open
-  unifiedPollingTimer = setInterval(() => {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  unifiedPollingTimer = setInterval(async () => {
+    const isOnline =
+      typeof navigator === 'undefined' || navigator.onLine !== false
+        ? true
+        : await isNetworkConnected().catch(() => false);
+    if (!isOnline) return;
     if (typeof document !== 'undefined' && document.hidden) return;
     
     // Check if user is typing, searching, or entering data in a form modal
@@ -2906,8 +2910,11 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
         }
       }
 
-      // In offline mode, skip unnecessary network roundtrips to prevent UI freezing
-      const isOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+      // Check real native network status on APK when navigator.onLine reports false
+      const isOnline =
+        typeof navigator === 'undefined' || navigator.onLine !== false
+          ? true
+          : await isNetworkConnected().catch(() => false);
 
       if (isOnline && apiEndpoint) {
         // First attempt: Central PostgreSQL Server API endpoint with fallback for APK

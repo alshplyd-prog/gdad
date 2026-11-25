@@ -166,7 +166,7 @@ import { universalApiFetch } from './lib/apiConfig';
 import { subscribeToQueueChange, getPendingQueue, getPendingQueueSync, flushPendingQueue, scheduleIdleVerification, isUserActivelyTypingOrInputFocused } from './lib/offlineQueue';
 import { hasDuplicateName, deduplicateEntitiesByName, normalizeEntityName } from './lib/nameHelpers';
 import { normalizePin } from './lib/pinUtils';
-import { fetchWithFallback } from './lib/apiConfig';
+import { fetchWithFallback, isNetworkConnected } from './lib/apiConfig';
 import {
   getAuthSession,
   clearAuthSession,
@@ -501,9 +501,13 @@ export default function App() {
     });
 
     // Immediately attempt automatic upload of any leftover pending items on app startup
-    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
-      flushPendingQueue().catch(() => {});
-    }
+    isNetworkConnected()
+      .then((online) => {
+        if (online) flushPendingQueue().catch(() => {});
+      })
+      .catch(() => {
+        flushPendingQueue().catch(() => {});
+      });
 
     const handleOnline = async () => {
       setSyncError(false);
@@ -595,7 +599,11 @@ export default function App() {
     // Automatic background flush & heartbeat (every 5s): uploads queued items without waiting for idle input
     let versionTick = 0;
     const connectionHeartbeatInterval = setInterval(async () => {
-      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const online =
+        typeof navigator === 'undefined' || navigator.onLine !== false
+          ? true
+          : await isNetworkConnected().catch(() => false);
+      if (!online) {
         setSyncError(true);
         return;
       }

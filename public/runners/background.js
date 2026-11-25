@@ -19,7 +19,9 @@ addEventListener('syncOfflineQueue', async (resolve, _reject, _args) => {
           if (
             custom &&
             typeof custom === 'string' &&
-            (custom.startsWith('https://') || custom.startsWith('http://'))
+            (custom.startsWith('https://') || custom.startsWith('http://')) &&
+            !custom.includes('localhost') &&
+            !custom.includes('127.0.0.1')
           ) {
             const normalized = custom.trim().replace(/\/+$/, '');
             if (!candidateServers.includes(normalized)) {

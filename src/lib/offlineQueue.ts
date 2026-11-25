@@ -162,11 +162,21 @@ export async function getActionsFromIndexedDb(): Promise<PendingAction[]> {
 // Helper: Generate candidate metadata payload for Service Worker
 function getMetaPayloadForSw() {
   const origins: string[] = [];
-  if (typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null') {
-    origins.push(window.location.origin);
-  }
   const custom = getCustomServerUrl();
   if (custom && !origins.includes(custom)) origins.push(custom);
+  if (typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null') {
+    const orig = window.location.origin;
+    const isCapacitorWebViewOrigin =
+      orig.startsWith('capacitor://') ||
+      orig.startsWith('ionic://') ||
+      orig.startsWith('file://') ||
+      ((orig.startsWith('https://localhost') || orig.startsWith('http://localhost')) &&
+        !orig.includes(':3000') &&
+        !orig.includes(':5173'));
+    if (!isCapacitorWebViewOrigin && !origins.includes(orig)) {
+      origins.push(orig);
+    }
+  }
   for (const s of CANDIDATE_SERVERS) {
     if (s && !origins.includes(s)) origins.push(s);
   }
@@ -387,8 +397,14 @@ export function subscribeToQueueChange(listener: (count: number) => void): () =>
     const activeCount = q.filter((i) => i.status !== 'synced').length;
     lastNotifiedQueueCount = activeCount;
     listener(activeCount);
-    if (activeCount > 0 && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
-      flushPendingQueue().catch(() => {});
+    if (activeCount > 0) {
+      if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+        flushPendingQueue().catch(() => {});
+      } else {
+        isNetworkConnected().then((online) => {
+          if (online) flushPendingQueue().catch(() => {});
+        }).catch(() => {});
+      }
     }
   });
   return () => {
@@ -1652,7 +1668,6 @@ export function triggerImmediateSync(callback?: () => Promise<void>) {
 // Automatic network reconnection and lifecycle handlers
 if (typeof window !== 'undefined') {
   (window as any).alkarrarFlushQueue = () => {
-    sendBeaconOnExit();
     return flushPendingQueue();
   };
   (window as any).alkarrarSendBeacon = sendBeaconOnExit;
