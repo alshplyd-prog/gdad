@@ -9,7 +9,7 @@ import { getApiBaseUrl, isNativeOrApkEnvironment } from '../lib/apiConfig';
  * Production backend URL for mobile APK and external environments
  * استبدل الرابط بالرابط الحقيقي لسيرفرك في Hostinger (مثال: http://72.62.158.128/api أو https://your-domain.com/api)
  */
-export const CLOUD_API_URL = 'http://127.0.0.1:3000/api';
+export const CLOUD_API_URL = 'http://72.62.158.128:3000/api';
 
 /**
  * Dynamic API Base URL resolver:

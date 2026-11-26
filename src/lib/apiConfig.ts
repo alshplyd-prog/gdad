@@ -8,18 +8,18 @@ import { getAuthSession } from './securityClient';
  * الرابط الافتراضي لسيرفر Hostinger: http://72.62.158.128
  */
 
-export const HOSTINGER_DEFAULT_SERVER = 'http://127.0.0.1:3000';
+export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128:3000';
 
 export const CANDIDATE_SERVERS: string[] = [
-  'http://127.0.0.1:3000',
-  'http://127.0.0.1',
   'http://72.62.158.128:3000',
   'http://72.62.158.128',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1',
   'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
   'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
 ];
 
-const DEFAULT_REMOTE_SERVER = 'http://127.0.0.1:3000';
+const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128:3000';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
 const LEGACY_CUSTOM_SERVER_KEY = 'alkarrar_custom_server_url';
 
