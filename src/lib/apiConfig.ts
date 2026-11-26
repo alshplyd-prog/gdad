@@ -8,16 +8,18 @@ import { getAuthSession } from './securityClient';
  * الرابط الافتراضي لسيرفر Hostinger: http://72.62.158.128
  */
 
-export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128';
+export const HOSTINGER_DEFAULT_SERVER = 'http://127.0.0.1:3000';
 
 export const CANDIDATE_SERVERS: string[] = [
-  'http://72.62.158.128',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1',
   'http://72.62.158.128:3000',
+  'http://72.62.158.128',
   'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
   'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
 ];
 
-const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128';
+const DEFAULT_REMOTE_SERVER = 'http://127.0.0.1:3000';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
 const LEGACY_CUSTOM_SERVER_KEY = 'alkarrar_custom_server_url';
 
@@ -25,9 +27,6 @@ function isLocalWebViewUrl(url: string): boolean {
   const lower = (url || '').trim().toLowerCase();
   return (
     !lower ||
-    lower.includes('localhost') ||
-    lower.includes('127.0.0.1') ||
-    lower.includes('0.0.0.0') ||
     lower.startsWith('capacitor://') ||
     lower.startsWith('ionic://') ||
     lower.startsWith('file://') ||

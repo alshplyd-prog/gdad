@@ -1005,7 +1005,7 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                 {isAr ? 'رابط استضافة هوستجر التلقائي:' : 'Hostinger Auto Server Link:'}
               </span>
               <span className="text-[10px] font-mono font-extrabold text-emerald-700 bg-emerald-100 dark:bg-emerald-950 px-2.5 py-1 rounded-lg border border-emerald-300 dark:border-emerald-800" dir="ltr">
-                http://72.62.158.128 (100% Active)
+                {HOSTINGER_DEFAULT_SERVER} (100% Active)
               </span>
             </div>
 
