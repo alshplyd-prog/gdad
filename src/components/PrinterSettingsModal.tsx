@@ -998,35 +998,15 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
 
 
 
-            {/* حالة وقسم رابط استضافة هوستجر (Hostinger Server Domain) */}
-            <div className="p-3 bg-white dark:bg-slate-900 rounded-2xl border border-indigo-200 dark:border-indigo-800/80 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-black text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                  <Globe className="w-4 h-4 text-indigo-600" />
-                  {isAr ? 'رابط استضافة هوستجر (Hostinger Server Link):' : 'Hostinger Server Link:'}
-                </span>
-                <span className="text-[10px] font-extrabold text-emerald-700 bg-emerald-100 dark:bg-emerald-950 px-2 py-0.5 rounded-full border border-emerald-300 dark:border-emerald-800">
-                  {isAr ? 'مستضيف ومربوط' : 'Hostinger Connected'}
-                </span>
-              </div>
-              <div className="flex items-center gap-2 dir-ltr">
-                <input
-                  type="text"
-                  value={hostingerUrlInput}
-                  onChange={(e) => setHostingerUrlInput(e.target.value)}
-                  placeholder="http://72.62.158.128:3000 or https://your-hostinger-domain.com"
-                  className="flex-1 px-3 py-2 text-xs font-mono rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                />
-                <button
-                  type="button"
-                  onClick={handleTestAndSaveHostingerUrl}
-                  disabled={isTestingServer}
-                  className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black transition-all cursor-pointer flex items-center gap-1 shrink-0 disabled:opacity-50"
-                >
-                  {isTestingServer ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Globe className="w-3.5 h-3.5" />}
-                  <span>{isAr ? 'حفظ واختبار' : 'Save & Test'}</span>
-                </button>
-              </div>
+            {/* حالة وقسم رابط استضافة هوستجر التلقائي */}
+            <div className="p-3 bg-white dark:bg-slate-900 rounded-2xl border border-indigo-200 dark:border-indigo-800/80 flex items-center justify-between">
+              <span className="text-xs font-black text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                <Globe className="w-4 h-4 text-indigo-600" />
+                {isAr ? 'رابط استضافة هوستجر التلقائي:' : 'Hostinger Auto Server Link:'}
+              </span>
+              <span className="text-[10px] font-mono font-extrabold text-emerald-700 bg-emerald-100 dark:bg-emerald-950 px-2.5 py-1 rounded-lg border border-emerald-300 dark:border-emerald-800" dir="ltr">
+                http://72.62.158.128 (100% Active)
+              </span>
             </div>
 
             {/* حالة خادم السحاب المباشر التلقائي */}

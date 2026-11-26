@@ -441,44 +441,16 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
             </div>
           </div>
 
-          {/* Server Connection & URL Editor Card */}
+          {/* Automatic Server Connection Card */}
           <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-xs font-black text-slate-700 dark:text-slate-200">
                 <Server className="w-4 h-4 text-teal-600" />
-                <span>{isAr ? 'عنوان السيرفر والمزامنة المباشرة' : 'Backend Server URL'}</span>
+                <span>{isAr ? 'اتصال سيرفر هوستجر التلقائي' : 'Hostinger Auto-Server Connection'}</span>
               </div>
-              <span className="text-[10px] font-mono text-slate-500 truncate max-w-[180px]" dir="ltr">
-                {getApiBaseUrl()}
+              <span className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950 px-2.5 py-1 rounded-lg border border-emerald-200 dark:border-emerald-800 font-bold" dir="ltr">
+                {HOSTINGER_DEFAULT_SERVER} (100% Active)
               </span>
-            </div>
-            <div className="flex flex-col sm:flex-row gap-2">
-              <input
-                type="text"
-                dir="ltr"
-                value={serverUrlInput}
-                onChange={(e) => setServerUrlInput(e.target.value)}
-                placeholder="http://72.62.158.128"
-                className="flex-1 px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-xs font-mono text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-teal-500"
-              />
-              <button
-                type="button"
-                onClick={handleSaveAndTestServer}
-                disabled={isCheckingServer}
-                className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black flex items-center justify-center gap-1.5 shadow-xs transition-all cursor-pointer shrink-0"
-              >
-                <Globe className={`w-3.5 h-3.5 ${isCheckingServer ? 'animate-spin' : ''}`} />
-                <span>{isAr ? (isCheckingServer ? 'جاري الفحص...' : 'فحص ومزامنة') : 'Test & Sync'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={handleResetToDefaultServer}
-                disabled={isCheckingServer}
-                className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black flex items-center justify-center gap-1.5 shadow-xs transition-all cursor-pointer shrink-0"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingServer ? 'animate-spin' : ''}`} />
-                <span>{isAr ? 'الافتراضي (72.62.158.128)' : 'Reset Default'}</span>
-              </button>
             </div>
             {serverStatusInfo && (
               <div
@@ -504,18 +476,19 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 ))}
               </div>
             )}
+          </div>
 
             {/* Sync Keys & Batch Upload Verification Block */}
-            <div className="pt-2 mt-2 border-t border-slate-200 dark:border-slate-700 space-y-1.5 text-[10px]">
+            <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-black text-slate-600 dark:text-slate-300">
+                <span className="font-black text-slate-600 dark:text-slate-300 text-xs">
                   {isAr ? 'مفاتيح المزامنة النشطة للمطابقة:' : 'Active Sync Keys & Diagnostics:'}
                 </span>
                 <button
                   type="button"
                   onClick={handleTestBatchEndpoint}
                   disabled={isTestingBatch}
-                  className="px-2.5 py-1 rounded-lg bg-teal-600 hover:bg-teal-700 text-white font-bold cursor-pointer disabled:opacity-60"
+                  className="px-2.5 py-1 rounded-lg bg-teal-600 hover:bg-teal-700 text-white font-bold cursor-pointer disabled:opacity-60 text-[10px]"
                 >
                   {isTestingBatch ? 'جاري الفحص...' : isAr ? 'فحص مسار الرفع (batch)' : 'Test Batch Upload'}
                 </button>
@@ -530,13 +503,13 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 candidates: {CANDIDATE_SERVERS.join(' | ')}
               </div>
               {getLastSyncUploadError() && (
-                <div className="p-1.5 rounded bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 font-mono break-all" dir="ltr">
+                <div className="p-1.5 rounded bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 font-mono break-all text-[10px]" dir="ltr">
                   lastError: {getLastSyncUploadError()}
                 </div>
               )}
               {batchTestInfo && (
                 <div
-                  className={`p-1.5 rounded font-mono break-all ${
+                  className={`p-1.5 rounded font-mono break-all text-[10px] ${
                     batchTestInfo.ok
                       ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
                       : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300'
@@ -547,7 +520,6 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 </div>
               )}
             </div>
-          </div>
 
           {/* Test Result Box */}
           {testResult && (

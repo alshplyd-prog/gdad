@@ -10,10 +10,20 @@ declare global {
 
 const SAME_SERVER_PUBLIC_IP = '72.62.158.128';
 
+// Embedded default PostgreSQL credentials per user instructions (Hostinger local VPS)
+const DEFAULT_DB_CONFIG = {
+  host: '127.0.0.1',
+  port: 5432,
+  database: 'app_database',
+  user: 'app_user',
+  password: 'v0Y9)hN0)5egF3cL',
+  ssl: false as const,
+};
+
 export function resolveLocalDbHost(rawHost?: string | null): string {
   const host = (rawHost || '').trim();
   if (!host || host === SAME_SERVER_PUBLIC_IP) {
-    return '127.0.0.1';
+    return DEFAULT_DB_CONFIG.host;
   }
   return host;
 }
@@ -39,9 +49,9 @@ function normalizeLocalConnectionString(rawUrl: string): { connectionString: str
   try {
     const parsed = new URL(rawUrl);
     if (parsed.hostname === SAME_SERVER_PUBLIC_IP) {
-      parsed.hostname = '127.0.0.1';
+      parsed.hostname = DEFAULT_DB_CONFIG.host;
     }
-    const host = parsed.hostname || '127.0.0.1';
+    const host = parsed.hostname || DEFAULT_DB_CONFIG.host;
     const ssl = resolveDbSsl(host);
     if (ssl === false) {
       parsed.searchParams.delete('sslmode');
@@ -49,8 +59,8 @@ function normalizeLocalConnectionString(rawUrl: string): { connectionString: str
     }
     return { connectionString: parsed.toString(), host, ssl };
   } catch (_e) {
-    const replaced = rawUrl.replace(SAME_SERVER_PUBLIC_IP, '127.0.0.1');
-    return { connectionString: replaced, host: '127.0.0.1', ssl: false };
+    const replaced = rawUrl.replace(SAME_SERVER_PUBLIC_IP, DEFAULT_DB_CONFIG.host);
+    return { connectionString: replaced, host: DEFAULT_DB_CONFIG.host, ssl: false };
   }
 }
 
@@ -59,46 +69,28 @@ export function getResolvedDbTargetInfo(): { host: string; port: number; ssl: bo
     const host = resolveLocalDbHost(process.env.SQL_HOST);
     return {
       host,
-      port: Number(process.env.SQL_PORT || process.env.DB_PORT || 5432),
+      port: Number(process.env.SQL_PORT || process.env.DB_PORT || DEFAULT_DB_CONFIG.port),
       ssl: Boolean(resolveDbSsl(host)),
       database: process.env.SQL_DB_NAME,
     };
   }
-  if ((process.env.DB_HOST || (process.env.DB_USER && process.env.DB_PASSWORD)) && process.env.DB_NAME) {
-    const host = resolveLocalDbHost(process.env.DB_HOST || '127.0.0.1');
+  if (process.env.DB_NAME || process.env.DB_USER || process.env.DATABASE_URL) {
+    const host = resolveLocalDbHost(process.env.DB_HOST || DEFAULT_DB_CONFIG.host);
+    const dbName = process.env.DB_NAME || DEFAULT_DB_CONFIG.database;
     return {
       host,
-      port: Number(process.env.DB_PORT || 5432),
+      port: Number(process.env.DB_PORT || DEFAULT_DB_CONFIG.port),
       ssl: Boolean(resolveDbSsl(host)),
-      database: process.env.DB_NAME,
+      database: dbName,
     };
   }
-  if (
-    process.env.DATABASE_URL &&
-    !process.env.DATABASE_URL.includes('supabase.co') &&
-    !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]') &&
-    !process.env.DATABASE_URL.includes('YOUR-PASSWORD')
-  ) {
-    const norm = normalizeLocalConnectionString(process.env.DATABASE_URL);
-    let parsedDbName = 'app_database';
-    let parsedPort = Number(process.env.DB_PORT || 5432);
-    try {
-      const u = new URL(norm.connectionString);
-      if (u.pathname && u.pathname.length > 1) {
-        parsedDbName = decodeURIComponent(u.pathname.replace(/^\//, ''));
-      }
-      if (u.port) {
-        parsedPort = Number(u.port);
-      }
-    } catch (_e) {}
-    return {
-      host: norm.host,
-      port: parsedPort,
-      ssl: Boolean(norm.ssl),
-      database: parsedDbName,
-    };
-  }
-  return null;
+  // Automatic fallback to embedded user credentials
+  return {
+    host: DEFAULT_DB_CONFIG.host,
+    port: DEFAULT_DB_CONFIG.port,
+    ssl: DEFAULT_DB_CONFIG.ssl,
+    database: DEFAULT_DB_CONFIG.database,
+  };
 }
 
 export const resetPool = () => {
@@ -133,28 +125,6 @@ export const createPool = (): Pool => {
       keepAliveInitialDelayMillis: 5000,
     });
   } else if (
-    (process.env.DB_HOST || (process.env.DB_USER && process.env.DB_PASSWORD)) &&
-    process.env.DB_USER &&
-    process.env.DB_PASSWORD &&
-    process.env.DB_NAME
-  ) {
-    // Always connect via 127.0.0.1 with ssl=false when app and PostgreSQL share the same server
-    const dbHost = resolveLocalDbHost(process.env.DB_HOST || '127.0.0.1');
-    newPool = new Pool({
-      host: dbHost,
-      port: Number(process.env.DB_PORT || 5432),
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      ssl: resolveDbSsl(dbHost),
-      max: 10,
-      idleTimeoutMillis: 10000,
-      connectionTimeoutMillis: 15000,
-      statement_timeout: 20000,
-      keepAlive: true,
-      keepAliveInitialDelayMillis: 5000,
-    });
-  } else if (
     process.env.DATABASE_URL &&
     !process.env.DATABASE_URL.includes('supabase.co') &&
     !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]') &&
@@ -172,7 +142,27 @@ export const createPool = (): Pool => {
       keepAliveInitialDelayMillis: 5000,
     });
   } else {
-    throw new Error('PostgreSQL environment variables (SQL_HOST/SQL_USER/SQL_DB_NAME or DB_HOST) are not configured.');
+    // Automatic fallback connection using embedded user credentials
+    const dbHost = resolveLocalDbHost(process.env.DB_HOST || DEFAULT_DB_CONFIG.host);
+    const dbUser = process.env.DB_USER || DEFAULT_DB_CONFIG.user;
+    const dbPassword = process.env.DB_PASSWORD !== undefined ? process.env.DB_PASSWORD : DEFAULT_DB_CONFIG.password;
+    const dbName = process.env.DB_NAME || DEFAULT_DB_CONFIG.database;
+    const dbPort = Number(process.env.DB_PORT || DEFAULT_DB_CONFIG.port);
+
+    newPool = new Pool({
+      host: dbHost,
+      port: dbPort,
+      user: dbUser,
+      password: dbPassword,
+      database: dbName,
+      ssl: resolveDbSsl(dbHost),
+      max: 10,
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 15000,
+      statement_timeout: 20000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 5000,
+    });
   }
 
   newPool.on('error', (err) => {
