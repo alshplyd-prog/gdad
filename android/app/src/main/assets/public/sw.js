@@ -167,14 +167,13 @@ async function getCandidateServerOrigins() {
     origins.unshift(self.location.origin);
   }
 
-  // Fallback candidate origins for Cloud PostgreSQL server
+  // Fallback candidate origins for PostgreSQL server
   const defaults = [
-    'http://72.62.158.128',
-    'http://72.62.158.128:3000',
-    'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
-    'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1',
     'http://localhost:3000',
-    'http://127.0.0.1:3000'
+    'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
+    'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app'
   ];
   for (const d of defaults) {
     if (!origins.includes(d)) origins.push(d);

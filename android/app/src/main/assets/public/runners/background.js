@@ -5,10 +5,10 @@ addEventListener('syncOfflineQueue', async (resolve, _reject, _args) => {
   try {
     console.log('[BackgroundRunner] Woke up to check and sync offlineQueue...');
 
-    // 1. Read stored server config (both http and https) or use candidate cloud servers
+    // 1. Read stored server config (both http and https) or use candidate servers
     let candidateServers = [
-      'http://72.62.158.128',
-      'http://72.62.158.128:3000',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1',
       'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
       'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
     ];
@@ -20,8 +20,7 @@ addEventListener('syncOfflineQueue', async (resolve, _reject, _args) => {
             custom &&
             typeof custom === 'string' &&
             (custom.startsWith('https://') || custom.startsWith('http://')) &&
-            !custom.includes('localhost') &&
-            !custom.includes('127.0.0.1')
+            !custom.includes('72.62.158.128')
           ) {
             const normalized = custom.trim().replace(/\/+$/, '');
             if (!candidateServers.includes(normalized)) {

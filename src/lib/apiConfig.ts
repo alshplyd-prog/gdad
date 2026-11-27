@@ -5,21 +5,19 @@ import { getAuthSession } from './securityClient';
 
 /**
  * Centralized API & Server Endpoint Resolver for Web and Android APK
- * الرابط الافتراضي لسيرفر Hostinger: http://72.62.158.128
+ * الرابط الافتراضي للسيرفر: http://127.0.0.1:3000
  */
 
-export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128:3000';
+export const HOSTINGER_DEFAULT_SERVER = 'http://127.0.0.1:3000';
 
 export const CANDIDATE_SERVERS: string[] = [
-  'http://72.62.158.128:3000',
-  'http://72.62.158.128',
   'http://127.0.0.1:3000',
   'http://127.0.0.1',
   'https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
   'https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app',
 ];
 
-const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128:3000';
+const DEFAULT_REMOTE_SERVER = 'http://127.0.0.1:3000';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
 const LEGACY_CUSTOM_SERVER_KEY = 'alkarrar_custom_server_url';
 
@@ -52,7 +50,7 @@ export function validateServerUrl(rawUrl: string): {
     return {
       valid: false,
       cleanUrl: trimmed,
-      error: 'يجب أن يبدأ العنوان بـ http:// أو https:// (مثال: http://72.62.158.128)',
+      error: 'يجب أن يبدأ العنوان بـ http:// أو https:// (مثال: http://127.0.0.1:3000)',
     };
   }
   if (isLocalWebViewUrl(trimmed)) {
@@ -90,7 +88,7 @@ export function validateServerUrl(rawUrl: string): {
       return {
         valid: false,
         cleanUrl: trimmed,
-        error: `عنوان الـ IP غير مكتمل (${hostname}) — يجب أن يتكون من 4 أجزاء مثل 72.62.158.128`,
+        error: `عنوان الـ IP غير مكتمل (${hostname}) — يجب أن يتكون من 4 أجزاء مثل 127.0.0.1`,
       };
     }
   } else if (!hostname.includes('.')) {
@@ -110,14 +108,15 @@ export function isValidServerUrl(rawUrl: string): boolean {
 }
 
 function purgeInvalidStoredServerKeys() {
+  const isDeprecatedOldIp = (val?: string | null) => Boolean(val && val.includes('72.62.158.128'));
   try {
     if (typeof localStorage !== 'undefined') {
       const k1 = localStorage.getItem(SERVER_URL_STORAGE_KEY);
-      if (k1 && !isValidServerUrl(k1)) {
+      if (k1 && (!isValidServerUrl(k1) || isDeprecatedOldIp(k1))) {
         localStorage.removeItem(SERVER_URL_STORAGE_KEY);
       }
       const k2 = localStorage.getItem(LEGACY_CUSTOM_SERVER_KEY);
-      if (k2 && !isValidServerUrl(k2)) {
+      if (k2 && (!isValidServerUrl(k2) || isDeprecatedOldIp(k2))) {
         localStorage.removeItem(LEGACY_CUSTOM_SERVER_KEY);
       }
     }
@@ -126,7 +125,7 @@ function purgeInvalidStoredServerKeys() {
   try {
     Preferences.get({ key: SERVER_URL_STORAGE_KEY })
       .then((res) => {
-        if (res?.value && !isValidServerUrl(res.value)) {
+        if (res?.value && (!isValidServerUrl(res.value) || isDeprecatedOldIp(res.value))) {
           Preferences.remove({ key: SERVER_URL_STORAGE_KEY }).catch(() => {});
           Preferences.remove({ key: LEGACY_CUSTOM_SERVER_KEY }).catch(() => {});
           Preferences.remove({ key: `CapacitorStorage.${SERVER_URL_STORAGE_KEY}` }).catch(() => {});
@@ -611,6 +610,7 @@ export async function fetchWithFallback(
   }
 
   let lastError: any = null;
+  let last404Response: Response | null = null;
   const skipSigning = cleanEndpoint.startsWith('/api/auth/login') || cleanEndpoint.startsWith('/api/auth/logout');
   const methodUpper = (options?.method || 'GET').toUpperCase();
 
@@ -663,7 +663,15 @@ export async function fetchWithFallback(
         return res;
       }
 
-      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404 || res.status === 409 || res.status === 422) {
+      if (res.status === 404) {
+        last404Response = res;
+        if (idx < urlsToTry.length - 1) {
+          continue;
+        }
+        return res;
+      }
+
+      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 409 || res.status === 422) {
         if (
           res.status === 401 &&
           !skipSigning &&
@@ -682,6 +690,10 @@ export async function fetchWithFallback(
     } catch (err: any) {
       lastError = err;
     }
+  }
+
+  if (last404Response) {
+    return last404Response;
   }
 
   throw lastError || new Error(`Network fetch failed for ${endpoint}`);

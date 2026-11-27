@@ -54,8 +54,8 @@ public class ForegroundSyncService extends Service {
     private static final int NOTIFICATION_ID = 9981;
 
     private static final String[] CANDIDATE_SYNC_URLS = {
-        "http://72.62.158.128/api/sync/batch",
-        "http://72.62.158.128:3000/api/sync/batch",
+        "http://127.0.0.1:3000/api/sync/batch",
+        "http://127.0.0.1/api/sync/batch",
         "https://ais-dev-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api/sync/batch",
         "https://ais-pre-asc5xuvnur4hlmpl5rfxpz-655986077616.europe-west2.run.app/api/sync/batch"
     };
@@ -534,7 +534,7 @@ public class ForegroundSyncService extends Service {
             java.util.List<String> targetUrls = new java.util.ArrayList<>();
             if (customServerUrl != null && (customServerUrl.startsWith("https://") || customServerUrl.startsWith("http://"))) {
                 String cleanCustom = customServerUrl.replaceAll("/+$", "");
-                if (!cleanCustom.contains("localhost") && !cleanCustom.contains("127.0.0.1")) {
+                if (!cleanCustom.contains("72.62.158.128")) {
                     targetUrls.add(cleanCustom + "/api/sync/batch");
                 }
             }
